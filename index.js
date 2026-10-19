@@ -507,6 +507,20 @@ function extractCliArgs() {
         } else if (arg.startsWith('-p=')) {
             const p = parseInt(arg.split('=')[1], 10);
             if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        } else if (arg.startsWith('--server_port=') || arg.startsWith('--server-port=')) {
+            const p = parseInt(arg.split('=')[1], 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
+        } else if (arg === '--server_port' || arg === '--server-port') {
+            if (i + 1 < argv.length) {
+                const p = parseInt(argv[i + 1], 10);
+                if (Number.isFinite(p) && p > 0 && p <= 65535) {
+                    port = p;
+                    i++;
+                }
+            }
+        } else if (arg.startsWith('--web_port=') || arg.startsWith('--web-port=')) {
+            const p = parseInt(arg.split('=')[1], 10);
+            if (Number.isFinite(p) && p > 0 && p <= 65535) port = p;
         } else if (arg.startsWith('--platform=')) {
             platform = arg.split('=')[1].trim().toLowerCase();
         } else if (arg === '--platform') {
@@ -525,7 +539,7 @@ function extractCliArgs() {
 function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
     const cli = extractCliArgs();
 
-    // 1. Dấu hiệu Render Cloud Native theo tài liệu chính thức (https://render.com/docs/environment-variables):
+    // 1. Nhận diện nền tảng Hosting (Render Cloud, Deplexo, WispByte, Pterodactyl, Docker, Local):
     const isRender = !!(
         (process.env.RENDER && String(process.env.RENDER).toLowerCase() === 'true') ||
         process.env.RENDER_SERVICE_ID ||
@@ -534,40 +548,72 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
         process.env.RENDER_EXTERNAL_HOSTNAME
     );
 
-    let platform = isRender ? 'render' : 'local';
+    const isPanel = !!(
+        process.env.PTERODACTYL ||
+        process.env.P_SERVER_UUID ||
+        process.env.P_SERVER_ALLOCATION_LIMIT ||
+        process.env.SERVER_PORT ||
+        process.env.P_SERVER_PORT ||
+        process.env.STARTUP ||
+        process.env.DEPLEXO ||
+        process.env.WISPBYTE ||
+        process.env.WISPBAY ||
+        process.env.WISP
+    );
+
+    let platform = isRender ? 'render' : (isPanel ? 'pterodactyl' : 'local');
     let detectionSource = isRender
-        ? 'Biến môi trường Render chính thức (process.env.RENDER / RENDER_SERVICE_ID)'
-        : 'Môi trường Local PC / VPS độc lập (Render Compatible Mode)';
+        ? 'Render Cloud Web Service (process.env.RENDER / RENDER_SERVICE_ID)'
+        : (isPanel
+            ? 'Hosting Panel / Pterodactyl / Wisp (Deplexo, WispByte, Game Host Container)'
+            : 'Môi trường Local PC / VPS độc lập (Universal Mode)');
 
     const configuredPlatform = String(config.PLATFORM || 'auto').trim().toLowerCase();
 
-    if (cli.platform === 'render' || cli.platform === 'local') {
+    if (cli.platform) {
         platform = cli.platform;
         detectionSource = `Tham số dòng lệnh CLI (--platform=${cli.platform})`;
-    } else if (configuredPlatform === 'render' || configuredPlatform === 'local') {
+    } else if (configuredPlatform && configuredPlatform !== 'auto') {
         platform = configuredPlatform;
-        detectionSource = `Cấu hình ép buộc config.PLATFORM = '${configuredPlatform}'`;
+        detectionSource = `Cấu hình config.PLATFORM = '${configuredPlatform}'`;
     }
 
-    // 2. Phân giải Cổng (Port) - Render Web Service mặc định 10000
+    // 2. Phân giải Cổng (Port) thông minh - Ưu tiên thích ứng mọi Hosting
+    function isValidPort(p) {
+        const n = Number(p);
+        return Number.isFinite(n) && n > 0 && n <= 65535;
+    }
+
     let port = fallbackPort || 10000;
     let portSource = 'mặc định';
 
-    if (cli.port) {
-        port = cli.port;
-        portSource = `Tham số dòng lệnh CLI (--port = ${cli.port})`;
-    } else if (process.env.PORT) {
-        const envPort = Number(process.env.PORT);
-        if (Number.isFinite(envPort) && envPort > 0 && envPort <= 65535) {
-            port = envPort;
-            portSource = `Render Web Service (process.env.PORT = ${envPort})`;
-        }
-    } else if (config.WEB_PORT) {
-        const cfgPort = Number(config.WEB_PORT);
-        if (Number.isFinite(cfgPort) && cfgPort > 0 && cfgPort <= 65535) {
-            port = cfgPort;
-            portSource = `Cấu hình config.WEB_PORT = ${cfgPort}`;
-        }
+    if (cli.port && isValidPort(cli.port)) {
+        port = Number(cli.port);
+        portSource = `Tham số dòng lệnh CLI (--port = ${port})`;
+    } else if (isValidPort(process.env.PORT)) {
+        port = Number(process.env.PORT);
+        portSource = `Biến môi trường PORT = ${port} (Render / Cloud Web Service)`;
+    } else if (isValidPort(process.env.SERVER_PORT)) {
+        port = Number(process.env.SERVER_PORT);
+        portSource = `Biến môi trường SERVER_PORT = ${port} (Deplexo / WispByte / Pterodactyl)`;
+    } else if (isValidPort(process.env.P_SERVER_PORT)) {
+        port = Number(process.env.P_SERVER_PORT);
+        portSource = `Biến môi trường P_SERVER_PORT = ${port} (Pterodactyl Allocation)`;
+    } else if (isValidPort(process.env.APP_PORT)) {
+        port = Number(process.env.APP_PORT);
+        portSource = `Biến môi trường APP_PORT = ${port}`;
+    } else if (isValidPort(process.env.WEB_PORT)) {
+        port = Number(process.env.WEB_PORT);
+        portSource = `Biến môi trường WEB_PORT = ${port}`;
+    } else if (isRender) {
+        port = 10000;
+        portSource = 'Render Web Service mặc định (10000)';
+    } else if (isValidPort(config.WEB_PORT)) {
+        port = Number(config.WEB_PORT);
+        portSource = `Cấu hình BOT_CONFIG.WEB_PORT = ${port}`;
+    } else {
+        port = fallbackPort || 10000;
+        portSource = `Cổng dự phòng fallback (${port})`;
     }
 
     return { platform, detectionSource, port, portSource };
@@ -575,23 +621,31 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
 
 function listenHttpServer(app, initialPort, platform, onListening) {
     const fixedPort = initialPort;
-    const maxRetries = 5;
+    const maxRetries = 10;
     let attempt = 0;
+    let bindHost = '0.0.0.0';
 
     function tryListen() {
-        const srv = app.listen(fixedPort, '0.0.0.0');
+        const srv = app.listen(fixedPort, bindHost);
 
         srv.on('listening', () => {
-            onListening(srv, fixedPort);
+            onListening(srv, fixedPort, bindHost);
         });
 
         srv.on('error', (err) => {
+            if (err.code === 'EADDRNOTAVAIL' && bindHost !== '0.0.0.0') {
+                console.warn(`[HTTP] ⚠️ Không thể gán IP ${bindHost} (EADDRNOTAVAIL). Tự động chuyển sang bind '0.0.0.0'...`);
+                bindHost = '0.0.0.0';
+                setTimeout(tryListen, 500);
+                return;
+            }
+
             if (err.code === 'EADDRINUSE' && attempt < maxRetries) {
                 attempt++;
                 console.warn(`[HTTP] ⚠️ Cổng ${fixedPort} đang tạm thời bận (EADDRINUSE). Đang chờ giải phóng socket và thử lại lần ${attempt}/${maxRetries} sau 1 giây...`);
                 setTimeout(tryListen, 1000);
             } else {
-                console.error(`[HTTP] ❌ Lỗi khởi động máy chủ web trên cổng cố định ${fixedPort}:`, err.message);
+                console.error(`[HTTP] ❌ Lỗi khởi động máy chủ web trên cổng ${fixedPort} (IP: ${bindHost}):`, err.message);
                 if (err.code === 'EADDRINUSE') {
                     console.error(`[HTTP] 💡 Khắc phục: Cổng ${fixedPort} đang bị chiếm bởi tiến trình khác. Hãy kiểm tra các bot/tiến trình Node.js đang chạy ngầm trên máy.`);
                 }
@@ -2202,7 +2256,14 @@ function startMemoryWatchdog(state) {
             state.lastHeapMb = heapMb;
 
             const isEco = state.settings.ecoMode !== false;
-            const limitMb = isEco ? 220 : (Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380);
+            const hostTotalMb = typeof getContainerMemoryLimit === 'function' ? getContainerMemoryLimit() : 512;
+            let limitMb;
+            if (isEco) {
+                limitMb = Math.min(220, Math.max(120, Math.round(hostTotalMb * 0.5)));
+            } else {
+                const configLimit = Number(BOT_CONFIG.RAM_WATCHDOG_LIMIT_MB) || 380;
+                limitMb = Math.min(configLimit, Math.max(160, Math.round(hostTotalMb * 0.75)));
+            }
             if (rssMb > limitMb || heapMb > (limitMb * 0.75)) {
                 // 1. Dọn dẹp an toàn chunk ở xa
                 if (state.bot && state.bot.world) {
@@ -4753,7 +4814,13 @@ function readCgroupFile(filePath) {
 }
 
 function getContainerMemoryLimit() {
-    // a) Render container environment limit
+    // a1) Pterodactyl / Wisp panel container limit in MB (Deplexo, WispByte)
+    if (process.env.SERVER_MEMORY) {
+        const sm = Number(process.env.SERVER_MEMORY);
+        if (Number.isFinite(sm) && sm > 0) return Math.round(sm);
+    }
+
+    // a2) Render container environment limit
     if (process.env.RENDER || process.env.RENDER_SERVICE_ID) {
         return Number(process.env.RENDER_MEMORY_MB) || 512;
     }
