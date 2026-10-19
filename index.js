@@ -590,15 +590,18 @@ function detectHostPlatformAndPort(config, fallbackPort, role = 'bot') {
     if (cli.port && isValidPort(cli.port)) {
         port = Number(cli.port);
         portSource = `Tham số dòng lệnh CLI (--port = ${port})`;
-    } else if (isValidPort(process.env.PORT)) {
-        port = Number(process.env.PORT);
-        portSource = `Biến môi trường PORT = ${port} (Render / Cloud Web Service)`;
     } else if (isValidPort(process.env.SERVER_PORT)) {
         port = Number(process.env.SERVER_PORT);
-        portSource = `Biến môi trường SERVER_PORT = ${port} (Deplexo / WispByte / Pterodactyl)`;
+        portSource = `Biến môi trường SERVER_PORT = ${port} (WispByte / Deplexo / Pterodactyl)`;
     } else if (isValidPort(process.env.P_SERVER_PORT)) {
         port = Number(process.env.P_SERVER_PORT);
         portSource = `Biến môi trường P_SERVER_PORT = ${port} (Pterodactyl Allocation)`;
+    } else if (isValidPort(process.env.ALLOCATION_PORT)) {
+        port = Number(process.env.ALLOCATION_PORT);
+        portSource = `Biến môi trường ALLOCATION_PORT = ${port}`;
+    } else if (isValidPort(process.env.PORT)) {
+        port = Number(process.env.PORT);
+        portSource = `Biến môi trường PORT = ${port} (Render / Cloud Web Service)`;
     } else if (isValidPort(process.env.APP_PORT)) {
         port = Number(process.env.APP_PORT);
         portSource = `Biến môi trường APP_PORT = ${port}`;
