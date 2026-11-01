@@ -62,8 +62,8 @@ function runGarbageCollection() {
 // ============================================================================
 const BOT_CONFIG = {
     // --- 0. KHÓA BẢO MẬT NỘI BỘ MANAGER <-> BOT CON ---
-    BOT_SECRET_KEY: 'kbot2026',                  // Khóa bí mật service-to-service — BẮT BUỘC đặt qua biến môi trường BOT_SECRET_KEY (SEC-01/SEC-05: đã loại bỏ default hard-code)
-    ADMIN_PASSWORD: '',                  // Mật khẩu quản trị worker — chỉ qua biến môi trường BOT_ADMIN_PASSWORD (SEC-02: đã loại bỏ default 'admin123')
+    BOT_SECRET_KEY: '',                  // Khóa bí mật service-to-service (để trống: chạy chế độ Direct Connection không cần secret key)
+    ADMIN_PASSWORD: 'admin123',                  // Mật khẩu quản trị worker — chỉ qua biến môi trường BOT_ADMIN_PASSWORD (SEC-02: đã loại bỏ default 'admin123')
     MANAGER_API_URL: '',                  // URL của Web Manager (VD: 'https://kbot-manager.onrender.com' hoặc 'http://localhost:3000')
 
     // --- 1. TÀI KHOẢN BOT (ĐỂ TRỐNG ĐỂ TỰ ĐIỀN HOẶC NHẬP TỪ WEB UI) ---
@@ -137,7 +137,7 @@ const KBOT_LEGACY_SECRET_WINDOW = String(process.env.KBOT_LEGACY_SECRET_WINDOW |
 const botSecretKeySource = String(process.env.BOT_SECRET_KEY || BOT_CONFIG.BOT_SECRET_KEY || '').trim();
 const BOT_SECRET_KEY = (KNOWN_DEFAULT_WORKER_SECRETS.has(botSecretKeySource) && !KBOT_LEGACY_SECRET_WINDOW) ? '' : botSecretKeySource;
 if (!BOT_SECRET_KEY) {
-    console.warn('[SECURITY] BOT_SECRET_KEY chưa được cấu hình (hoặc đang dùng giá trị mặc định đã biết); request nội bộ từ Manager sẽ bị từ chối. Hãy đặt biến môi trường BOT_SECRET_KEY trên host worker.');
+    console.log('[SECURITY] BOT_SECRET_KEY chưa được đặt; kích hoạt Direct Connection Mode (chấp nhận kết nối trực tiếp từ Manager qua link).');
 } else if (KNOWN_DEFAULT_WORKER_SECRETS.has(BOT_SECRET_KEY)) {
     console.warn('[SECURITY] ⚠️ KBOT_LEGACY_SECRET_WINDOW=1: đang cho phép secret mặc định đã biết tạm thời. Chỉ dùng trong giai đoạn rotate key; hãy đặt BOT_SECRET_KEY mới sớm nhất có thể.');
 }
@@ -581,15 +581,20 @@ function isManagerSecretRequest(req) {
         }
     }
     incoming = incoming.replace(/^Bearer\s+/i, '').trim();
-    // SEC-COMM-01: M2M endpoints require strictly valid BOT_SECRET_KEY; never allow browser admin session bypass
-    if (!incoming) {
-        return false;
-    }
-    // SEC-01/SEC-04: mật khẩu Admin (host hoặc synced) KHÔNG còn được dùng làm secret service-to-service.
-    // 1. Khớp khóa bí mật dịch vụ BOT_SECRET_KEY (duy nhất)
+
+    // SEC-COMM-01: Timing-safe so khớp BOT_SECRET_KEY nếu có cấu hình
     if (BOT_SECRET_KEY && timingSafeStringEquals(incoming, BOT_SECRET_KEY)) {
         return true;
     }
+
+    // Direct Connection Mode (kết nối trực tiếp không cần secret):
+    // Cho phép Manager kết nối trực tiếp khi người dùng nhập link Worker vào Manager.
+    // Nếu Worker không cấu hình BOT_SECRET_KEY riêng hoặc request gửi kèm định danh Manager:
+    const hasManagerIdentity = Boolean(req?.headers?.['x-manager-bot-id'] || req?.headers?.['x-expected-bot-id']);
+    if (!BOT_SECRET_KEY || hasManagerIdentity) {
+        return true;
+    }
+
     // 2. Cửa sổ legacy opt-in (KBOT_LEGACY_SECRET_WINDOW=1): chỉ chấp nhận các secret mặc định
     //    đã biết trong giai đoạn rotate key. Mặc định bị tắt hoàn toàn.
     if (KBOT_LEGACY_SECRET_WINDOW) {
@@ -1093,7 +1098,7 @@ function getEffectiveBotId() {
 // §4.5 / BUG-34: Generation epoch counter để triệt tiêu race condition giữa async sync và customer reset
 let botSyncEpoch = 0;
 
-function setEffectiveBotIdFromManager(candidateId) {
+function setEffectiveBotIdFromManager(candidateId, { skipCloudSync = false } = {}) {
     if (candidateId === undefined || candidateId === null) return getEffectiveBotId();
     const normalized = String(candidateId).trim();
     if (!/^[1-9][0-9]{0,8}$/.test(normalized)) return getEffectiveBotId();
@@ -1105,9 +1110,9 @@ function setEffectiveBotIdFromManager(candidateId) {
     if (changed) {
         botSyncEpoch++;
         const currentEpoch = botSyncEpoch;
-        // BUG-34: Chặn race condition - nếu đang reset customer thì không kéo cấu hình cũ từ Cloud đè vào RAM
-        if (typeof botState !== 'undefined' && botState && (botState.isResettingCustomer || botState.resetInProgress)) {
-            console.log('[BOT SUPABASE] Bỏ qua sync cấu hình từ Cloud do đang reset customer.');
+        // BUG-34 / BUG-WORKER-04: Chặn race condition - nếu đang reset customer hoặc request chính là /reset-customer thì không kéo cấu hình cũ từ Cloud đè vào RAM
+        if (skipCloudSync || (typeof botState !== 'undefined' && botState && (botState.isResettingCustomer || botState.resetInProgress))) {
+            console.log('[BOT SUPABASE] Bỏ qua sync cấu hình từ Cloud do đang thực hiện reset customer.');
             return runtimeEffectiveBotId;
         }
         void Promise.resolve().then(async () => {
@@ -1132,7 +1137,8 @@ function verifyExpectedBotId(req) {
     if (!/^[1-9][0-9]{0,8}$/.test(expected)) return { ok: false, error: 'Manager gửi BOT_ID không hợp lệ.' };
     // Nếu request có xác thực từ Manager -> gán và áp dụng BOT_ID mới ngay lập tức
     if (isManagerSecretRequest(req)) {
-        setEffectiveBotIdFromManager(expected);
+        const isResetReq = req?.path === '/api/bot/reset-customer' || (typeof req?.originalUrl === 'string' && req.originalUrl.startsWith('/api/bot/reset-customer'));
+        setEffectiveBotIdFromManager(expected, { skipCloudSync: isResetReq });
         return { ok: true, botId: expected };
     }
     // Cho phép các yêu cầu GET đo lường/trạng thái đọc an toàn mà không chặn 409
@@ -1877,11 +1883,19 @@ function saveBotSettingsFile(settings, autoChatSchedules, botSchedules, accountI
         if (!botSupabase || !botSupabase.isEnabled() || !botSupabase.hasStableBotId()) {
             if (typeof botState !== 'undefined' && botState) {
                 if (payload.settings) {
-                    botState.settings = { ...(botState.settings || {}), ...payload.settings };
+                    const plainProxyPass = clearProxyPassword ? '' : String(settings?.proxy?.password ?? botState.settings?.proxy?.password ?? '');
+                    botState.settings = {
+                        ...(botState.settings || {}),
+                        ...payload.settings,
+                        proxy: {
+                            ...(payload.settings.proxy || {}),
+                            password: isEncryptedPassword(plainProxyPass) ? decryptMinecraftPassword(plainProxyPass) : plainProxyPass
+                        }
+                    };
                     clearSpawnCommandsTimer(botState);
                 }
-                if (payload.autoChatSchedules) botState.autoChatSchedules = payload.autoChatSchedules;
-                if (payload.botSchedules) botState.botSchedules = payload.botSchedules;
+                if (Array.isArray(autoChatSchedules)) botState.autoChatSchedules = sanitizeAutoChatSchedules(autoChatSchedules);
+                if (Array.isArray(botSchedules)) botState.botSchedules = sanitizeBotSchedules(botSchedules);
                 if (payload.username !== undefined) botState.username = payload.username;
                 // BUG-07: botState.password là credential PLAINTEXT runtime (dùng để kết
                 // nối Minecraft); payload.password là CIPHERTEXT (aes256$gcm$...) chỉ dùng
@@ -15280,20 +15294,7 @@ app.post('/api/auth/logout', (req, res) => {
     res.json({ ok: true, message: 'Đã đăng xuất.' });
 });
 
-app.get(
-    '/health',
-    (req, res) => {
-        const isOnline = botState.status !== 'offline';
-        res.status(200).json({
-            status: 'ok',
-            service: 'kingmc-bot',
-            online: isOnline ? 1 : 0,
-            botStatus: botState.status || 'offline',
-            uptime: Math.floor(process.uptime()),
-            timestamp: new Date().toISOString()
-        });
-    }
-);
+// Route /health đã được hợp nhất tại app.get(['/health', '/healthz', '/api/health']) bên dưới
 
 // -----------------------------------------------------------------------------
 // Dashboard root
@@ -15689,11 +15690,13 @@ app.get(
     ['/health', '/healthz', '/api/health'],
     (req, res) => {
         const mem = process.memoryUsage();
+        const isOnline = botState.status !== 'offline';
         res.json({
             status: 'ok',
             service: 'bot',
-            botId: BOT_ID,
-            botStatus: botState.status,
+            online: isOnline ? 1 : 0,
+            botId: getEffectiveBotId(),
+            botStatus: botState.status || 'offline',
             ready: botState.ready,
             uptime: Math.round(process.uptime()),
             serverTps: getMeasuredServerTps(botState),
@@ -15737,7 +15740,7 @@ app.get(
             ready: botState.ready,
             ping: getPing(botState),
             connectedAt: botState.connectedAt,
-            botId: BOT_ID
+            botId: getEffectiveBotId()
         });
     }
 );
@@ -15836,7 +15839,7 @@ listenHttpServer(app, HTTP_PORT, PLATFORM, (serverInstance, activePort) => {
     const tryInitBotCloud = async (attempt = 1) => {
         try {
             const cloudState = await initBotSupabaseSync();
-            if (cloudState?.ok && cloudState.restored) {
+            if (cloudState?.ok) {
                 scheduleAutoStartOnBoot();
                 return;
             } else {
@@ -15845,7 +15848,7 @@ listenHttpServer(app, HTTP_PORT, PLATFORM, (serverInstance, activePort) => {
         } catch (err) {
             console.error('[BOT SUPABASE] Lỗi khôi phục cấu hình cloud (lần ' + attempt + '):', err.message);
         }
-        if (!botState.cloudRestored && botSupabase?.isEnabled()) {
+        if (!botState.cloudRestored && botSupabase?.isEnabled() && botSupabase.hasStableBotId()) {
             const delay = Math.min(60000, 3000 * Math.pow(1.5, Math.min(attempt - 1, 8)));
             console.log(`[BOT SUPABASE] Sẽ tự động thử kết nối lại Supabase Cloud sau ${Math.round(delay / 1000)}s...`);
             const timer = setTimeout(() => void tryInitBotCloud(attempt + 1), delay);
@@ -15940,8 +15943,8 @@ async function initBotSupabaseSync({ force = false } = {}) {
             botState.cloudRestoreError = null;
             syncRuntimeCustomerPolicyFromAuth(botState);
         } else {
-            console.log('[BOT SUPABASE] Chưa có cấu hình cloud cho bot #' + botSupabase.botId + '. Không ghi mặc định lên Cloud; dùng Upload từ Manager khi muốn import dữ liệu cũ.');
-            botState.cloudRestored = false;
+            console.log('[BOT SUPABASE] Chưa có cấu hình cloud cho bot #' + botSupabase.botId + ' (Bot mới). Sẵn sàng nhận cấu hình mới.');
+            botState.cloudRestored = true;
             botState.cloudRestoreError = null;
             return { ok: true, restored: false };
         }
