@@ -56,7 +56,6 @@ function runGarbageCollection() {
 
 // ============================================================================
 // CẤU HÌNH TỔNG BOT MINECRAFT KINGMC (COMMERCIAL ENTERPRISE EDITION V11.8 (Audit V4 Release Candidate))
-//
 // Triển khai file này lên Render Web Service hoặc VPS dưới dạng index.js / bot.js.
 // Tự động nhận diện Render Cloud Native (PORT 10000) và khởi chạy Web UI tức thì!
 // Chỉnh sửa các trường cấu hình trực tiếp ngay bên dưới:
@@ -166,7 +165,6 @@ if (rawBotAdminPassword && !BOT_ADMIN_PASSWORD) {
     console.warn('[SECURITY] BOT_ADMIN_PASSWORD đang dùng mật khẩu mặc định đã biết (admin123/secret mặc định); đây không được coi là credential an toàn. Hãy đặt mật khẩu Admin worker mạnh qua biến môi trường.');
 }
 const MANAGER_API_URL = String(process.env.MANAGER_API_URL || BOT_CONFIG.MANAGER_API_URL || '').trim().replace(/\/+$/, '');
-
 
 // ----------------------------------------------------------------------------
 // SUPABASE CLOUD DATABASE ADAPTER (BOT WORKER ENGINE)
@@ -568,7 +566,6 @@ class BotSupabaseAdapter {
     }
 }
 
-
 const botSupabase = new BotSupabaseAdapter({
     url: process.env.SUPABASE_URL || '',
     key: process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '',
@@ -584,9 +581,7 @@ function isManagerSecretRequest(req) {
         }
     }
     incoming = incoming.replace(/^Bearer\s+/i, '').trim();
-    if (req?.user?.role === 'admin' || req?.session?.role === 'admin') {
-        return true;
-    }
+    // SEC-COMM-01: M2M endpoints require strictly valid BOT_SECRET_KEY; never allow browser admin session bypass
     if (!incoming) {
         return false;
     }
@@ -878,7 +873,6 @@ function readPositiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER
     return Math.min(Math.max(Math.trunc(parsed), min), max);
 }
 
-
 // ============================================================================
 // HỆ THỐNG TỰ ĐỘNG NHẬN DIỆN NỀN TẢNG THUẦN RENDER CLOUD & PHÁT HIỆN PORT
 // ============================================================================
@@ -1060,7 +1054,6 @@ function listenHttpServer(app, initialPort, platform, onListening) {
     tryListen();
 }
 
-
 const hostInfo = detectHostPlatformAndPort(BOT_CONFIG, Number(BOT_CONFIG.WEB_PORT) || 10000, 'bot');
 const PLATFORM = hostInfo.platform;
 const isRender = PLATFORM === 'render';
@@ -1215,21 +1208,26 @@ const LEGACY_BOT_CREDENTIAL_KEYS = Object.freeze([
     process.env.BOT_SECRET_KEY,
     BOT_ADMIN_PASSWORD,
     process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.SUPABASE_KEY,
+    (process.env.SUPABASE_SERVICE_ROLE_KEY ? 'kbot-cred-v1:' + String(process.env.SUPABASE_SERVICE_ROLE_KEY).trim() : ''),
+    (process.env.SUPABASE_KEY ? 'kbot-cred-v1:' + String(process.env.SUPABASE_KEY).trim() : ''),
     'kbot_enterprise_stable_encryption_key_v11',
     'kbot_default_key',
-    'KingMC_Master_Secret_Key_32Byte!'
+    'KingMC_Master_Secret_Key_32Byte!',
+    'KingMC_Secret_Pass_2026_Secure!'
 ]);
 function getCurrentBotCredentialKey() {
-    // SEC-05 (Wave A — BLOCKER-01/BUG-38): khớp với manager getManagerCredentialKey —
-    // chuỗi primary chỉ còn MANAGER_MASTER_KEY / BOT_CREDENTIALS_ENCRYPTION_KEY, tách miền
-    // khóa khỏi BOT_SECRET_KEY (service-to-service). BOT_SECRET_KEY chỉ còn trong
-    // LEGACY_BOT_CREDENTIAL_KEYS để GIẢI MÃ dữ liệu cũ; không dùng mã hóa credential mới.
-    const source = String(
+    // SEC-05 (Wave A — BLOCKER-01/BUG-38): khớp 100% với Manager getManagerCredentialKey
+    const primary = String(
         process.env.MANAGER_MASTER_KEY ||
         process.env.BOT_CREDENTIALS_ENCRYPTION_KEY ||
         ''
     ).trim();
-    return source ? crypto.createHash('sha256').update(source).digest() : null;
+    if (primary) {
+        return crypto.createHash('sha256').update(primary).digest();
+    }
+    const fallback = !process.env.KBOT_STRICT_PRODUCTION ? String(process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || '').trim() : '';
+    return fallback ? crypto.createHash('sha256').update('kbot-cred-v1:' + fallback).digest() : null;
 }
 function getBotCredentialsKeys() {
     const sources = [process.env.MANAGER_MASTER_KEY, process.env.BOT_CREDENTIALS_ENCRYPTION_KEY, ...LEGACY_BOT_CREDENTIAL_KEYS, legacyBotFileMasterKey];
@@ -2519,7 +2517,6 @@ function addLog(state, message) {
     console.log(`[BOT ${state.id}] ${message}`);
 }
 
-
 function addChatLog(
     state,
     username,
@@ -2798,6 +2795,10 @@ function withTimeout(
 function clearSpawnCommandsTimer(state) {
     if (state.spawnCommandsTimer) {
         clearTimeout(state.spawnCommandsTimer);
+        if (Array.isArray(state.afkTimers)) {
+            const idx = state.afkTimers.indexOf(state.spawnCommandsTimer);
+            if (idx !== -1) state.afkTimers.splice(idx, 1);
+        }
         state.spawnCommandsTimer = null;
     }
 }
@@ -3057,12 +3058,9 @@ function applyEcoModeOptimizations(state, bot) {
         // BẢO ĐẢM PHYSICS TICK LUÔN BẬT để server KingMC không kick do mất gói tin / timeout
         bot.physicsEnabled = true;
 
-        // Hạ CPU ~80%: triệt tiêu tính toán gia tốc khi bot đang AFK đứng yên
+        // Hạ CPU ~80%: triệt tiêu tính toán gia tốc khi bot đang AFK đứng yên (không xóa sneak của Anti-AFK)
         if (state.status === 'afk' && !state.isEating && !state.locationFlowBusy) {
             try {
-                if (typeof bot.clearControlStates === 'function') {
-                    bot.clearControlStates();
-                }
                 if (bot.entity && bot.entity.velocity) {
                     bot.entity.velocity.set(0, 0, 0);
                 }
@@ -3072,36 +3070,6 @@ function applyEcoModeOptimizations(state, bot) {
         // Cắt tỉa logs trong RAM
         if (state.logs && state.logs.length > 150) state.logs = state.logs.slice(-150);
         if (state.chatLogs && state.chatLogs.length > 150) state.chatLogs = state.chatLogs.slice(-150);
-
-        // Dọn dẹp an toàn các chunk bản đồ ở xa (> 2 chunk quanh bot) để giải phóng hàng chục MB RAM
-        try {
-            if (bot.world) {
-                const myPos = bot.entity ? bot.entity.position : null;
-                if (myPos) {
-                    const myCx = Math.floor(myPos.x / 16);
-                    const myCz = Math.floor(myPos.z / 16);
-                    if (bot.world.columns) {
-                        for (const key of Object.keys(bot.world.columns)) {
-                            const parts = key.split(',');
-                            if (parts.length === 2) {
-                                const cx = parseInt(parts[0], 10);
-                                const cz = parseInt(parts[1], 10);
-                                if (Math.abs(cx - myCx) > 2 || Math.abs(cz - myCz) > 2) {
-                                    if (typeof bot.world.unloadColumn === 'function') {
-                                        bot.world.unloadColumn(cx, cz);
-                                    } else {
-                                        delete bot.world.columns[key];
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } catch (_) {}
-
-        // Kích hoạt V8 Garbage Collection giải phóng bộ nhớ Heap thực sự
-        runGarbageCollection();
     } else {
         bot.physicsEnabled = true;
     }
@@ -3482,10 +3450,11 @@ function runSpawnCommands(state, bot) {
             addLog(state, `[SPAWN-CMD] ❌ Lỗi gửi lệnh (${formatted}): ${e.message}`);
         }
         state.spawnCommandsTimer = setTimeout(next, 1600);
+        if (Array.isArray(state.afkTimers)) state.afkTimers.push(state.spawnCommandsTimer);
     }
     state.spawnCommandsTimer = setTimeout(next, 2000);
+    if (Array.isArray(state.afkTimers)) state.afkTimers.push(state.spawnCommandsTimer);
 }
-
 
 // BUG-36: Danh sách thức ăn mở rộng — chỉ gồm item EDIBLE có thật (tên chuẩn
 // Minecraft/Mineflayer, tồn tại từ 1.8–1.13+), xếp theo giá trị dinh dưỡng/hồi phục
@@ -4870,7 +4839,7 @@ async function botSchedulerTick(state) {
                     }
 
                     const applied = await applyScheduledLifecycleAction(state, item.action, `Cố định ${item.time}`, item.command);
-                    if (applied) {
+                    if (applied || item.action === 'command') {
                         item.lastFixedRunKey = currentKey;
                         await persistBotSchedulerRuntimeState(state);
                         break;
@@ -4911,8 +4880,8 @@ async function botSchedulerTick(state) {
                     );
                     schedule.lastCycleEventIndex = eventIndex;
                     delete schedule.cycleEventRetries;
+                    await persistBotSchedulerRuntimeState(state);
                 }
-                await persistBotSchedulerRuntimeState(state);
             }
         }
     } finally {
@@ -4941,7 +4910,6 @@ function clearBotSchedulerTimer(state) {
         state.botSchedulerTimer = null;
     }
 }
-
 
 function startBackgroundManagers(state, bot) {
     clearManagerTimers(state);
@@ -5401,6 +5369,14 @@ function confirmAfkAfterClick(state, bot) {
     state.locationState = kind;
 
     if (kind === 'other') {
+        if (state.locationRetryTimer) {
+            clearTimeout(state.locationRetryTimer);
+            state.locationRetryTimer = null;
+        }
+        if (state.locationConfirmTimer) {
+            clearTimeout(state.locationConfirmTimer);
+            state.locationConfirmTimer = null;
+        }
         state.pendingAfkConfirmation = false;
         state.locationFlowBusy = false;
         state.ready = true;
@@ -5427,12 +5403,14 @@ function confirmAfkAfterClick(state, bot) {
     if (kind === 'login') {
         state.pendingAfkConfirmation = false;
         state.locationFlowBusy = false;
+        if (!state.loginFlowStartedAt) state.loginFlowStartedAt = Date.now();
         setBotStatus(state, 'authenticating');
         scheduleLocationRetry(state, bot, 'login');
         return;
     }
 
     if (kind === 'lobby') {
+        if (!state.loginFlowStartedAt) state.loginFlowStartedAt = Date.now();
         setBotStatus(state, 'entering');
         scheduleLocationRetry(state, bot, 'menu-confirm', true);
         return;
@@ -7547,7 +7525,7 @@ const HTML = String.raw`<!doctype html>
 :root {
   color-scheme: dark;
   --bg: #050811;
-  --bg-gradient: 
+  --bg-gradient:
     radial-gradient(ellipse at 12% 10%, rgba(14, 165, 233, 0.13) 0%, transparent 45%),
     radial-gradient(ellipse at 88% 88%, rgba(124, 58, 237, 0.11) 0%, transparent 50%),
     radial-gradient(ellipse at 55% 0%, rgba(16, 185, 129, 0.07) 0%, transparent 35%),
@@ -9237,7 +9215,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
     </div>
   </div>
 
-
 <div id="mainApp" class="app hidden">
 
 <section class="detail active">
@@ -10024,7 +10001,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   class="toast"
 ></div>
 
-
 <script>
 'use strict';
 
@@ -10052,7 +10028,6 @@ let refreshGeneration = 0;
 function byId(id) {
   return document.getElementById(id);
 }
-
 
 function invalidatePendingReads() {
   refreshGeneration++;
@@ -10083,7 +10058,6 @@ function runQueuedRefresh() {
     void refresh(true);
   }
 }
-
 
 function escapeHtml(value) {
   return String(value ?? '')
@@ -10408,7 +10382,6 @@ function defaultFixedTime(index) {
   const hour = (3 + Number(index || 0) * 3) % 24;
   return String(hour).padStart(2, '0') + ':00';
 }
-
 
 function collectAutoChatSchedules() {
   const box = byId('autoChatSchedules');
@@ -10862,7 +10835,6 @@ function setBotScheduleButtonsDisabled(disabled) {
     element.disabled = !!disabled;
   });
 }
-
 
 async function startBot() {
   return runBotAction('start');
@@ -12148,9 +12120,6 @@ window.addEventListener('unhandledrejection', function(event) {
   } catch (_) {}
 });
 
-
-
-
 let soundAlertEnabled = localStorage.getItem('kingmc_sound_alert') === '1';
 let lastKnownBotStatus = null;
 
@@ -12482,7 +12451,6 @@ document.addEventListener('visibilitychange', () => {
 setInterval(updateUptimeDisplay, 1000);
 </script>
 
-
 </body>
 </html>`;
 
@@ -12698,7 +12666,6 @@ function publicBotSchedulesState(state, options = {}) {
     }));
 }
 
-
 app.get('/api/settings', (req, res) => {
     const isAdmin = isAdminRequest(req);
     res.json({
@@ -12811,6 +12778,9 @@ app.post('/api/settings', async (req, res) => {
 
         if (wasReadyAfk) {
             botState.ready = true;
+            if (nextSettings.antiAfkKick !== false) {
+                startSmartAntiAfk(botState);
+            }
         }
     }
 
@@ -13216,7 +13186,6 @@ app.post(['/api/bot/chat-logs/clear', '/api/chat-logs/clear'], async (req, res) 
     return res.json({ ok: true, revision: botState.chatLogRevision, deleted: result.deleted, message: 'Đã xóa Chat Log trên Supabase.' });
 });
 
-
 // -----------------------------------------------------------------------------
 // API: node identity / central dashboard capability discovery
 // -----------------------------------------------------------------------------
@@ -13245,7 +13214,7 @@ app.get(
                 restart: '/api/bot/restart',
                 send: '/api/bot/send',
                 account: '/api/bot/account',
-                
+
                 moveInventory: '/api/inventory/move',
                 equip: '/api/inventory/equip',
                 unequip: '/api/inventory/unequip',
@@ -13266,7 +13235,6 @@ app.get(
 
 // -----------------------------------------------------------------------------
 // API: current bot credentials
-//
 // Used only by the central Manager after the Manager ADMIN password has been
 // validated there. Credentials are read directly from runtime botState so a
 // runtime account change is reflected immediately.
@@ -13960,6 +13928,9 @@ app.post('/api/bot/supabase/reload', async (req, res) => {
     if (!identity.ok) return res.status(409).json({ ok: false, error: identity.error || 'BOT_ID không hợp lệ.' });
     const result = await initBotSupabaseSync({ force: true });
     if (!result?.ok) return res.status(502).json({ ok: false, error: result?.error || 'Không thể tải cấu hình từ Supabase.' });
+    if ((botState.manuallyStopped === true || !String(botState.username || '').trim()) && (botState.bot || botState.status !== 'offline')) {
+        stopBot(botState, 'Đồng bộ Cloud yêu cầu dừng bot (manuallyStopped / cleared credentials)');
+    }
     botState.stateRevision++;
     res.json({ ok: true, botId: getEffectiveBotId(), restored: result.restored === true, message: result.restored ? 'Đã tải cấu hình Supabase vào worker.' : 'Cloud chưa có cấu hình cho bot này.' });
 });
@@ -15069,7 +15040,6 @@ app.post(
 // Render / Google Apps Script can call /health.
 // -----------------------------------------------------------------------------
 
-
 // -----------------------------------------------------------------------------
 // Remote GUI Inspector API
 // -----------------------------------------------------------------------------
@@ -15340,7 +15310,7 @@ const BOT_PUBLIC_LOGIN_HTML = `<!doctype html>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800;850&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif; }
-    
+
     @keyframes auroraFloat {
       0%, 100% { transform: translate(0, 0) scale(1); opacity: 0.28; }
       50% { transform: translate(30px, -24px) scale(1.18); opacity: 0.42; }
@@ -15984,7 +15954,6 @@ async function initBotSupabaseSync({ force = false } = {}) {
     }
 }
 
-
 // -----------------------------------------------------------------------------
 // Graceful process shutdown
 // -----------------------------------------------------------------------------
@@ -16068,7 +16037,6 @@ process.on('unhandledRejection', (reason) => {
 
 // -----------------------------------------------------------------------------
 // FINAL STARTUP STATE
-//
 // - BOT_CONFIG có username/password => tự khởi động sau khi HTTP service listen.
 // - BOT_CONFIG thiếu credential => giữ OFFLINE để chờ nhập từ web.
 // - AUTO_START=false => tắt auto-start nhưng vẫn giữ nút Chạy thủ công.
@@ -16083,13 +16051,10 @@ resetInventoryState(botState);
 // Auto-start được gọi sau khi HTTP server listen xong để bot chỉ kết nối
 // sau khi dashboard/web service đã sẵn sàng.
 
-
 // ============================================================================
 // END OF FILE
 // ============================================================================
-//
 // File này là bản 1-bot hardcoded hoàn chỉnh.
-//
 // Chức năng giữ lại:
 // - Mineflayer
 // - Express dashboard
@@ -16115,7 +16080,6 @@ resetInventoryState(botState);
 // - Graceful shutdown
 // - BOT_ID hardcode trong BOT_CONFIG
 // - CORS/API discovery cho central dashboard
-//
 // Lưu ý:
 // Phần này chỉ là marker kết thúc file.
 // Không cần thêm code khác sau đây.
