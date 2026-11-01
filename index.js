@@ -62,7 +62,7 @@ function runGarbageCollection() {
 // ============================================================================
 const BOT_CONFIG = {
     // --- 0. KHÓA BẢO MẬT NỘI BỘ MANAGER <-> BOT CON ---
-    BOT_SECRET_KEY: '',                  // Khóa bí mật service-to-service — BẮT BUỘC đặt qua biến môi trường BOT_SECRET_KEY (SEC-01/SEC-05: đã loại bỏ default hard-code)
+    BOT_SECRET_KEY: 'kbot2026',                  // Khóa bí mật service-to-service — BẮT BUỘC đặt qua biến môi trường BOT_SECRET_KEY (SEC-01/SEC-05: đã loại bỏ default hard-code)
     ADMIN_PASSWORD: '',                  // Mật khẩu quản trị worker — chỉ qua biến môi trường BOT_ADMIN_PASSWORD (SEC-02: đã loại bỏ default 'admin123')
     MANAGER_API_URL: '',                  // URL của Web Manager (VD: 'https://kbot-manager.onrender.com' hoặc 'http://localhost:3000')
 
