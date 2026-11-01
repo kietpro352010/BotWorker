@@ -1,19 +1,13 @@
 {
-  "name": "kingmc-afk-bot",
+  "name": "kbot-worker",
   "version": "1.0.0",
-  "description": "Enterprise KingMC AFK Bot & Fleet Management System",
-  "main": "manager.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node manager.js",
-    "bot": "node bot.js",
-    "start:bot": "node bot.js",
-    "dev": "node -e \"const {spawn} = require('child_process'); const m = spawn(process.execPath, ['manager.js'], {stdio: 'inherit'}); const b = spawn(process.execPath, ['bot.js'], {stdio: 'inherit'}); process.on('SIGINT', () => { m.kill(); b.kill(); process.exit(0); });\"",
-    "test": "node --check manager.js && node --check bot.js",
-    "test:e2e": "node test_verify.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "express": "4.21.2",
-    "mineflayer": "4.37.1",
-    "socks": "^2.8.10"
+    "express": "^4.21.2",
+    "mineflayer": "^4.24.0",
+    "socks": "^2.8.3"
   }
 }
