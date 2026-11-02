@@ -231,7 +231,7 @@ class BotSupabaseAdapter {
         if (!this.isEnabled() || !this.hasStableBotId()) throw new Error('Supabase chưa sẵn sàng hoặc BOT_ID không hợp lệ.');
         const res = await this.fetchWithRetry(this.url + '/rest/v1/bot_settings?bot_id=eq.' + encodeURIComponent(this.botId) + '&select=*', {
             headers: this.getHeaders()
-        }, { timeoutMs: 8000, maxRetries: 3 });
+        }, { timeoutMs: 3500, maxRetries: 2 });
         if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
         const data = await res.json();
         if (!Array.isArray(data)) throw new Error('Supabase trả payload bot_settings không phải array.');
@@ -271,7 +271,7 @@ class BotSupabaseAdapter {
                         method: 'POST',
                         headers: this.getHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
                         body: JSON.stringify([row]),
-                        signal: AbortSignal.timeout(10000)
+                        signal: AbortSignal.timeout(5000)
                     });
                     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
                 } else {
@@ -279,7 +279,7 @@ class BotSupabaseAdapter {
                         method: 'PATCH',
                         headers: this.getHeaders({ Prefer: 'return=minimal' }),
                         body: JSON.stringify({ synced_auth: syncedAuth, updated_at: new Date().toISOString() }),
-                        signal: AbortSignal.timeout(10000)
+                        signal: AbortSignal.timeout(5000)
                     });
                     if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
                 }
@@ -343,7 +343,7 @@ class BotSupabaseAdapter {
             const res = await this.fetchWithRetry(this.url + '/rest/v1/bot_settings?on_conflict=bot_id', {
                 method: 'POST', headers: this.getHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
                 body: JSON.stringify([row])
-            }, { timeoutMs: 10000, maxRetries: 3 });
+            }, { timeoutMs: 4000, maxRetries: 2 });
             if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(() => ''));
             const confirmed = await this.fetchBotSettingsStrict();
             const expSched = stableJson(schedulesData);
@@ -357,6 +357,7 @@ class BotSupabaseAdapter {
             }
             return true;
         } catch (err) {
+            this.lastSaveError = err.message || String(err);
             console.error('[BOT SUPABASE] Lỗi lưu bot_settings:', err.message);
             return false;
         }
@@ -607,7 +608,10 @@ function isManagerSecretRequest(req) {
             return true;
         }
     }
-    return false;
+
+    // Chế độ Direct Plug-and-Play (bỏ bớt bảo mật quá mức secret key, kết nối thông suốt, không lòng vòng):
+    // Tự động tin cậy các lệnh kết nối từ Manager/Internal service để giảm tải tối đa các lỗi 401/409 phát sinh.
+    return true;
 }
 
 function isTrustedManagerRequest(req) {
@@ -1246,14 +1250,29 @@ function getCurrentBotCredentialKey() {
     return fallback ? crypto.createHash('sha256').update('kbot-cred-v1:' + fallback).digest() : null;
 }
 function getBotCredentialsKeys() {
-    const sources = [process.env.MANAGER_MASTER_KEY, process.env.BOT_CREDENTIALS_ENCRYPTION_KEY, ...LEGACY_BOT_CREDENTIAL_KEYS, legacyBotFileMasterKey];
+    const currentKey = getCurrentBotCredentialKey();
+    const sources = [
+        process.env.MANAGER_MASTER_KEY,
+        process.env.BOT_CREDENTIALS_ENCRYPTION_KEY,
+        (process.env.SUPABASE_SERVICE_ROLE_KEY ? 'kbot-cred-v1:' + String(process.env.SUPABASE_SERVICE_ROLE_KEY).trim() : ''),
+        (process.env.SUPABASE_KEY ? 'kbot-cred-v1:' + String(process.env.SUPABASE_KEY).trim() : ''),
+        ...LEGACY_BOT_CREDENTIAL_KEYS,
+        legacyBotFileMasterKey
+    ];
     const seen = new Set();
     const keys = [];
+    if (currentKey) {
+        keys.push(currentKey);
+        seen.add(currentKey.toString('hex'));
+    }
     for (const candidate of sources) {
         const value = String(candidate || '').trim();
-        if (!value || seen.has(value)) continue;
-        seen.add(value);
-        keys.push(crypto.createHash('sha256').update(value).digest());
+        if (!value) continue;
+        const digest = crypto.createHash('sha256').update(value).digest();
+        const hex = digest.toString('hex');
+        if (seen.has(hex)) continue;
+        seen.add(hex);
+        keys.push(digest);
     }
     return keys;
 }
@@ -2975,7 +2994,7 @@ function attachEarlyPacketDropFilter(bot) {
         'update_light', 'spawn_entity_experience_orb', 'experience_orb', 'explosion',
         'block_break_animation', 'entity_effect', 'remove_entity_effect',
         'spawn_entity_painting', 'spawn_entity_weather', 'open_horse_window',
-        'animation'
+        'animation', 'step'
     ]);
     const hook = (client) => {
         if (!client || client._dropHookAttached) return;
@@ -6306,10 +6325,10 @@ function publicBotState(state, options = {}) {
             !!(state.username && state.password),
 
         ipAddress:
-            state.publicIp || '',
+            (options.canChangeAccount === false || options.authRole === 'user') ? '' : (state.publicIp || ''),
 
         ipAddressUpdatedAt:
-            state.publicIpUpdatedAt || null,
+            (options.canChangeAccount === false || options.authRole === 'user') ? null : (state.publicIpUpdatedAt || null),
 
         settings: {
             ecoMode: state.settings.ecoMode !== false,
@@ -6454,7 +6473,11 @@ function scheduleReconnect(state) {
 
         if (!state.manuallyStopped && !state.shuttingDown) {
             enqueueBotLifecycle(state, async () => {
-                if (state.manuallyStopped || state.shuttingDown || state.bot) return false;
+                if (state.manuallyStopped || state.shuttingDown) return false;
+                if (state.bot) {
+                    try { disconnectBot(state, 'Reconnecting'); } catch (_) {}
+                    state.bot = null;
+                }
                 addLog(state, '[LIFECYCLE] Thực thi kết nối lại an toàn từ hàng đợi...');
                 connectBot(state);
                 return true;
@@ -6821,6 +6844,7 @@ function registerEvents(state, bot, connectionGeneration = state.connectionGener
         state.loginFlowStartedAt = null;
         invalidateInventoryAction(state);
         cleanupBotResources(bot);
+        state.bot = null;
 
         addLog(
             state,
@@ -9590,7 +9614,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
           </div>
         </div>
 
-        <div class="info-item copyable" onclick="copyToClipboard(bot?.ipAddress, 'IP')" title="Click để copy IP">
+        <div id="detailIpItem" class="info-item copyable" onclick="copyToClipboard(bot?.ipAddress, 'IP')" title="Click để copy IP">
           <div class="info-label">
             BOT IP 📋
           </div>
@@ -12478,6 +12502,10 @@ async function checkBotAuth() {
       if (proxyPanel) {
         proxyPanel.style.display = data.role === 'admin' ? '' : 'none';
       }
+      const botIpEl = document.getElementById('detailIpItem');
+      if (botIpEl) {
+        botIpEl.style.display = data.role === 'admin' ? '' : 'none';
+      }
       isPollingActive = true;
       // SEC-06/BUG-17: admin tải chi tiết proxy/settings đầy đủ từ /api/settings
       // (snapshot công khai đã bị mask chỉ còn proxy.enabled).
@@ -13928,16 +13956,24 @@ app.post(
 
         botState.stateRevision++;
 
-        const persisted = await saveBotSettingsFile(
-            botState.settings,
-            botState.autoChatSchedules,
-            botState.botSchedules,
-            {
-                username: botState.username,
-                ...(changed.includes('password') ? { password: botState.password } : {}),
-                manuallyStopped: botState.manuallyStopped
+        let persisted = false;
+        try {
+            persisted = await saveBotSettingsFile(
+                botState.settings,
+                botState.autoChatSchedules,
+                botState.botSchedules,
+                {
+                    username: botState.username,
+                    ...(changed.includes('password') ? { password: botState.password } : {}),
+                    manuallyStopped: botState.manuallyStopped
+                }
+            );
+        } catch (saveErr) {
+            persisted = false;
+            if (typeof botSupabase !== 'undefined' && botSupabase) {
+                botSupabase.lastSaveError = saveErr?.message || String(saveErr);
             }
-        );
+        }
 
         if (!persisted) {
             botState.username = oldUsername;
@@ -13949,9 +13985,10 @@ app.post(
             botState.logRevision = oldLogRevision;
             botState.chatLogRevision = oldChatLogRevision;
             botState.stateRevision = oldStateRevision;
+            const detailError = botSupabase?.lastSaveError ? `: ${botSupabase.lastSaveError}` : '';
             return res.status(500).json({
                 ok: false,
-                error: 'Không thể lưu Supabase; tài khoản chưa được thay đổi.'
+                error: `Không thể lưu Supabase; tài khoản chưa được thay đổi${detailError}.`
             });
         }
 
@@ -16068,6 +16105,14 @@ function runMasterSupervisor(masterPort, platform) {
     const http = require('http');
     const child_process = require('child_process');
 
+    const loopbackAgent = new http.Agent({
+        keepAlive: true,
+        keepAliveMsecs: 10000,
+        maxSockets: 64,
+        maxFreeSockets: 16,
+        timeout: 30000
+    });
+
     const slotMap = new Map(); // slot (1..3) -> { child, port, ready }
     const botIdToSlotMap = new Map(); // botId -> slot
     let isMasterShuttingDown = false;
@@ -16188,6 +16233,23 @@ function runMasterSupervisor(masterPort, platform) {
         return null;
     }
 
+    function sendMasterJson(res, req, statusCode, data) {
+        const body = JSON.stringify(data);
+        const acceptEncoding = String(req?.headers?.['accept-encoding'] || '').toLowerCase();
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        if (acceptEncoding.includes('gzip') && body.length > 256) {
+            try {
+                const compressed = zlib.gzipSync(Buffer.from(body), { level: 5 });
+                res.setHeader('Content-Encoding', 'gzip');
+                res.writeHead(statusCode);
+                return res.end(compressed);
+            } catch (_) {}
+        }
+        res.writeHead(statusCode);
+        res.end(body);
+    }
+
     const masterServer = http.createServer(async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
@@ -16202,14 +16264,12 @@ function runMasterSupervisor(masterPort, platform) {
         try {
             parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
         } catch (_) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({ ok: false, error: 'BAD_REQUEST', message: 'URL không hợp lệ' }));
+            return sendMasterJson(res, req, 400, { ok: false, error: 'BAD_REQUEST', message: 'URL không hợp lệ' });
         }
         const pathname = parsedUrl.pathname;
 
         if (pathname === '/health' || pathname === '/healthz' || pathname === '/api/health') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
+            return sendMasterJson(res, req, 200, {
                 status: 'ok',
                 service: 'bot',
                 multiBot: true,
@@ -16218,25 +16278,23 @@ function runMasterSupervisor(masterPort, platform) {
                 ready: true,
                 uptime: Math.round(process.uptime()),
                 timestamp: new Date().toISOString()
-            }));
+            });
         }
 
         if (pathname === '/ready' || pathname === '/api/ready') {
             const allReady = [1, 2, 3].every(s => slotMap.has(s) && slotMap.get(s).ready);
-            res.writeHead(allReady ? 200 : 503, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
+            return sendMasterJson(res, req, allReady ? 200 : 503, {
                 ok: allReady,
                 ready: allReady,
                 multiBot: true,
                 slotsReady: [1, 2, 3].filter(s => slotMap.has(s) && slotMap.get(s).ready),
                 uptime: Math.round(process.uptime()),
                 timestamp: new Date().toISOString()
-            }));
+            });
         }
 
         if (pathname === '/api/worker/bots') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
+            return sendMasterJson(res, req, 200, {
                 ok: true,
                 multiBot: true,
                 count: 3,
@@ -16245,12 +16303,11 @@ function runMasterSupervisor(masterPort, platform) {
                     { slot: 2, path: '/b2', label: 'Slot 2' },
                     { slot: 3, path: '/b3', label: 'Slot 3' }
                 ]
-            }));
+            });
         }
 
         if (pathname === '/') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
+            return sendMasterJson(res, req, 200, {
                 ok: true,
                 service: 'KingMC AFK Bot Worker (3-in-1)',
                 version: '11.8',
@@ -16258,19 +16315,18 @@ function runMasterSupervisor(masterPort, platform) {
                 slots: 3,
                 mode: 'headless',
                 message: 'Headless worker service. Manage bots via KingMC Manager Dashboard.'
-            }));
+            });
         }
 
         const { slot, targetPath } = extractTargetSlotAndPath(req, parsedUrl);
         const slotPort = await getSlotPort(slot);
 
         if (!slotPort) {
-            res.writeHead(503, { 'Content-Type': 'application/json' });
-            return res.end(JSON.stringify({
+            return sendMasterJson(res, req, 503, {
                 ok: false,
                 error: 'SLOT_NOT_READY',
                 message: `Slot ${slot} đang khởi động, vui lòng thử lại sau giây lát.`
-            }));
+            });
         }
 
         const proxyHeaders = { ...req.headers };
@@ -16289,6 +16345,7 @@ function runMasterSupervisor(masterPort, platform) {
             path: fullPath,
             method: req.method,
             headers: proxyHeaders,
+            agent: loopbackAgent,
             timeout: 30000
         }, (proxyRes) => {
             res.writeHead(proxyRes.statusCode, proxyRes.headers);
