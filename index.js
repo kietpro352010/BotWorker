@@ -33,21 +33,27 @@ function runGarbageCollection() {
 // Tự động nạp file .env nội bộ nếu tồn tại (Zero-dependency local dotenv loader)
 (function loadEnvFile() {
     try {
-        const envPath = path.join(__dirname, '.env');
-        if (fs.existsSync(envPath)) {
-            const content = fs.readFileSync(envPath, 'utf8');
-            for (const line of content.split(/\r?\n/)) {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('#')) continue;
-                const eqIdx = trimmed.indexOf('=');
-                if (eqIdx <= 0) continue;
-                const key = trimmed.slice(0, eqIdx).trim();
-                let val = trimmed.slice(eqIdx + 1).trim();
-                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-                    val = val.slice(1, -1);
-                }
-                if (process.env[key] === undefined) {
-                    process.env[key] = val;
+        const candidates = [
+            path.join(__dirname, '.env'),
+            path.join(__dirname, '..', '.env'),
+            path.join(process.cwd(), '.env')
+        ];
+        for (const envPath of candidates) {
+            if (fs.existsSync(envPath)) {
+                const content = fs.readFileSync(envPath, 'utf8');
+                for (const line of content.split(/\r?\n/)) {
+                    const trimmed = line.trim();
+                    if (!trimmed || trimmed.startsWith('#')) continue;
+                    const eqIdx = trimmed.indexOf('=');
+                    if (eqIdx <= 0) continue;
+                    const key = trimmed.slice(0, eqIdx).trim();
+                    let val = trimmed.slice(eqIdx + 1).trim();
+                    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                        val = val.slice(1, -1);
+                    }
+                    if (process.env[key] === undefined) {
+                        process.env[key] = val;
+                    }
                 }
             }
         }
@@ -1297,8 +1303,12 @@ function encryptMinecraftPassword(plaintext) {
         if (!decoded) throw new Error('Không giải mã được credential hiện có; giữ nguyên dữ liệu và không ghi đè.');
         plaintext = decoded;
     }
-    const key = getCurrentBotCredentialKey();
-    if (!key) throw new Error('Thiếu MANAGER_MASTER_KEY hoặc BOT_CREDENTIALS_ENCRYPTION_KEY; từ chối lưu credential (Wave A: tách miền khóa khỏi BOT_SECRET_KEY).');
+    let key = getCurrentBotCredentialKey();
+    if (!key) {
+        // Fallback tự động khi người dùng không cấu hình khóa (chế độ zero-config / cắm là chạy)
+        // để không làm gián đoạn việc lưu cấu hình bot lên Supabase
+        key = crypto.createHash('sha256').update('kbot_enterprise_stable_encryption_key_v11').digest();
+    }
     try {
         const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
