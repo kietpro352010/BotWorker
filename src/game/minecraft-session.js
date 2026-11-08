@@ -395,7 +395,7 @@ class MinecraftSession extends EventEmitter {
   isHeld() { return Boolean(this.restriction); }
 
   requireOnlineBot() {
-    if (!this.bot || !this.bot.player || !this.bot.entity || !['online', 'entering'].includes(this.state)) {
+    if (!this.bot || !this.bot._client || !['online', 'entering'].includes(this.state)) {
       throw new Error('Worker is not connected to Minecraft.');
     }
     return this.bot;

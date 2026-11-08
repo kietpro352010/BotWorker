@@ -73,6 +73,7 @@ function enforceZeroFarmEntities(bot) {
     } catch (_) {}
   }, 5000);
   timer.unref?.();
+  bot.once?.('end', () => clearInterval(timer));
 }
 
 function applyEcoPhysics(bot) {
@@ -107,6 +108,7 @@ function startChunkPruner(bot, { intervalMs = 30000, radius = 2 } = {}) {
     try { pruneFarChunks(bot, radius); } catch (_) {}
   }, intervalMs);
   timer.unref?.();
+  bot?.once?.('end', () => clearInterval(timer));
   return timer;
 }
 
