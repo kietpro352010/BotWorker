@@ -112,4 +112,4 @@ function startChunkPruner(bot, { intervalMs = 30000, radius = 2 } = {}) {
   return timer;
 }
 
-module.exports = { DISABLED_PLUGINS, DROP_EVENTS, attachEarlyPacketDropFilter, applyEcoPhysics, pruneFarChunks, startChunkPruner };
+module.exports = { DISABLED_PLUGINS, DROP_EVENTS, attachEarlyPacketDropFilter, enforceZeroFarmEntities, applyEcoPhysics, pruneFarChunks, startChunkPruner };

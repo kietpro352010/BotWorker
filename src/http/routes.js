@@ -23,7 +23,9 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false } = {}) {
     try {
       const result = await req.workerInstance.runtime.execute(action, req.body?.payload || {});
       return res.json({ ok: true, result });
-    } catch (error) { return next(error); }
+    } catch (error) {
+      return res.status(400).json({ ok: false, error: error.message || 'command_failed' });
+    }
   });
 
   if (legacy) {

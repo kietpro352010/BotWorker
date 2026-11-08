@@ -51,7 +51,9 @@ function readSlot(env, slot, common) {
 
 function loadConfig(env = process.env) {
   const managerUrl = required(env.MANAGER_URL, 'MANAGER_URL').replace(/\/+$/, '');
-  if (!/^https:\/\//i.test(managerUrl)) throw new Error('MANAGER_URL must use HTTPS.');
+  if (!/^https:\/\//i.test(managerUrl) && !/^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(managerUrl)) {
+    throw new Error('MANAGER_URL must use HTTPS.');
+  }
 
   const hosts = String(env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
     .split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
