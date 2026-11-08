@@ -1,0 +1,22 @@
+{
+  "name": "kingmc-afk-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Modular KingMC AFK worker with Render HTTP and Wispbyte poll transports.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node --max-old-space-size=384 src/index.js",
+    "start:render": "cross-env WORKER_TRANSPORT=render-http node --max-old-space-size=384 src/index.js",
+    "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 src/index.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^4.21.2",
+    "helmet": "^8.1.0",
+    "mineflayer": "^4.37.1",
+    "socks": "^2.8.3",
+    "cross-env": "^7.0.3"
+  }
+}
+
