@@ -6,7 +6,10 @@ const { SocksClient } = require('socks');
 const AfkController = require('./afk-controller');
 const LobbyNavigator = require('./lobby-navigator');
 const ServerMonitor = require('./server-monitor');
-const { ServerAuth, cleanText, normalize, isRestrictedMinecraftCommand } = require('./server-auth');
+const {
+  ServerAuth, cleanText, normalize, isRestrictedMinecraftCommand,
+  getLocationKind, isVerificationSuccessNotice, extractChatMessage
+} = require('./server-auth');
 const { parseSocksProxy } = require('../config/proxy');
 const { normalizeState } = require('../domain/worker-state');
 const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, startChunkPruner } = require('./packet-optimization');
@@ -30,6 +33,9 @@ class MinecraftSession extends EventEmitter {
     this.hostIndex = 0;
     this.reconnectTimer = null;
     this.connectTimer = null;
+    this.locationTimer = null;
+    this.lastLocationKind = 'unknown';
+    this.lastAuthSendAt = 0;
     this.generation = 0;
     this.reconnectAttempts = 0;
     this.reconnectCount = 0;
@@ -169,6 +175,8 @@ class MinecraftSession extends EventEmitter {
       bot.on('kicked', (reason) => this.onKicked(bot, generation, reason));
       bot.on('end', () => this.onEnd(bot, generation));
       bot.on('message', (json) => this.onMessage(bot, generation, json));
+      bot.on('actionBar', (json) => this.onMessage(bot, generation, json));
+      bot.on('title', (json) => this.onMessage(bot, generation, json));
       bot.on('chat', (username, message) => this.recordChat(bot, username, message));
       bot.on('whisper', (username, message) => this.recordChat(bot, username, message));
       bot.once('spawn', () => this.onSpawn(bot, generation, host));
@@ -198,20 +206,56 @@ class MinecraftSession extends EventEmitter {
     this.navigator.onSpawn(bot);
     this.afk.mode = this.afkMode;
     this.afk.start(bot);
-    setTimeout(() => {
-      if (this.bot === bot && generation === this.generation && this.state === 'entering') {
-        this.setState('online', 'spawn_ready');
-        this.emit('event', { type: 'online', host });
+
+    this.startLocationMonitor(bot, generation, host);
+  }
+
+  startLocationMonitor(bot, generation, host) {
+    if (this.locationTimer) clearInterval(this.locationTimer);
+    this.lastLocationKind = 'unknown';
+
+    const check = () => {
+      if (this.bot !== bot || generation !== this.generation || this.manualStop) {
+        if (this.locationTimer) clearInterval(this.locationTimer);
+        this.locationTimer = null;
+        return;
       }
-    }, Math.max(3000, this.config.joinDelayMs + 1000)).unref?.();
+      const kind = getLocationKind(bot);
+      const prevKind = this.lastLocationKind;
+      this.lastLocationKind = kind;
+
+      if (kind === 'login') {
+        if (this.state !== 'authenticating') this.setState('authenticating', 'auth_lobby');
+        const now = Date.now();
+        if (now - this.lastAuthSendAt >= 1500) {
+          this.lastAuthSendAt = now;
+          if (prevKind === 'login') {
+            this.auth.sendDirectAuth(bot, 'dn');
+          } else {
+            this.auth.sendDirectAuth(bot, 'login');
+          }
+        }
+      } else if (kind === 'lobby') {
+        if (this.state !== 'entering') this.setState('entering', 'server_lobby');
+        this.navigator.tryJoin(bot);
+      } else if (kind === 'other') {
+        if (this.state !== 'online') {
+          this.setState('online', 'kingmc_in_game');
+          this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
+        }
+      }
+    };
+
+    setTimeout(check, 800);
+    this.locationTimer = setInterval(check, 1500);
+    this.locationTimer.unref?.();
   }
 
   onMessage(bot, generation, json) {
     if (this.bot !== bot || generation !== this.generation) return;
-    let raw = '';
-    try { raw = typeof json === 'string' ? json : (json?.toString?.() || JSON.stringify(json)); } catch (_) {}
-    const text = cleanText(raw);
+    const text = extractChatMessage(json);
     if (!text) return;
+    this.logger.info('minecraft_message_received', { text: text.slice(0, 160) });
     const classification = classifyServerText(text);
     if (classification === 'maintenance') {
       if (this.state === 'maintenance') return;
@@ -228,14 +272,26 @@ class MinecraftSession extends EventEmitter {
 
   onKicked(bot, generation, reason) {
     if (this.bot !== bot || generation !== this.generation) return;
-    const text = cleanText(typeof reason === 'string' ? reason : JSON.stringify(reason));
+    const text = extractChatMessage(reason) || cleanText(typeof reason === 'string' ? reason : JSON.stringify(reason));
     this.lastKickReason = text.slice(0, 300);
+    const isVerificationKick = isVerificationSuccessNotice(text);
     const classification = classifyServerText(text);
-    this.emit('event', { type: 'kicked', reason: this.lastKickReason });
+
+    this.emit('event', {
+      type: 'kicked',
+      reason: this.lastKickReason,
+      message: this.lastKickReason
+    });
+
     if (classification === 'ip_limited' || classification === 'banned') {
       this.pauseForRestriction(classification, text);
     } else if (classification === 'maintenance') {
       this.setState('maintenance', 'maintenance_kick');
+    } else if (isVerificationKick) {
+      this.logger.info('kingmc_verification_kick_detected', { text: this.lastKickReason });
+      this.setState('error', 'verification_kick');
+      this.reconnectAttempts = 0;
+      this.scheduleReconnect(2500);
     } else {
       this.setState('error', 'kicked');
     }
@@ -245,6 +301,8 @@ class MinecraftSession extends EventEmitter {
     if (this.bot !== bot || generation !== this.generation) return;
     this.bot = null;
     this.connectedAt = null;
+    if (this.locationTimer) clearInterval(this.locationTimer);
+    this.locationTimer = null;
     this.afk.stop();
     this.monitor.detach();
     this.navigator.clear();
@@ -511,8 +569,10 @@ class MinecraftSession extends EventEmitter {
   clearTimers() {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
+    if (this.locationTimer) clearInterval(this.locationTimer);
     this.reconnectTimer = null;
     this.connectTimer = null;
+    this.locationTimer = null;
   }
 
   getStatus() {

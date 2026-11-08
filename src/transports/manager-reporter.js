@@ -31,9 +31,11 @@ class ManagerReporter {
 
   async bootstrap() {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/bootstrap`;
+    const startedAt = Date.now();
     const response = await this.fetch(`${this.baseUrl}${path}`, {
       headers: { 'x-worker-secret': this.secret }, signal: AbortSignal.timeout(8000)
     });
+    this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
     const body = await response.json().catch(() => ({}));
     if (!response.ok || !body.ok) throw new Error(body.error || `manager_http_${response.status}`);
     return body;
