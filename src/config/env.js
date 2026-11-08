@@ -53,7 +53,7 @@ function loadConfig(env = process.env) {
   const managerUrl = required(env.MANAGER_URL, 'MANAGER_URL').replace(/\/+$/, '');
   if (!/^https:\/\//i.test(managerUrl)) throw new Error('MANAGER_URL must use HTTPS.');
 
-  const hosts = String(env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
+  const hosts = String(env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn,java.kingmc.vn')
     .split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
   const validHost = (host) => isIP(host) !== 0 || /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(host);
   if (!hosts.length || hosts.some((host) => !validHost(host))) {
