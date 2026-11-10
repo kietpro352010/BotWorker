@@ -44,7 +44,7 @@ class LobbyNavigator {
     this.joinCommand = joinCommand;
     this.joinDelayMs = joinDelayMs;
     this.logger = logger;
-    this.state = 'IDLE'; // FSM: IDLE -> SELECT_COMPASS_SLOT -> USE_COMPASS -> WAIT_MENU_WINDOW -> CLICK_TARGET_SERVER_SLOT -> VERIFY_AFK_ZONE
+    this.state = 'IDLE'; // FSM: IDLE -> SELECT_COMPASS -> USE_COMPASS -> WAIT_MENU -> CLICK_SERVER -> AFK_LOCKED
     this.timer = null;
     this.bot = null;
     this.lastJoinAt = 0;
@@ -123,7 +123,7 @@ class LobbyNavigator {
       if (clicked || this.bot !== bot) return;
       clicked = true;
       this.clearMenuListener(bot);
-      this.transitionTo('CLICK_TARGET_SERVER_SLOT');
+      this.transitionTo('CLICK_SERVER');
 
       setTimeout(() => {
         if (this.bot !== bot) return;
@@ -133,19 +133,20 @@ class LobbyNavigator {
             if (Array.isArray(targetWindow.slots) && targetWindow.slots.length <= 24) {
               this.logger.warn('lobby_menu_missing_slot_24', { totalSlots: targetWindow.slots.length });
               this.serverJoinBusy = false;
+              try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
               this.transitionTo('IDLE', { reason: 'missing_slot_24' });
               return;
             }
             this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
             bot.clickWindow(24, 0, 0);
-            this.transitionTo('VERIFY_AFK_ZONE');
+            this.transitionTo('AFK_LOCKED');
           } catch (clickErr) {
             this.logger.warn('lobby_menu_click_failed', { error: clickErr.message });
           } finally {
             setTimeout(() => {
               this.serverJoinBusy = false;
               if (getLocationKind(bot) === 'other') {
-                this.transitionTo('IDLE', { verified: true });
+                this.transitionTo('AFK_LOCKED', { verified: true });
               }
             }, 2000);
           }
@@ -159,20 +160,25 @@ class LobbyNavigator {
     if (bot.currentWindow) {
       doClickSlot24(bot.currentWindow);
     } else {
-      this.transitionTo('WAIT_MENU_WINDOW');
+      this.transitionTo('WAIT_MENU');
       this.pendingMenuListener = (win) => doClickSlot24(win);
       bot.once('windowOpen', this.pendingMenuListener);
       this.pendingMenuCleanup = setTimeout(() => {
         this.clearMenuListener(bot);
         this.serverJoinBusy = false;
-        if (this.state === 'WAIT_MENU_WINDOW') {
-          this.transitionTo('IDLE', { reason: 'menu_window_timeout' });
+        try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
+        if (this.serverJoinAttempts < 3) {
+          this.triggerServerJoin(bot, `retry_after_timeout_${this.serverJoinAttempts}`);
+        } else {
+          if (this.state === 'WAIT_MENU') {
+            this.transitionTo('IDLE', { reason: 'menu_window_timeout' });
+          }
         }
       }, 5000);
     }
 
     // 1. Right-click selector item in hotbar
-    this.transitionTo('SELECT_COMPASS_SLOT');
+    this.transitionTo('SELECT_COMPASS');
     try {
       const selectorSlot = findMenuSelectorSlot(bot);
       if (selectorSlot >= 0 && typeof bot.setQuickBarSlot === 'function') {
@@ -202,7 +208,7 @@ class LobbyNavigator {
       } catch (_) {}
     }, 400);
 
-    // 3. Retry loop (up to 5 attempts)
+    // 3. Retry loop (up to 3 attempts)
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       if (this.bot !== bot) return;
@@ -210,11 +216,12 @@ class LobbyNavigator {
       if (currentKind === 'other') {
         this.serverJoinAttempts = 0;
         this.serverJoinBusy = false;
-        this.transitionTo('IDLE', { verified: true });
+        this.transitionTo('AFK_LOCKED', { verified: true });
         return;
       }
-      if (this.serverJoinAttempts < 5) {
+      if (this.serverJoinAttempts < 3) {
         this.serverJoinBusy = false;
+        try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
         this.triggerServerJoin(bot, `retry_${this.serverJoinAttempts}`);
       } else {
         this.logger.warn('lobby_server_join_exhausted', { attempts: this.serverJoinAttempts });

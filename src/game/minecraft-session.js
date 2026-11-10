@@ -356,9 +356,11 @@ class MinecraftSession extends EventEmitter {
       }
       bot.entities = {};
       bot.players = {};
+      bot.registry = null;
       bot.world = null;
       bot.blockAt = null;
     }
+    this.bot = null;
     this.connectedAt = null;
   }
 

@@ -5,7 +5,8 @@ const DROP_EVENTS = new Set([
   'spawn_entity_experience_orb', 'experience_orb',
   'spawn_entity_weather', 'spawn_entity_painting',
   'world_particles', 'particle', 'sound_effect', 'named_sound_effect', 'sound_entity',
-  'update_light', 'explosion', 'block_break_animation',
+  'update_light', 'light_update', 'map_chunk', 'chunk_data',
+  'explosion', 'block_break_animation',
   'entity_effect', 'remove_entity_effect', 'open_horse_window',
   'animation', 'step', 'resource_pack_send', 'add_resource_pack', 'remove_resource_pack',
   'boss_bar', 'scoreboard_objective', 'scoreboard_score', 'scoreboard_display_objective', 'teams'
