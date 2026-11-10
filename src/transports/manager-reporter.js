@@ -1,6 +1,7 @@
 'use strict';
 
 const { redactAuditValue } = require('../game/server-auth');
+const { computeBotStateDigest } = require('../domain/worker-state');
 
 class ManagerReporter {
   constructor({ baseUrl, workerId, secret, fetchImpl = global.fetch, logger }) {
@@ -11,6 +12,8 @@ class ManagerReporter {
     this.logger = logger;
     this.managerLatencyMs = null;
     this.lastReportedPosition = null;
+    this.lastStateDigest = null;
+    this.lastFullReportAt = 0;
     this.eventQueue = [];
     this.eventFlushTimer = null;
   }
@@ -51,12 +54,26 @@ class ManagerReporter {
 
   async heartbeat(status) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/heartbeat`;
+    const now = Date.now();
+    const digest = computeBotStateDigest(status);
+    const digestUnchanged = this.lastStateDigest === digest && (now - this.lastFullReportAt < 60000);
 
-    // Only include position if significant movement occurred or first report
-    const sanitizedStatus = { ...status, managerLatencyMs: this.managerLatencyMs };
+    const sanitizedStatus = {
+      ...status,
+      managerLatencyMs: this.managerLatencyMs,
+      stateDigest: digest,
+      digestUnchanged
+    };
+
+    if (digestUnchanged) {
+      sanitizedStatus.isLightweight = true;
+    } else {
+      this.lastStateDigest = digest;
+      this.lastFullReportAt = now;
+    }
+
     if (status.position) {
       if (!this.hasPositionMovedSignificantly(status.position)) {
-        // Keep position but mark unchanged to save DB processing on Manager
         sanitizedStatus.positionUnchanged = true;
       }
     }

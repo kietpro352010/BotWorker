@@ -10,7 +10,7 @@ const {
   ServerAuth, cleanText, normalize, isRestrictedMinecraftCommand,
   getLocationKind, isVerificationSuccessNotice, extractChatMessage
 } = require('./server-auth');
-const { parseSocksProxy } = require('../config/proxy');
+const { parseSocksProxy, createSocksConnector } = require('../config/proxy');
 const { normalizeState } = require('../domain/worker-state');
 const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, startChunkPruner } = require('./packet-optimization');
 const { TIME_ZONE, isMaintenanceWindow, nextMaintenanceBoundary } = require('../services/maintenance-window');
@@ -132,27 +132,12 @@ class MinecraftSession extends EventEmitter {
         hideErrors: false
       };
       if (this.proxy) {
-        const proxy = this.proxy;
         delete options.host;
         options.fakeHost = host;
-        options.connect = (client) => {
-          const proxyOptions = {
-            proxy: {
-              host: proxy.host,
-              port: proxy.port,
-              type: 5,
-              ...(proxy.username ? { userId: proxy.username, password: proxy.password } : {})
-            },
-            command: 'connect',
-            destination: { host, port: this.config.mc.port },
-            timeout: this.config.connectTimeoutMs
-          };
-          SocksClient.createConnection(proxyOptions, (error, info) => {
-            if (error) { client.emit('error', error); return; }
-            client.setSocket(info.socket);
-            client.emit('connect');
-          });
-        };
+        options.connect = createSocksConnector(this.proxy, host, this.config.mc.port, {
+          timeoutMs: this.config.connectTimeoutMs || 10000,
+          logger: this.logger
+        });
       }
       this.bot = mineflayer.createBot(options);
       const bot = this.bot;
@@ -344,19 +329,43 @@ class MinecraftSession extends EventEmitter {
     }
   }
 
+  cleanupSessionResources(bot = this.bot) {
+    this.clearTimers();
+    if (this.afk) this.afk.stop();
+    if (this.monitor) this.monitor.detach();
+    if (this.navigator) this.navigator.clear();
+    if (this.chunkPruneTimer) {
+      clearInterval(this.chunkPruneTimer);
+      this.chunkPruneTimer = null;
+    }
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+    if (this.locationTimer) {
+      clearInterval(this.locationTimer);
+      this.locationTimer = null;
+    }
+    if (bot) {
+      try { bot.removeAllListeners?.(); } catch (_) {}
+      try { bot._client?.removeAllListeners?.(); } catch (_) {}
+      try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
+      try { bot._client?.socket?.destroy?.(); } catch (_) {}
+      try { bot.quit?.('cleanup'); } catch (_) {
+        try { bot.end?.('cleanup'); } catch (_) {}
+      }
+      bot.entities = {};
+      bot.players = {};
+      bot.world = null;
+      bot.blockAt = null;
+    }
+    this.connectedAt = null;
+  }
+
   onEnd(bot, generation) {
     if (this.bot !== bot || generation !== this.generation) return;
     this.bot = null;
-    this.connectedAt = null;
-    if (this.locationTimer) clearInterval(this.locationTimer);
-    this.locationTimer = null;
-    this.afk.stop();
-    this.monitor.detach();
-    this.navigator.clear();
-    if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
-    this.chunkPruneTimer = null;
-    if (this.connectTimer) clearTimeout(this.connectTimer);
-    this.connectTimer = null;
+    this.cleanupSessionResources(bot);
     if (this.manualStop || ['ip_limited', 'banned'].includes(this.state)) return;
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
@@ -376,13 +385,9 @@ class MinecraftSession extends EventEmitter {
     this.setState(kind, kind === 'ip_limited' ? 'server_ip_limit' : 'server_ban');
     this.emit('event', { type: kind, message: this.lastKickReason });
     this.manualStop = true;
-    this.afk.stop();
-    this.monitor.detach();
-    this.navigator.clear();
     const bot = this.bot;
     this.bot = null;
-    this.connectedAt = null;
-    if (bot) { try { bot.end(kind); } catch (_) {} }
+    this.cleanupSessionResources(bot);
   }
 
   scheduleReconnect(delayOverride) {
@@ -408,16 +413,9 @@ class MinecraftSession extends EventEmitter {
 
   async stop(reason = 'manager_stop', { emitEvent = true } = {}) {
     this.manualStop = true;
-    this.clearTimers();
-    this.afk.stop();
-    this.monitor.detach();
-    this.navigator.clear();
-    if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
-    this.chunkPruneTimer = null;
     const bot = this.bot;
     this.bot = null;
-    this.connectedAt = null;
-    if (bot) { try { bot.quit(reason); } catch (_) { try { bot.end(reason); } catch (_) {} } }
+    this.cleanupSessionResources(bot);
     this.setState('stopped', reason);
     if (emitEvent) this.emit('event', { type: 'stopped', reason });
     return this.getStatus();

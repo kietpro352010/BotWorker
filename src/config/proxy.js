@@ -37,4 +37,72 @@ function parseSocksProxy(value, label = 'MC_PROXY_URL') {
   return Object.freeze({ host: parsed.hostname.replace(/^\[|\]$/g, ''), port, username, password });
 }
 
-module.exports = { parseSocksProxy, isLocalOrPrivateHost };
+function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } = {}) {
+  const { SocksClient } = require('socks');
+  return (client) => {
+    let finished = false;
+    let timer = null;
+    let activeSocket = null;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+
+    timer = setTimeout(() => {
+      if (!finished) {
+        finished = true;
+        cleanup();
+        if (activeSocket) {
+          try { activeSocket.destroy(); } catch (_) {}
+        }
+        const err = new Error(`SOCKS5 proxy connection timed out after ${timeoutMs}ms (${proxy.host}:${proxy.port})`);
+        err.code = 'ETIMEDOUT';
+        client.emit('error', err);
+      }
+    }, timeoutMs);
+    timer.unref?.();
+
+    const proxyOptions = {
+      proxy: {
+        host: proxy.host,
+        port: proxy.port,
+        type: 5,
+        ...(proxy.username ? { userId: proxy.username, password: proxy.password } : {})
+      },
+      command: 'connect',
+      destination: { host, port },
+      timeout: timeoutMs
+    };
+
+    try {
+      SocksClient.createConnection(proxyOptions, (error, info) => {
+        if (finished) {
+          if (info?.socket) {
+            try { info.socket.destroy(); } catch (_) {}
+          }
+          return;
+        }
+        finished = true;
+        cleanup();
+
+        if (error) {
+          if (info?.socket) {
+            try { info.socket.destroy(); } catch (_) {}
+          }
+          client.emit('error', error);
+          return;
+        }
+
+        activeSocket = info.socket;
+        client.setSocket(info.socket);
+        client.emit('connect');
+      });
+    } catch (err) {
+      cleanup();
+      client.emit('error', err);
+    }
+  };
+}
+
+module.exports = { parseSocksProxy, isLocalOrPrivateHost, createSocksConnector };

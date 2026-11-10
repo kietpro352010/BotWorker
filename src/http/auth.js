@@ -3,9 +3,14 @@
 const crypto = require('node:crypto');
 
 function safeEqual(a, b) {
-  const left = Buffer.from(String(a || ''), 'utf8');
-  const right = Buffer.from(String(b || ''), 'utf8');
-  return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
+  if (typeof a !== 'string' && !Buffer.isBuffer(a)) return false;
+  if (typeof b !== 'string' && !Buffer.isBuffer(b)) return false;
+  const strA = String(a);
+  const strB = String(b);
+  if (!strA || !strB) return false;
+  const hashA = crypto.createHash('sha256').update(strA).digest();
+  const hashB = crypto.createHash('sha256').update(strB).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }
 
 function requireWorkerSecret(secret) {
@@ -17,4 +22,3 @@ function requireWorkerSecret(secret) {
 }
 
 module.exports = { safeEqual, requireWorkerSecret };
-

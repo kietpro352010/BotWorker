@@ -35,4 +35,41 @@ function nextMaintenanceBoundary(value = new Date()) {
   return new Date(localDay + boundaryHour * 60 * 60 * 1000 + boundaryMinutePart * 60 * 1000 - BANGKOK_OFFSET_MS);
 }
 
-module.exports = { TIME_ZONE, MAINTENANCE_START_MINUTE, MAINTENANCE_END_MINUTE, isMaintenanceWindow, nextMaintenanceBoundary };
+class StaggeredReconnectQueue {
+  constructor({ baseSpacingMs = 4000, maxSpacingMs = 8000 } = {}) {
+    this.baseSpacingMs = baseSpacingMs;
+    this.maxSpacingMs = maxSpacingMs;
+    this.lastScheduledAt = 0;
+  }
+
+  nextDelay() {
+    const now = Date.now();
+    const spacing = this.baseSpacingMs + Math.floor(Math.random() * 1000);
+    const earliest = Math.max(now, this.lastScheduledAt + spacing);
+    this.lastScheduledAt = earliest;
+    return Math.max(0, earliest - now);
+  }
+
+  reset() {
+    this.lastScheduledAt = 0;
+  }
+}
+
+const defaultReconnectQueue = new StaggeredReconnectQueue();
+
+function getStaggeredReconnectDelay(index = 0, spacingMs = 4000) {
+  const base = Math.max(0, index) * spacingMs;
+  const jitter = Math.floor(Math.random() * 1000);
+  return base + jitter;
+}
+
+module.exports = {
+  TIME_ZONE,
+  MAINTENANCE_START_MINUTE,
+  MAINTENANCE_END_MINUTE,
+  isMaintenanceWindow,
+  nextMaintenanceBoundary,
+  StaggeredReconnectQueue,
+  defaultReconnectQueue,
+  getStaggeredReconnectDelay
+};
