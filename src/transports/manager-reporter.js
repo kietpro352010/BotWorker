@@ -1,5 +1,7 @@
 'use strict';
 
+const { redactAuditValue } = require('../game/server-auth');
+
 class ManagerReporter {
   constructor({ baseUrl, workerId, secret, fetchImpl = global.fetch, logger }) {
     this.baseUrl = baseUrl;
@@ -8,14 +10,40 @@ class ManagerReporter {
     this.fetch = fetchImpl;
     this.logger = logger;
     this.managerLatencyMs = null;
+    this.lastReportedPosition = null;
+    this.eventQueue = [];
+    this.eventFlushTimer = null;
+  }
+
+  hasPositionMovedSignificantly(newPos) {
+    if (!newPos || !Number.isFinite(newPos.x)) return false;
+    if (!this.lastReportedPosition) {
+      this.lastReportedPosition = { ...newPos };
+      return true;
+    }
+    const dx = newPos.x - this.lastReportedPosition.x;
+    const dy = (newPos.y || 0) - (this.lastReportedPosition.y || 0);
+    const dz = newPos.z - this.lastReportedPosition.z;
+    const distSq = dx * dx + dy * dy + dz * dz;
+    if (distSq >= 25.0) { // >= 5.0 blocks (matched with RPC record_bot_position_change)
+      this.lastReportedPosition = { ...newPos };
+      return true;
+    }
+    return false;
   }
 
   async post(path, payload) {
     if (!this.baseUrl || !this.fetch) return;
     const startedAt = Date.now();
     const response = await this.fetch(`${this.baseUrl}${path}`, {
-      method: 'POST', headers: { 'content-type': 'application/json', 'x-worker-secret': this.secret },
-      body: JSON.stringify(payload), signal: AbortSignal.timeout(8000)
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-worker-secret': this.secret,
+        'x-manager-bot-id': String(this.workerId)
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000)
     });
     if (!response.ok) throw new Error(`manager_http_${response.status}`);
     this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
@@ -23,8 +51,18 @@ class ManagerReporter {
 
   async heartbeat(status) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/heartbeat`;
+
+    // Only include position if significant movement occurred or first report
+    const sanitizedStatus = { ...status, managerLatencyMs: this.managerLatencyMs };
+    if (status.position) {
+      if (!this.hasPositionMovedSignificantly(status.position)) {
+        // Keep position but mark unchanged to save DB processing on Manager
+        sanitizedStatus.positionUnchanged = true;
+      }
+    }
+
     return this.post(path, {
-      status: { ...status, managerLatencyMs: this.managerLatencyMs },
+      status: sanitizedStatus,
       sentAt: new Date().toISOString()
     });
   }
@@ -33,7 +71,11 @@ class ManagerReporter {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/bootstrap`;
     const startedAt = Date.now();
     const response = await this.fetch(`${this.baseUrl}${path}`, {
-      headers: { 'x-worker-secret': this.secret }, signal: AbortSignal.timeout(8000)
+      headers: {
+        'x-worker-secret': this.secret,
+        'x-manager-bot-id': String(this.workerId)
+      },
+      signal: AbortSignal.timeout(8000)
     });
     this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
     const body = await response.json().catch(() => ({}));
@@ -42,10 +84,17 @@ class ManagerReporter {
   }
 
   async sendEvent(event) {
+    // Redact any passwords from event message/reason before sending
+    const sanitized = {
+      ...event,
+      message: event.message ? redactAuditValue(event.message) : undefined,
+      reason: event.reason ? redactAuditValue(event.reason) : undefined,
+      occurredAt: new Date().toISOString()
+    };
+
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
-    return this.post(path, { ...event, occurredAt: new Date().toISOString() });
+    return this.post(path, sanitized);
   }
 }
 
 module.exports = ManagerReporter;
-

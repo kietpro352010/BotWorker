@@ -51,6 +51,13 @@ function isRestrictedMinecraftCommand(value) {
   return /^\/\s*(?:[a-z0-9_-]+:)?(?:register|login|changepassword|changepass|password|unregister|email)\b/i.test(String(value || '').trim());
 }
 
+function redactAuditValue(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/(\/(?:login|register|dn|dk|changepassword|changepass)\s+)(\S+)(\s+\S+)?/gi, '$1*** REDACTED ***')
+    .replace(/(password\s*[:=]\s*)(\S+)/gi, '$1*** REDACTED ***');
+}
+
 function inRadius(pos, target, radiusXZ = 2.5, radiusY = 3.0) {
   if (!pos || !target) return false;
   const x = Number(pos.x);
@@ -133,5 +140,6 @@ module.exports = {
   LOBBY_COORDS,
   inRadius,
   getLocationKind,
-  isVerificationSuccessNotice
+  isVerificationSuccessNotice,
+  redactAuditValue
 };

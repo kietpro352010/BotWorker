@@ -63,6 +63,7 @@ class MinecraftSession extends EventEmitter {
       joinCommand: config.joinCommand, joinDelayMs: config.joinDelayMs, logger
     });
     this.monitor = new ServerMonitor();
+    this.isEquippingTotem = false;
     this.scheduleMaintenanceBoundary();
   }
 
@@ -207,7 +208,53 @@ class MinecraftSession extends EventEmitter {
     this.afk.mode = this.afkMode;
     this.afk.start(bot);
 
+    // Auto Totem & Health / Death monitoring
+    bot._client?.on?.('entity_status', (packet) => {
+      if (packet && packet.entityId === bot.entity?.id && packet.entityStatus === 35) {
+        this.logger.info('totem_popped', { bot: this.username });
+        this.emit('event', { type: 'totem_popped', message: 'Totem vừa phát nổ cứu mạng bot! Đang lắp Totem mới vào tay phụ...' });
+        void this.fastEquipTotem(bot);
+      }
+    });
+
+    bot.on('health', () => {
+      if (bot.health <= 10) void this.fastEquipTotem(bot);
+    });
+
+    bot.on('death', () => {
+      const pos = bot.entity?.position;
+      const coords = pos ? `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}` : 'Không rõ';
+      this.logger.warn('bot_died', { coords });
+      this.emit('event', { type: 'bot_death', reason: `Bot bị chết tại tọa độ ${coords}` });
+    });
+
+    // Check off-hand totem immediately on spawn
+    void this.fastEquipTotem(bot);
+
     this.startLocationMonitor(bot, generation, host);
+  }
+
+  async fastEquipTotem(bot) {
+    if (!bot || !bot.inventory || this.isEquippingTotem) return;
+    const offHand = bot.inventory.slots?.[45];
+    if (offHand && offHand.name === 'totem_of_undying') return;
+
+    const totem = bot.inventory.items().find((i) => i && i.name === 'totem_of_undying');
+    if (!totem) {
+      this.logger.warn('no_totem_in_inventory', { bot: this.username });
+      this.emit('event', { type: 'low_totem', count: 0, message: 'Bot đã hết Totem trong túi đồ!' });
+      return;
+    }
+
+    try {
+      this.isEquippingTotem = true;
+      await bot.equip(totem, 'off-hand');
+      this.logger.info('totem_equipped_offhand', { bot: this.username });
+    } catch (err) {
+      this.logger.warn('totem_equip_failed', { error: err.message });
+    } finally {
+      this.isEquippingTotem = false;
+    }
   }
 
   startLocationMonitor(bot, generation, host) {
