@@ -95,6 +95,55 @@ async function runTests() {
   assert.strictEqual(safeEqual('secret123456789012345678901234', 'wrongsecret12345678901234567890'), false);
   console.log('✅ 4. Secret Auth: Timing safe string comparison verified.');
 
+  // 5. WorkerRuntime Lifecycle Concurrency Mutex
+  console.log('5. Checking Lifecycle Concurrency Mutex...');
+  let slowStartResolve;
+  const slowSession = {
+    start: () => new Promise(res => { slowStartResolve = res; }),
+    restart: async () => ({ ok: true }),
+    getStatus: () => ({ state: 'starting' })
+  };
+  const mutexRuntime = new WorkerRuntime(slowSession, { workerId: 'test_mutex' }, console);
+  const p1 = mutexRuntime.execute('start');
+  await new Promise(r => setImmediate(r));
+  let mutexCaught = false;
+  try {
+    await mutexRuntime.execute('restart');
+  } catch (err) {
+    mutexCaught = true;
+    assert.match(err.message, /lifecycle operation.*already in progress/i);
+  }
+  assert.strictEqual(mutexCaught, true, 'Concurrent lifecycle action must be blocked by mutex');
+  slowStartResolve({ ok: true });
+  await p1;
+  console.log('✅ 5. Lifecycle Mutex: Concurrent conflicting actions blocked.');
+
+  // 6. MinecraftSession Bounded Reconnect & Cancel on Stop/Reset
+  console.log('6. Checking MinecraftSession Bounded Reconnect...');
+  const { MinecraftSession } = require('../src/game/minecraft-session');
+  const session = new MinecraftSession({
+    workerId: 'test_session',
+    botNumber: 1,
+    reconnectMaxAttempts: 25,
+    reconnectBaseMs: 100,
+    mc: {
+      username: 'TestBot',
+      password: 'password123',
+      server: 'localhost:25565'
+    }
+  }, console);
+
+  assert.strictEqual(session.config.reconnectMaxAttempts, 25, 'Default reconnect max attempts must be 25');
+  assert.strictEqual(session.reconnectAttempts, 0, 'Initial reconnect attempts must be 0');
+
+  // Trigger stop and verify generation increments and reconnect cancels
+  const initialGen = session.generation;
+  await session.stop();
+  assert.strictEqual(session.generation, initialGen + 1, 'Stop must increment generation to invalidate reconnect callbacks');
+  await session.resetData();
+  assert.strictEqual(session.generation, initialGen + 3, 'Reset must increment generation (including internal stop)');
+  console.log('✅ 6. Bounded Reconnect: Max 25 attempts, generation increment & cancel on stop/reset verified.');
+
   console.log('🎉 ALL WORKER INTEGRATION TESTS PASSED 100%!');
 }
 

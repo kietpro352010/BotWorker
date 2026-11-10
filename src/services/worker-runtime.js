@@ -5,6 +5,8 @@ const ACTIONS = new Set([
   'respawn', 'inventory', 'look', 'toss', 'window_click', 'window_close'
 ]);
 
+const LIFECYCLE_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset']);
+
 class WorkerRuntime {
   constructor(session, config, logger, { refreshManagerConfig } = {}) {
     this.session = session;
@@ -15,6 +17,7 @@ class WorkerRuntime {
     this.execution = Promise.resolve();
     this.pendingCommands = 0;
     this.commandTimes = [];
+    this.activeLifecycle = null;
   }
 
   async execute(action, payload = {}) {
@@ -22,13 +25,47 @@ class WorkerRuntime {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Command payload must be an object.');
     if (Buffer.byteLength(JSON.stringify(payload)) > 4096) throw new Error('Command payload is too large.');
     this.applyCommandLimit();
-    if (this.pendingCommands >= 5) throw new Error('Worker command queue is busy. Try again shortly.');
+    if (this.pendingCommands >= 10) throw new Error('Worker command queue is busy. Try again shortly.');
+
+    // Concurrency guard: Do not start conflicting lifecycle commands concurrently
+    if (LIFECYCLE_ACTIONS.has(action) && this.activeLifecycle) {
+      throw new Error(`A lifecycle operation (${this.activeLifecycle}) is already in progress. Conflicting ${action} command rejected.`);
+    }
+
+    const timeoutMs = LIFECYCLE_ACTIONS.has(action) ? 15000 : 10000;
+    let timeoutTimer = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutTimer = setTimeout(() => {
+        reject(new Error(`Worker action "${action}" timed out after ${timeoutMs}ms.`));
+      }, timeoutMs);
+      timeoutTimer.unref?.();
+    });
+
+    const runTask = async () => {
+      if (LIFECYCLE_ACTIONS.has(action)) {
+        this.activeLifecycle = action;
+      }
+      try {
+        return await Promise.race([this.executeNow(action, payload), timeoutPromise]);
+      } finally {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (LIFECYCLE_ACTIONS.has(action)) {
+          this.activeLifecycle = null;
+        }
+      }
+    };
 
     this.pendingCommands += 1;
-    const task = this.execution.then(() => this.executeNow(action, payload));
+    const task = this.execution.then(() => runTask());
     this.execution = task.catch(() => {});
-    try { return await task; }
-    finally { this.pendingCommands -= 1; }
+    try {
+      return await task;
+    } finally {
+      this.pendingCommands = Math.max(0, this.pendingCommands - 1);
+      if (this.pendingCommands === 0) {
+        this.execution = Promise.resolve();
+      }
+    }
   }
 
   applyCommandLimit() {
@@ -63,8 +100,16 @@ class WorkerRuntime {
     }
   }
 
-  status() { return { ...this.session.getStatus(), processStartedAt: this.startedAt, pendingCommands: this.pendingCommands }; }
+  status() {
+    return {
+      ...this.session.getStatus(),
+      processStartedAt: this.startedAt,
+      pendingCommands: this.pendingCommands,
+      activeLifecycle: this.activeLifecycle || null
+    };
+  }
 }
 
 module.exports = WorkerRuntime;
 module.exports.ACTIONS = ACTIONS;
+module.exports.LIFECYCLE_ACTIONS = LIFECYCLE_ACTIONS;

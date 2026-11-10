@@ -399,6 +399,12 @@ class MinecraftSession extends EventEmitter {
       this.setState('maintenance', 'fixed_maintenance_window');
       return;
     }
+    if (this.reconnectAttempts >= (this.config.reconnectMaxAttempts || 25)) {
+      this.logger.warn('minecraft_reconnect_limit_reached', { attempts: this.reconnectAttempts });
+      this.manualStop = true;
+      this.setState('error', 'max_reconnects_reached');
+      return;
+    }
     this.reconnectAttempts += 1;
     this.reconnectCount += 1;
     const exponential = Math.min(this.config.reconnectMaxMs, this.config.reconnectBaseMs * (2 ** Math.min(this.reconnectAttempts - 1, 8)));
@@ -415,6 +421,8 @@ class MinecraftSession extends EventEmitter {
 
   async stop(reason = 'manager_stop', { emitEvent = true } = {}) {
     this.manualStop = true;
+    this.generation += 1;
+    this.clearTimers();
     const bot = this.bot;
     this.bot = null;
     this.cleanupSessionResources(bot);
@@ -432,6 +440,8 @@ class MinecraftSession extends EventEmitter {
   }
 
   async resetData() {
+    this.generation += 1;
+    this.clearTimers();
     await this.stop('manager_reset_data', { emitEvent: false });
     this.username = '';
     this.password = '';
