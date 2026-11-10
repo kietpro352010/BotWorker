@@ -23,7 +23,8 @@ class WispbytePoller {
   }
 
   async request(path, payload) {
-    const url = `${this.config.managerUrl}${path}`;
+    const baseUrl = this.config.managerUrl || this.config.managerBaseUrl || '';
+    const url = `${baseUrl}${path}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 35000);
     this.activeController = controller;
