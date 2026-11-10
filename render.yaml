@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: kingmc-afk-worker
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: WORKER_BOT_COUNT
+        value: 2
+      - key: MANAGER_URL
+        sync: false
+      - key: WORKER_ID_1
+        sync: false
+      - key: WORKER_SECRET_1
+        sync: false
+      - key: WORKER_ID_2
+        sync: false
+      - key: WORKER_SECRET_2
+        sync: false
+      - key: MC_AUTH_TYPE
+        value: offline
+      - key: MC_AUTH_ENABLED
+        value: true
+      - key: MC_SERVER_HOSTS
+        value: sgp.kingmc.vn,kingmc.vn
+      - key: MC_SERVER_PORT
+        value: 25565
+      - key: MC_SERVER_VERSION
+        value: 1.20.1
+      - key: MC_VIEW_DISTANCE
+        value: short
+      - key: AFK_MODE
+        value: still
+      - key: AUTO_START
+        value: true
+      - key: AUTO_RECONNECT
+        value: true
+      - key: WORKER_RSS_WARN_MB
+        value: 440

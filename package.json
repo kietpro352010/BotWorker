@@ -6,6 +6,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node --max-old-space-size=384 src/index.js",
+    "test": "node tests/integration.test.js",
     "start:render": "cross-env WORKER_TRANSPORT=render-http node --max-old-space-size=384 src/index.js",
     "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 src/index.js"
   },

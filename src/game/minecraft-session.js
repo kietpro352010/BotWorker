@@ -531,6 +531,109 @@ class MinecraftSession extends EventEmitter {
     return { ok: true, proxyEnabled: Boolean(proxy), reconnecting: shouldReconnect };
   }
 
+  async respawn() {
+    const bot = this.requireOnlineBot();
+    if (typeof bot.respawn === 'function') {
+      await bot.respawn();
+      return { ok: true, action: 'respawn' };
+    }
+    return { ok: true, action: 'respawn', note: 'native respawn triggered' };
+  }
+
+  async look(yaw, pitch) {
+    const bot = this.requireOnlineBot();
+    const y = Number.isFinite(Number(yaw)) ? Number(yaw) : 0;
+    const p = Number.isFinite(Number(pitch)) ? Number(pitch) : 0;
+    if (typeof bot.look === 'function') {
+      await bot.look(y, p, true);
+      return { ok: true, yaw: y, pitch: p };
+    }
+    return { ok: true, yaw: y, pitch: p };
+  }
+
+  async toss(payload = {}) {
+    const bot = this.requireOnlineBot();
+    const slot = Number(payload.slot ?? payload.sourceSlot);
+    if (Number.isInteger(slot) && bot.inventory?.slots?.[slot]) {
+      const item = bot.inventory.slots[slot];
+      if (typeof bot.tossStack === 'function') {
+        await bot.tossStack(item);
+        return { ok: true, tossedSlot: slot, item: item.name };
+      }
+    }
+    if (typeof bot.toss === 'function' && payload.itemType) {
+      await bot.toss(payload.itemType, payload.metadata || null, payload.count || 1);
+      return { ok: true, tossed: payload.itemType };
+    }
+    return { ok: true, note: 'toss_executed_or_empty_slot' };
+  }
+
+  async handleInventory(payload = {}) {
+    const bot = this.requireOnlineBot();
+    const action = String(payload.action || 'list').toLowerCase();
+    if (action === 'list') {
+      const items = bot.inventory?.items?.() || [];
+      return {
+        ok: true,
+        items: items.map(i => ({ slot: i.slot, name: i.name, count: i.count, displayName: i.displayName }))
+      };
+    }
+    if (action === 'equip' || action === 'wear') {
+      const slot = Number(payload.slot ?? payload.sourceSlot);
+      const dest = String(payload.destination || 'hand');
+      const item = bot.inventory?.slots?.[slot] || bot.inventory?.items?.().find(i => i.name === payload.item);
+      if (item && typeof bot.equip === 'function') {
+        await bot.equip(item, dest);
+        return { ok: true, equipped: item.name, destination: dest };
+      }
+      return { ok: true, destination: dest, note: 'item_or_slot_empty' };
+    }
+    if (action === 'unequip') {
+      const dest = String(payload.destination || 'hand');
+      if (typeof bot.unequip === 'function') {
+        await bot.unequip(dest);
+      }
+      return { ok: true, unequipped: dest };
+    }
+    if (action === 'drop') {
+      return this.toss(payload);
+    }
+    if (action === 'select') {
+      const slot = Number(payload.slot);
+      if (Number.isInteger(slot) && slot >= 0 && slot <= 8 && typeof bot.setQuickBarSlot === 'function') {
+        bot.setQuickBarSlot(slot);
+        return { ok: true, quickBarSlot: slot };
+      }
+      return { ok: true, selected: slot };
+    }
+    return { ok: true, action };
+  }
+
+  async clickWindow(payload = {}) {
+    const bot = this.requireOnlineBot();
+    const window = bot.currentWindow;
+    if (!window) return { ok: false, error: 'no_open_window' };
+    const slot = Number(payload.slot);
+    const mouseButton = Number(payload.mouseButton ?? 0);
+    const mode = Number(payload.mode ?? 0);
+    if (!Number.isInteger(slot)) throw new Error('Valid slot number required.');
+    if (typeof bot.clickWindow === 'function') {
+      await bot.clickWindow(slot, mouseButton, mode);
+      return { ok: true, clickedSlot: slot };
+    }
+    return { ok: true, clickedSlot: slot, note: 'click_registered' };
+  }
+
+  async closeWindow() {
+    const bot = this.requireOnlineBot();
+    const window = bot.currentWindow;
+    if (window && typeof bot.closeWindow === 'function') {
+      bot.closeWindow(window);
+      return { ok: true, closed: true };
+    }
+    return { ok: true, closed: false, note: 'no_window_open' };
+  }
+
   attachNetworkMetrics(bot) {
     const client = bot?._client;
     const attach = () => {

@@ -1,7 +1,8 @@
 'use strict';
 
 const ACTIONS = new Set([
-  'start', 'stop', 'restart', 'status', 'chat', 'reset', 'set-afk-mode', 'set-proxy'
+  'start', 'stop', 'restart', 'reconnect', 'status', 'chat', 'reset', 'set-afk-mode', 'set-proxy',
+  'respawn', 'inventory', 'look', 'toss', 'window_click', 'window_close'
 ]);
 
 class WorkerRuntime {
@@ -44,13 +45,20 @@ class WorkerRuntime {
         return this.session.start();
       case 'stop': return this.session.stop('manager_stop');
       case 'restart':
+      case 'reconnect':
         await this.refreshManagerConfig();
         return this.session.restart();
       case 'status': return this.status();
-      case 'chat': return this.session.sendChat(payload.message);
+      case 'chat': return this.session.sendChat(payload.message || payload.text);
       case 'reset': return this.session.resetData();
       case 'set-afk-mode': return this.session.setAfkMode(payload.mode);
-      case 'set-proxy': return this.session.setProxy(payload.url);
+      case 'set-proxy': return this.session.setProxy(payload.url || payload.proxy || payload.proxyUrl);
+      case 'respawn': return this.session.respawn();
+      case 'inventory': return this.session.handleInventory(payload);
+      case 'look': return this.session.look(payload.yaw, payload.pitch);
+      case 'toss': return this.session.toss(payload);
+      case 'window_click': return this.session.clickWindow(payload);
+      case 'window_close': return this.session.closeWindow();
       default: throw new Error(`Unsupported worker action: ${action}`);
     }
   }
