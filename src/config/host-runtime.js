@@ -24,12 +24,33 @@ function detectHostRuntime(env = process.env) {
   return Object.freeze({ platform, transport: render ? 'render-http' : 'wispbyte-poll', port, portSource });
 }
 
-async function listenHttpServer(server, { host = '0.0.0.0', port, maxRetries = 10, retryDelayMs = 1000, logger = console } = {}) {
+async function listenHttpServer(server, portOrOptions, maybeHost, maybeOptions) {
+  let port;
+  let host = '0.0.0.0';
+  let maxRetries = 10;
+  let retryDelayMs = 1000;
+  let logger = console;
+
+  if (typeof portOrOptions === 'object' && portOrOptions !== null) {
+    port = portOrOptions.port;
+    if (portOrOptions.host) host = portOrOptions.host;
+    if (portOrOptions.maxRetries) maxRetries = portOrOptions.maxRetries;
+    if (portOrOptions.retryDelayMs) retryDelayMs = portOrOptions.retryDelayMs;
+    if (portOrOptions.logger) logger = portOrOptions.logger;
+  } else {
+    port = portOrOptions;
+    if (typeof maybeHost === 'string' && maybeHost) host = maybeHost;
+    const opts = (typeof maybeHost === 'object' && maybeHost !== null) ? maybeHost : (maybeOptions || {});
+    if (opts.maxRetries) maxRetries = opts.maxRetries;
+    if (opts.retryDelayMs) retryDelayMs = opts.retryDelayMs;
+    if (opts.logger) logger = opts.logger;
+  }
+
   server.keepAliveTimeout = 65000;
   server.headersTimeout = 66000;
   server.requestTimeout = 40000;
 
-  let currentPort = port;
+  let currentPort = Number(port) || 10000;
   let attempts = 0;
 
   while (attempts < maxRetries) {
@@ -60,4 +81,9 @@ async function listenHttpServer(server, { host = '0.0.0.0', port, maxRetries = 1
   }
 }
 
-module.exports = { detectHostRuntime, validPort, listenHttpServer };
+module.exports = {
+  detectHostRuntime,
+  detectHostPlatformAndPort: detectHostRuntime,
+  validPort,
+  listenHttpServer
+};

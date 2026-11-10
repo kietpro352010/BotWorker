@@ -50,7 +50,8 @@ function readSlot(env, slot, common) {
 }
 
 function loadConfig(env = process.env) {
-  const managerUrl = required(env.MANAGER_URL, 'MANAGER_URL').replace(/\/+$/, '');
+  const rawManagerUrl = env.MANAGER_URL || env.MANAGER_BASE_URL;
+  const managerUrl = required(rawManagerUrl, 'MANAGER_URL').replace(/\/+$/, '');
   if (!/^https:\/\//i.test(managerUrl) && !/^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(managerUrl)) {
     throw new Error('MANAGER_URL must use HTTPS.');
   }
