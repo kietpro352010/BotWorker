@@ -43,10 +43,16 @@ async function runTests() {
 
   const runtime = new WorkerRuntime(mockSession, { workerId: 'test_worker' }, console);
 
-  // Test executing all actions
+  // Test executing all 15 actions
+  await runtime.execute('start');
+  await runtime.execute('stop');
+  await runtime.execute('restart');
+  await runtime.execute('reconnect');
   await runtime.execute('status');
   await runtime.execute('chat', { message: 'Hello' });
-  await runtime.execute('reconnect');
+  await runtime.execute('reset');
+  await runtime.execute('set-afk-mode', { mode: 'still' });
+  await runtime.execute('set-proxy', { url: 'socks5://user:pass@128.0.0.1:1080' });
   await runtime.execute('respawn');
   await runtime.execute('inventory', { action: 'list' });
   await runtime.execute('look', { yaw: 90, pitch: 0 });
@@ -54,8 +60,13 @@ async function runTests() {
   await runtime.execute('window_click', { slot: 1 });
   await runtime.execute('window_close');
 
+  assert.ok(sessionCalls.includes('start'));
+  assert.ok(sessionCalls.includes('stop'));
+  assert.ok(sessionCalls.includes('restart'));
   assert.ok(sessionCalls.includes('chat:Hello'));
-  assert.ok(sessionCalls.includes('restart')); // reconnect maps to restart
+  assert.ok(sessionCalls.includes('reset'));
+  assert.ok(sessionCalls.includes('afk:still'));
+  assert.ok(sessionCalls.includes('proxy:socks5://user:pass@128.0.0.1:1080'));
   assert.ok(sessionCalls.includes('respawn'));
   assert.ok(sessionCalls.includes('inventory:list'));
   assert.ok(sessionCalls.includes('look:90,0'));
