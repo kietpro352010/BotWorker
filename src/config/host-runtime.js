@@ -24,4 +24,40 @@ function detectHostRuntime(env = process.env) {
   return Object.freeze({ platform, transport: render ? 'render-http' : 'wispbyte-poll', port, portSource });
 }
 
-module.exports = { detectHostRuntime, validPort };
+async function listenHttpServer(server, { host = '0.0.0.0', port, maxRetries = 10, retryDelayMs = 1000, logger = console } = {}) {
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.requestTimeout = 40000;
+
+  let currentPort = port;
+  let attempts = 0;
+
+  while (attempts < maxRetries) {
+    attempts++;
+    try {
+      await new Promise((resolve, reject) => {
+        const errorHandler = (err) => {
+          server.removeListener('listening', successHandler);
+          reject(err);
+        };
+        const successHandler = () => {
+          server.removeListener('error', errorHandler);
+          resolve();
+        };
+        server.once('error', errorHandler);
+        server.once('listening', successHandler);
+        server.listen(currentPort, host);
+      });
+      return { port: currentPort, host };
+    } catch (err) {
+      if (err.code === 'EADDRINUSE' && attempts < maxRetries) {
+        logger.warn?.(`Port ${currentPort} in use, retrying in ${retryDelayMs}ms (attempt ${attempts}/${maxRetries})...`);
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+module.exports = { detectHostRuntime, validPort, listenHttpServer };
