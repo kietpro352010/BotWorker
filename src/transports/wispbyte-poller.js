@@ -65,6 +65,13 @@ class WispbytePoller {
           await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, {
             commandId: command.commandId, action: command.action, result, completedAt: new Date().toISOString()
           });
+          await sleep(500);
+        } else {
+          // Adaptive polling interval: 1.5s when active/transitioning, 4s-6s when idle (AFK_LOCKED / disconnected)
+          const stateStr = String(current.state || '').toLowerCase();
+          const isIdle = ['idle', 'stopped', 'disconnected', 'afk_locked'].includes(stateStr);
+          const adaptiveDelayMs = isIdle ? (4000 + Math.floor(Math.random() * 2000)) : 1500;
+          await sleep(adaptiveDelayMs);
         }
       } catch (error) {
         if (this.stopping) break;

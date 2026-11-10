@@ -126,17 +126,34 @@ class WorkerFleet {
     this.resourceTimer = setInterval(() => {
       const metrics = this.sampleResources();
       const rssMb = Math.round(metrics.rssMb);
+
+      // Memory Watchdog (Trụ cột 1.1: Tự động dọn RAM nếu > 350MB)
+      if (rssMb > 350) {
+        for (const instance of this.instances.values()) {
+          instance.session.pruneMemory?.();
+        }
+        if (typeof global.gc === 'function') {
+          try { global.gc(); } catch (_) {}
+        }
+      }
+
       if (rssMb >= this.config.rssWarnMb && Date.now() - this.lastResourceWarningAt >= 300000) {
         this.lastResourceWarningAt = Date.now();
         this.logger.warn('worker_memory_high', { rssMb, thresholdMb: this.config.rssWarnMb, botCount: this.instances.size });
       }
-    }, 10000);
+    }, 20000);
     this.resourceTimer.unref?.();
 
     if (this.config.autoStart) {
       let position = 0;
       for (const instance of this.instances.values()) {
         if (this.stopping) break;
+        // Trì hoãn nếu RAM vượt trần 440MB để tránh OOM
+        const mem = process.memoryUsage();
+        if (mem.rss > 440 * 1024 * 1024) {
+          this.logger.warn('bot_spawn_delayed_high_memory', { rssMb: Math.round(mem.rss / (1024 * 1024)) });
+          await delay(5000);
+        }
         if (position > 0) await delay(8000);
         if (!this.stopping && !instance.session.isHeld()) await instance.session.start();
         position += 1;

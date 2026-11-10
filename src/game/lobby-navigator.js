@@ -44,6 +44,7 @@ class LobbyNavigator {
     this.joinCommand = joinCommand;
     this.joinDelayMs = joinDelayMs;
     this.logger = logger;
+    this.state = 'IDLE'; // FSM: IDLE -> SELECT_COMPASS_SLOT -> USE_COMPASS -> WAIT_MENU_WINDOW -> CLICK_TARGET_SERVER_SLOT -> VERIFY_AFK_ZONE
     this.timer = null;
     this.bot = null;
     this.lastJoinAt = 0;
@@ -56,9 +57,18 @@ class LobbyNavigator {
     this.chatTimer = null;
   }
 
+  transitionTo(newState, context = {}) {
+    const prev = this.state;
+    this.state = newState;
+    if (this.logger?.debug) {
+      this.logger.debug('lobby_fsm_transition', { from: prev, to: newState, ...context });
+    }
+  }
+
   onSpawn(bot) {
     this.bot = bot;
     this.clear();
+    this.transitionTo('IDLE');
     // Schedule initial check/join after spawn
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -69,7 +79,10 @@ class LobbyNavigator {
   tryJoin(bot) {
     if (!bot || this.serverJoinBusy) return;
     const kind = getLocationKind(bot);
-    if (kind === 'other') return; // Already in game
+    if (kind === 'other') {
+      this.transitionTo('IDLE', { reason: 'already_in_game' });
+      return; // Already in game
+    }
 
     if (this.joinCommand) {
       if (Date.now() - this.lastJoinAt < 3000) return;
@@ -95,7 +108,10 @@ class LobbyNavigator {
   triggerServerJoin(bot, source = 'routine') {
     if (!bot || this.serverJoinBusy) return;
     const kind = getLocationKind(bot);
-    if (kind === 'other') return;
+    if (kind === 'other') {
+      this.transitionTo('IDLE', { reason: 'already_in_game' });
+      return;
+    }
 
     this.serverJoinBusy = true;
     this.serverJoinAttempts += 1;
@@ -107,6 +123,7 @@ class LobbyNavigator {
       if (clicked || this.bot !== bot) return;
       clicked = true;
       this.clearMenuListener(bot);
+      this.transitionTo('CLICK_TARGET_SERVER_SLOT');
 
       setTimeout(() => {
         if (this.bot !== bot) return;
@@ -116,17 +133,25 @@ class LobbyNavigator {
             if (Array.isArray(targetWindow.slots) && targetWindow.slots.length <= 24) {
               this.logger.warn('lobby_menu_missing_slot_24', { totalSlots: targetWindow.slots.length });
               this.serverJoinBusy = false;
+              this.transitionTo('IDLE', { reason: 'missing_slot_24' });
               return;
             }
             this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
             bot.clickWindow(24, 0, 0);
+            this.transitionTo('VERIFY_AFK_ZONE');
           } catch (clickErr) {
             this.logger.warn('lobby_menu_click_failed', { error: clickErr.message });
           } finally {
-            setTimeout(() => { this.serverJoinBusy = false; }, 2000);
+            setTimeout(() => {
+              this.serverJoinBusy = false;
+              if (getLocationKind(bot) === 'other') {
+                this.transitionTo('IDLE', { verified: true });
+              }
+            }, 2000);
           }
         } else {
           this.serverJoinBusy = false;
+          this.transitionTo('IDLE');
         }
       }, 300);
     };
@@ -134,20 +159,26 @@ class LobbyNavigator {
     if (bot.currentWindow) {
       doClickSlot24(bot.currentWindow);
     } else {
+      this.transitionTo('WAIT_MENU_WINDOW');
       this.pendingMenuListener = (win) => doClickSlot24(win);
       bot.once('windowOpen', this.pendingMenuListener);
       this.pendingMenuCleanup = setTimeout(() => {
         this.clearMenuListener(bot);
         this.serverJoinBusy = false;
+        if (this.state === 'WAIT_MENU_WINDOW') {
+          this.transitionTo('IDLE', { reason: 'menu_window_timeout' });
+        }
       }, 5000);
     }
 
     // 1. Right-click selector item in hotbar
+    this.transitionTo('SELECT_COMPASS_SLOT');
     try {
       const selectorSlot = findMenuSelectorSlot(bot);
       if (selectorSlot >= 0 && typeof bot.setQuickBarSlot === 'function') {
         try { bot.setQuickBarSlot(selectorSlot); } catch (_) {}
       }
+      this.transitionTo('USE_COMPASS');
       if (typeof bot.activateItem === 'function') {
         bot.activateItem();
         this.logger.info('lobby_selector_item_activated');
@@ -179,6 +210,7 @@ class LobbyNavigator {
       if (currentKind === 'other') {
         this.serverJoinAttempts = 0;
         this.serverJoinBusy = false;
+        this.transitionTo('IDLE', { verified: true });
         return;
       }
       if (this.serverJoinAttempts < 5) {
@@ -187,6 +219,7 @@ class LobbyNavigator {
       } else {
         this.logger.warn('lobby_server_join_exhausted', { attempts: this.serverJoinAttempts });
         this.serverJoinBusy = false;
+        this.transitionTo('IDLE', { reason: 'exhausted' });
       }
     }, 3500);
   }
@@ -210,6 +243,7 @@ class LobbyNavigator {
     this.clearMenuListener(this.bot);
     this.serverJoinBusy = false;
     this.serverJoinAttempts = 0;
+    this.state = 'IDLE';
     this.bot = null;
   }
 }

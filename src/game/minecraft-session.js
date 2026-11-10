@@ -572,6 +572,25 @@ class MinecraftSession extends EventEmitter {
     this.networkSampleAt = now;
   }
 
+  pruneMemory() {
+    if (this.bot) {
+      if (this.bot.entities) {
+        for (const id in this.bot.entities) {
+          if (this.bot.entities[id] !== this.bot.entity) {
+            delete this.bot.entities[id];
+          }
+        }
+      }
+      if (this.bot.players) {
+        for (const p in this.bot.players) {
+          if (p !== this.bot.username) {
+            delete this.bot.players[p];
+          }
+        }
+      }
+    }
+  }
+
   scheduleMaintenanceBoundary() {
     if (this.maintenanceTimer) clearTimeout(this.maintenanceTimer);
     const now = new Date();
