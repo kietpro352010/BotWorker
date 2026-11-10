@@ -51,7 +51,7 @@ function attachEarlyPacketDropFilter(bot) {
 }
 
 function enforceZeroFarmEntities(bot) {
-  if (!bot || bot._kingmcZeroEntitiesAttached) return;
+  if (!bot || typeof bot.on !== 'function' || bot._kingmcZeroEntitiesAttached) return;
   bot._kingmcZeroEntitiesAttached = true;
 
   bot.on('entitySpawn', (entity) => {
@@ -114,4 +114,13 @@ function startChunkPruner(bot, { intervalMs = 30000, radius = 2 } = {}) {
   return timer;
 }
 
-module.exports = { DISABLED_PLUGINS, DROP_EVENTS, attachEarlyPacketDropFilter, enforceZeroFarmEntities, applyEcoPhysics, pruneFarChunks, startChunkPruner };
+module.exports = {
+  DISABLED_PLUGINS,
+  DROP_EVENTS,
+  attachEarlyPacketDropFilter,
+  optimizeBotPackets: attachEarlyPacketDropFilter,
+  enforceZeroFarmEntities,
+  applyEcoPhysics,
+  pruneFarChunks,
+  startChunkPruner
+};
