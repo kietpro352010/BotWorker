@@ -1,10 +1,14 @@
 'use strict';
 
 const assert = require('node:assert');
+const EventEmitter = require('node:events');
 const WorkerRuntime = require('../src/services/worker-runtime');
 const { ACTIONS } = require('../src/services/worker-runtime');
 const { parseSocksProxy } = require('../src/config/proxy');
 const { safeEqual } = require('../src/http/auth');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const quietLogger = { info() {}, warn() {}, error() {}, debug() {} };
 
 async function runTests() {
   console.log('--- [WORKER INTEGRATION TESTS] ---');
@@ -143,6 +147,504 @@ async function runTests() {
   await session.resetData();
   assert.strictEqual(session.generation, initialGen + 3, 'Reset must increment generation (including internal stop)');
   console.log('✅ 6. Bounded Reconnect: Max 25 attempts, generation increment & cancel on stop/reset verified.');
+
+  // 7. Execution timeout starts at execution time, NOT queue-wait time
+  console.log('7. Checking execution timeout starts at execution time (not queue wait)...');
+  {
+    const execOrder = [];
+    const queuedTimingSession = {
+      sendChat: async (msg) => {
+        execOrder.push(`chat:${msg}:start`);
+        await sleep(80);
+        execOrder.push(`chat:${msg}:end`);
+        return { ok: true, msg };
+      },
+      look: async (yaw, pitch) => {
+        execOrder.push(`look:${yaw},${pitch}:start`);
+        await sleep(40);
+        execOrder.push(`look:${yaw},${pitch}:end`);
+        return { ok: true, yaw, pitch };
+      },
+      getStatus: () => ({ state: 'online' })
+    };
+    const timingRuntime = new WorkerRuntime(queuedTimingSession, {
+      workerId: 'test_exec_timing',
+      commandTimeoutMs: 100
+    }, quietLogger);
+
+    const pChat = timingRuntime.execute('chat', { message: 'blocker' });
+    const pLook = timingRuntime.execute('look', { yaw: 45, pitch: 10 });
+    const [chatRes, lookRes] = await Promise.all([pChat, pLook]);
+    assert.strictEqual(chatRes.ok, true);
+    assert.strictEqual(lookRes.ok, true);
+    assert.deepStrictEqual(execOrder, [
+      'chat:blocker:start',
+      'chat:blocker:end',
+      'look:45,10:start',
+      'look:45,10:end'
+    ]);
+
+    // Verify execution timeout still fires when execution itself exceeds timeoutMs
+    const slowExecSession = {
+      sendChat: async () => {
+        await sleep(140);
+        return { ok: true };
+      },
+      getStatus: () => ({ state: 'online' })
+    };
+    const slowExecRuntime = new WorkerRuntime(slowExecSession, {
+      workerId: 'test_exec_timeout_fires',
+      commandTimeoutMs: 50
+    }, quietLogger);
+    await assert.rejects(
+      slowExecRuntime.execute('chat', { message: 'too-slow' }),
+      /timed out after 50ms/i
+    );
+  }
+  console.log('✅ 7. Execution Timeout Timing: Queue wait excluded from exec timeout & slow execution still times out.');
+
+  // 8. Queued cancellation skips executeNow() completely (queueTimeoutMs & AbortSignal)
+  console.log('8. Checking queued cancellation skips executeNow() completely...');
+  {
+    let releaseBlocker;
+    const executed = [];
+    let refreshCalled = 0;
+    const queueCancelSession = {
+      sendChat: async (msg) => {
+        executed.push(`chat:${msg}`);
+        if (msg === 'blocker') {
+          await new Promise((resolve) => { releaseBlocker = resolve; });
+        }
+        return { ok: true };
+      },
+      start: async () => {
+        executed.push('start');
+        return { ok: true };
+      },
+      restart: async () => {
+        executed.push('restart');
+        return { ok: true };
+      },
+      getStatus: () => ({ state: 'online' })
+    };
+    const qcRuntime = new WorkerRuntime(queueCancelSession, {
+      workerId: 'test_queue_cancel',
+      commandQueueTimeoutMs: 500
+    }, quietLogger, {
+      refreshManagerConfig: async () => { refreshCalled += 1; }
+    });
+
+    const pBlocker = qcRuntime.execute('chat', { message: 'blocker' });
+    await new Promise((r) => setImmediate(r));
+
+    // Part A: queueTimeoutMs via payload rejects immediately and skips executeNow
+    const pQueueTimeout = qcRuntime.execute('chat', { message: 'never-run-timeout', queueTimeoutMs: 30 });
+    await assert.rejects(pQueueTimeout, /timed out waiting in queue after 30ms/i);
+
+    // Part B: AbortSignal while queued rejects immediately, skips executeNow, and frees lifecycle reservation
+    const ac = new AbortController();
+    const pQueuedStart = qcRuntime.execute('start', {}, { signal: ac.signal });
+    ac.abort('caller_cancelled');
+    await assert.rejects(pQueuedStart, /caller_cancelled/);
+
+    // Lifecycle reservation must be cleared on queued cancel, allowing a new lifecycle command to queue
+    const pQueuedRestart = qcRuntime.execute('restart');
+
+    // Part C: Pre-aborted signal rejects synchronously/immediately without invoking executeNow
+    const preAborted = new AbortController();
+    preAborted.abort('already_aborted');
+    await assert.rejects(qcRuntime.execute('chat', { message: 'never-preaborted' }, { signal: preAborted.signal }), /already_aborted/);
+
+    releaseBlocker();
+    await Promise.all([pBlocker, pQueuedRestart]);
+
+    assert.deepStrictEqual(executed, ['chat:blocker', 'restart']);
+    assert.strictEqual(refreshCalled, 1, 'refreshManagerConfig must only run for non-cancelled restart');
+    assert.strictEqual(qcRuntime.pendingCommands, 0);
+  }
+  console.log('✅ 8. Queued Cancellation: queueTimeoutMs & AbortSignal skip executeNow() cleanly.');
+
+  // 9. Hung refreshManagerConfig() aborts on timeout & NEVER invokes session.start() / session.restart() late
+  console.log('9. Checking hung refreshManagerConfig() cancellation on timeout...');
+  {
+    const realSession = new MinecraftSession({
+      workerId: 'test_refresh_timeout',
+      botNumber: 1,
+      connectTimeoutMs: 5000,
+      reconnectMaxAttempts: 25,
+      reconnectBaseMs: 100,
+      reconnectMaxMs: 1000,
+      autoReconnect: true,
+      mc: {
+        hosts: ['127.0.0.1'],
+        port: 25565,
+        username: 'TestBot',
+        password: 'password123',
+        version: '1.20.1',
+        viewDistance: 'short',
+        authType: 'offline'
+      }
+    }, quietLogger);
+
+    let startCalls = 0;
+    let restartCalls = 0;
+    const origStart = realSession.start.bind(realSession);
+    const origRestart = realSession.restart.bind(realSession);
+    realSession.start = async (...args) => { startCalls += 1; return origStart(...args); };
+    realSession.restart = async (...args) => { restartCalls += 1; return origRestart(...args); };
+
+    const observedSignals = [];
+    let resolveHungRefresh;
+    const refreshTimeoutRuntime = new WorkerRuntime(realSession, {
+      workerId: 'test_refresh_timeout',
+      lifecycleTimeoutMs: 50
+    }, quietLogger, {
+      refreshManagerConfig: async ({ signal }) => {
+        observedSignals.push(signal);
+        await new Promise((resolve) => { resolveHungRefresh = resolve; });
+      }
+    });
+
+    const genBeforeStart = realSession.generation;
+    await assert.rejects(refreshTimeoutRuntime.execute('start'), /timed out after 50ms/i);
+    assert.strictEqual(observedSignals.length, 1);
+    assert.strictEqual(observedSignals[0].aborted, true, 'AbortSignal must be aborted on timeout');
+    assert.ok(realSession.generation > genBeforeStart, 'Session generation must increment on timeout cleanup');
+    assert.strictEqual(realSession.state, 'stopped');
+    assert.strictEqual(realSession.manualStop, true);
+    assert.strictEqual(refreshTimeoutRuntime.activeLifecycle, null);
+
+    // Resolve hung refresh late and verify session.start() is NEVER invoked
+    resolveHungRefresh();
+    await sleep(20);
+    assert.strictEqual(startCalls, 0, 'Late refresh resolution must NEVER call session.start()');
+
+    // Same check for restart
+    let resolveHungRestartRefresh;
+    refreshTimeoutRuntime.refreshManagerConfig = async ({ signal }) => {
+      observedSignals.push(signal);
+      await new Promise((resolve) => { resolveHungRestartRefresh = resolve; });
+    };
+    const genBeforeRestart = realSession.generation;
+    await assert.rejects(refreshTimeoutRuntime.execute('restart'), /timed out after 50ms/i);
+    assert.strictEqual(observedSignals[1].aborted, true);
+    assert.ok(realSession.generation > genBeforeRestart);
+    assert.strictEqual(realSession.state, 'stopped');
+    resolveHungRestartRefresh();
+    await sleep(20);
+    assert.strictEqual(restartCalls, 0, 'Late refresh resolution must NEVER call session.restart()');
+  }
+  console.log('✅ 9. Hung refreshManagerConfig(): Aborted on timeout, generation bumped, never calls start/restart late.');
+
+  // 10. Hung session.start()/restart() cleans up in-flight bot/timers safely, locks activeLifecycle during cleanup,
+  //     and late promise settlement does not corrupt activeLifecycle
+  console.log('10. Checking hung session.start()/restart() cleanup, safe error handling & activeLifecycle safety...');
+  {
+    const sessionWithBot = new MinecraftSession({
+      workerId: 'test_hung_session',
+      botNumber: 1,
+      connectTimeoutMs: 5000,
+      reconnectMaxAttempts: 25,
+      reconnectBaseMs: 100,
+      reconnectMaxMs: 1000,
+      autoReconnect: true,
+      mc: {
+        hosts: ['127.0.0.1'],
+        port: 25565,
+        username: 'TestBot',
+        password: 'password123',
+        version: '1.20.1',
+        viewDistance: 'short',
+        authType: 'offline'
+      }
+    }, quietLogger);
+
+    const fakeSocket = new EventEmitter();
+    let socketDestroyed = false;
+    fakeSocket.destroy = () => { socketDestroyed = true; };
+
+    const fakeClient = new EventEmitter();
+    fakeClient.socket = fakeSocket;
+    let clientEnded = false;
+    fakeClient.end = () => {
+      clientEnded = true;
+      // Simulate real socket error emitted during teardown after removeAllListeners
+      fakeClient.emit('error', new Error('ECONNRESET'));
+      fakeSocket.emit('error', new Error('ECONNRESET'));
+    };
+
+    const fakeBot = new EventEmitter();
+    fakeBot._client = fakeClient;
+    fakeBot.end = (reason) => fakeClient.end(reason);
+
+    let resolveLateStart;
+    sessionWithBot.start = async () => {
+      sessionWithBot.manualStop = false;
+      sessionWithBot.state = 'connecting';
+      sessionWithBot.generation += 1;
+      sessionWithBot.bot = fakeBot;
+      sessionWithBot.connectTimer = setTimeout(() => {}, 10000);
+      await new Promise((resolve) => { resolveLateStart = resolve; });
+      return sessionWithBot.getStatus();
+    };
+
+    const hungRuntime = new WorkerRuntime(sessionWithBot, {
+      workerId: 'test_hung_session',
+      lifecycleTimeoutMs: 50
+    }, quietLogger);
+
+    const genInitial = sessionWithBot.generation;
+    await assert.rejects(hungRuntime.execute('start'), /timed out after 50ms/i);
+    assert.strictEqual(sessionWithBot.state, 'stopped');
+    assert.strictEqual(sessionWithBot.manualStop, true);
+    assert.strictEqual(sessionWithBot.bot, null);
+    assert.strictEqual(sessionWithBot.connectTimer, null);
+    assert.ok(sessionWithBot.generation > genInitial);
+    assert.strictEqual(clientEnded, true);
+    assert.strictEqual(socketDestroyed, true);
+    assert.strictEqual(hungRuntime.activeLifecycle, null);
+
+    // Late resolution of first hung start must NOT corrupt activeLifecycle of a subsequent lifecycle command
+    let releaseSecondStart;
+    sessionWithBot.start = () => new Promise((resolve) => { releaseSecondStart = resolve; });
+    const pSecond = hungRuntime.execute('start');
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(hungRuntime.activeLifecycle, 'start');
+    resolveLateStart();
+    await sleep(15);
+    assert.strictEqual(hungRuntime.activeLifecycle, 'start', 'Late aborted start must not clear new activeLifecycle');
+    releaseSecondStart({ ok: true });
+    await pSecond;
+    assert.strictEqual(hungRuntime.activeLifecycle, null);
+
+    // Verify activeLifecycle remains locked WHILE async cleanup runs on timeout
+    let releaseStopCleanup;
+    let stopCleanupCalls = 0;
+    const asyncCleanupSession = {
+      start: () => new Promise(() => {}),
+      restart: async () => ({ ok: true }),
+      stop: () => {
+        stopCleanupCalls += 1;
+        return new Promise((resolve) => { releaseStopCleanup = resolve; });
+      },
+      getStatus: () => ({ state: 'stopped' })
+    };
+    const cleanupLockRuntime = new WorkerRuntime(asyncCleanupSession, {
+      workerId: 'test_cleanup_lock',
+      lifecycleTimeoutMs: 30
+    }, quietLogger);
+    const pTimedOutStart = cleanupLockRuntime.execute('start');
+    await sleep(45);
+    assert.strictEqual(stopCleanupCalls, 1);
+    assert.strictEqual(cleanupLockRuntime.activeLifecycle, 'start', 'activeLifecycle must stay locked during cleanup');
+    await assert.rejects(
+      cleanupLockRuntime.execute('restart'),
+      /lifecycle operation \(start\) is already in progress/i
+    );
+    releaseStopCleanup();
+    await assert.rejects(pTimedOutStart, /timed out after 30ms/i);
+    assert.strictEqual(cleanupLockRuntime.activeLifecycle, null);
+    await cleanupLockRuntime.execute('restart');
+  }
+  console.log('✅ 10. Hung session.start()/restart(): Bot/socket cleaned safely, activeLifecycle locked during cleanup & immune to late resolve.');
+
+  // 11. MinecraftSession.restart({ signal }) cancels cleanly if aborted mid-restart
+  console.log('11. Checking MinecraftSession.restart({ signal }) mid-restart abort guard...');
+  {
+    const restartSession = new MinecraftSession({
+      workerId: 'test_restart_abort',
+      botNumber: 1,
+      connectTimeoutMs: 5000,
+      mc: {
+        hosts: ['127.0.0.1'],
+        port: 25565,
+        username: 'TestBot',
+        password: 'password123',
+        version: '1.20.1',
+        viewDistance: 'short',
+        authType: 'offline'
+      }
+    }, quietLogger);
+
+    let connectCalls = 0;
+    restartSession.connect = async () => { connectCalls += 1; return restartSession.getStatus(); };
+    const ac = new AbortController();
+    const origStop = restartSession.stop.bind(restartSession);
+    restartSession.stop = async (reason, opts) => {
+      const res = await origStop(reason, opts);
+      ac.abort('abort_during_stop');
+      return res;
+    };
+
+    const status = await restartSession.restart({ signal: ac.signal });
+    assert.strictEqual(connectCalls, 0, 'connect() must not be called if signal aborts during stop()');
+    assert.strictEqual(status.state, 'stopped');
+    assert.strictEqual(restartSession.manualStop, true);
+  }
+  console.log('✅ 11. MinecraftSession.restart({ signal }): Aborted mid-restart prevents connect().');
+
+  // 12. Lifecycle mutex blocks conflicting lifecycle actions while queued behind non-lifecycle command & enforces queue depth limit
+  console.log('12. Checking queued lifecycle mutex & max queue depth (10)...');
+  {
+    let releaseChat;
+    const order = [];
+    const mutexQueueSession = {
+      sendChat: async (msg) => {
+        order.push(`chat:${msg}`);
+        if (msg === 'hold') {
+          await new Promise((resolve) => { releaseChat = resolve; });
+        }
+        return { ok: true };
+      },
+      start: async () => { order.push('start'); return { ok: true }; },
+      restart: async () => { order.push('restart'); return { ok: true }; },
+      stop: async () => { order.push('stop'); return { ok: true }; },
+      resetData: async () => { order.push('reset'); return { ok: true }; },
+      getStatus: () => ({ state: 'online' })
+    };
+    const mqRuntime = new WorkerRuntime(mutexQueueSession, { workerId: 'test_mq' }, quietLogger);
+
+    // Block queue with a non-lifecycle command so activeLifecycle is null
+    const pHold = mqRuntime.execute('chat', { message: 'hold' });
+    await new Promise((r) => setImmediate(r));
+    assert.strictEqual(mqRuntime.activeLifecycle, null);
+
+    // Queue 'start' behind blocking 'chat'
+    const pStart = mqRuntime.execute('start');
+    assert.strictEqual(mqRuntime.activeLifecycle, null, 'start is still queued, not active yet');
+
+    // Conflicting lifecycle actions must ALL be rejected while 'start' is queued
+    for (const conflictAction of ['start', 'stop', 'restart', 'reconnect', 'reset']) {
+      await assert.rejects(
+        mqRuntime.execute(conflictAction),
+        /lifecycle operation \(start\) is already in progress/i,
+        `Queued start must reject conflicting ${conflictAction}`
+      );
+    }
+
+    // Non-lifecycle 'status' must still queue and succeed
+    const pStatus = mqRuntime.execute('status');
+    releaseChat();
+    const [, startRes, statusRes] = await Promise.all([pHold, pStart, pStatus]);
+    assert.strictEqual(startRes.ok, true);
+    assert.strictEqual(statusRes.state, 'online');
+    assert.deepStrictEqual(order, ['chat:hold', 'start']);
+
+    // Synchronous immediate double-lifecycle without awaiting setImmediate
+    let releaseSyncStart;
+    mutexQueueSession.start = () => new Promise((resolve) => { releaseSyncStart = resolve; });
+    const pSync1 = mqRuntime.execute('start');
+    await assert.rejects(
+      mqRuntime.execute('stop'),
+      /lifecycle operation \(start\) is already in progress/i
+    );
+    releaseSyncStart({ ok: true });
+    await pSync1;
+
+    // Queue depth limit (>= 10)
+    let releaseDepthHold;
+    mutexQueueSession.sendChat = async (msg) => {
+      if (msg === 'depth-hold') {
+        await new Promise((resolve) => { releaseDepthHold = resolve; });
+      }
+      return { ok: true };
+    };
+    const depthPromises = [];
+    for (let i = 0; i < 10; i++) {
+      depthPromises.push(mqRuntime.execute('chat', { message: i === 0 ? 'depth-hold' : `q-${i}` }));
+    }
+    assert.strictEqual(mqRuntime.pendingCommands, 10);
+    await assert.rejects(
+      mqRuntime.execute('chat', { message: 'overflow' }),
+      /Worker command queue is busy/i
+    );
+    releaseDepthHold();
+    await Promise.all(depthPromises);
+    assert.strictEqual(mqRuntime.pendingCommands, 0);
+  }
+  console.log('✅ 12. Queued Lifecycle Mutex & Queue Depth: Conflicting queued lifecycles & overflow (>10) rejected.');
+
+  // 13. Real MinecraftSession.connect({ signal }) aborts in-flight mineflayer bot without reconnect loop or error crash
+  console.log('13. Checking real MinecraftSession.connect({ signal }) in-flight abort cleanup...');
+  {
+    const mineflayer = require('mineflayer');
+    const origCreateBot = mineflayer.createBot;
+    let createBotCalls = 0;
+    let botEnded = false;
+    let socketDestroyed = false;
+    let lastCreatedBot = null;
+
+    mineflayer.createBot = () => {
+      createBotCalls += 1;
+      const socket = new EventEmitter();
+      socket.destroy = () => { socketDestroyed = true; };
+      const client = new EventEmitter();
+      client.socket = socket;
+      client.end = () => {
+        botEnded = true;
+        client.emit('error', new Error('ABORTED_CONN'));
+        socket.emit('error', new Error('ABORTED_CONN'));
+      };
+      const bot = new EventEmitter();
+      bot._client = client;
+      bot.end = (reason) => client.end(reason);
+      lastCreatedBot = bot;
+      return bot;
+    };
+
+    try {
+      const liveSession = new MinecraftSession({
+        workerId: 'test_connect_abort',
+        botNumber: 1,
+        connectTimeoutMs: 5000,
+        reconnectMaxAttempts: 25,
+        reconnectBaseMs: 100,
+        reconnectMaxMs: 1000,
+        autoReconnect: true,
+        mc: {
+          hosts: ['127.0.0.1'],
+          port: 25565,
+          username: 'TestBot',
+          password: 'password123',
+          version: '1.20.1',
+          viewDistance: 'short',
+          authType: 'offline'
+        }
+      }, quietLogger);
+
+      // Pre-aborted signal must never invoke mineflayer.createBot
+      const preAborted = new AbortController();
+      preAborted.abort('pre_aborted');
+      await liveSession.start({ signal: preAborted.signal });
+      assert.strictEqual(createBotCalls, 0);
+      assert.strictEqual(liveSession.state, 'stopped');
+      assert.strictEqual(liveSession.manualStop, true);
+
+      // Live connect then abort mid-handshake
+      const liveAc = new AbortController();
+      const status = await liveSession.start({ signal: liveAc.signal });
+      assert.strictEqual(createBotCalls, 1);
+      assert.strictEqual(status.state, 'connecting');
+      const connectGen = liveSession.generation;
+
+      liveAc.abort('cancel_handshake');
+      assert.strictEqual(liveSession.state, 'stopped');
+      assert.strictEqual(liveSession.manualStop, true);
+      assert.strictEqual(liveSession.bot, null);
+      assert.strictEqual(liveSession.connectTimer, null);
+      assert.ok(liveSession.generation > connectGen);
+      assert.strictEqual(botEnded, true);
+      assert.strictEqual(socketDestroyed, true);
+
+      // Late onEnd from the old bot generation must NOT trigger reconnect
+      liveSession.onEnd(lastCreatedBot, connectGen);
+      assert.strictEqual(liveSession.reconnectTimer, null);
+      assert.strictEqual(liveSession.state, 'stopped');
+    } finally {
+      mineflayer.createBot = origCreateBot;
+    }
+  }
+  console.log('✅ 13. Real MinecraftSession.connect({ signal }): In-flight bot aborted & cleaned safely without reconnect.');
 
   console.log('🎉 ALL WORKER INTEGRATION TESTS PASSED 100%!');
 }

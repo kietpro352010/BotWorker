@@ -34,6 +34,8 @@ class MinecraftSession extends EventEmitter {
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
+    this.initialLocationTimer = null;
+    this._abortListenerCleanup = null;
     this.lastLocationKind = 'unknown';
     this.lastAuthSendAt = 0;
     this.generation = 0;
@@ -74,7 +76,22 @@ class MinecraftSession extends EventEmitter {
     this.logger.info('worker_state_changed', { state: this.state, detail });
   }
 
-  async start() {
+  _clearAbortListener() {
+    if (this._abortListenerCleanup) {
+      try { this._abortListenerCleanup(); } catch (_) {}
+      this._abortListenerCleanup = null;
+    }
+  }
+
+  _abortReasonFromSignal(signal) {
+    return signal?.reason?.code === 'ETIMEDOUT' ? 'command_timeout' : 'command_aborted';
+  }
+
+  async start({ signal } = {}) {
+    if (signal?.aborted) {
+      this.abortPending(this._abortReasonFromSignal(signal));
+      return this.getStatus();
+    }
     if (!this.hasCredentials()) {
       this.manualStop = true;
       this.lastError = 'Minecraft account credentials are not configured in Discord Manager.';
@@ -94,10 +111,14 @@ class MinecraftSession extends EventEmitter {
     if (!this.manualStop && this.bot && !['stopped', 'error', 'ip_limited', 'banned'].includes(this.state)) return this.getStatus();
     this.reconnectAttempts = 0;
     this.clearTimers();
-    return this.connect();
+    return this.connect({ signal });
   }
 
-  async connect() {
+  async connect({ signal } = {}) {
+    if (signal?.aborted) {
+      this.abortPending(this._abortReasonFromSignal(signal));
+      return this.getStatus();
+    }
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
       this.clearTimers();
@@ -119,6 +140,20 @@ class MinecraftSession extends EventEmitter {
     this.lastStateAt = new Date().toISOString();
     const host = this.config.mc.hosts[this.hostIndex % this.config.mc.hosts.length];
     const generation = ++this.generation;
+    this._clearAbortListener();
+    if (signal) {
+      const onAbort = () => {
+        if (this.generation === generation) {
+          this.abortPending(this._abortReasonFromSignal(signal));
+        }
+      };
+      if (signal.aborted) {
+        onAbort();
+        return this.getStatus();
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+      this._abortListenerCleanup = () => signal.removeEventListener('abort', onAbort);
+    }
     this.emit('state', this.getStatus());
     this.logger.info('minecraft_connecting', { host, port: this.config.mc.port });
 
@@ -144,7 +179,7 @@ class MinecraftSession extends EventEmitter {
       attachEarlyPacketDropFilter(bot);
       this.attachNetworkMetrics(bot);
       this.connectTimer = setTimeout(() => {
-        if (this.bot === bot && this.state === 'connecting') {
+        if (this.bot === bot && generation === this.generation && !this.manualStop && this.state === 'connecting') {
           this.logger.warn('minecraft_connect_timeout', { host });
           try { bot.end('Connection timeout'); } catch (_) { this.scheduleReconnect(); }
         }
@@ -168,6 +203,10 @@ class MinecraftSession extends EventEmitter {
       bot.once('spawn', () => this.onSpawn(bot, generation, host));
       return this.getStatus();
     } catch (error) {
+      this._clearAbortListener();
+      if (generation !== this.generation || this.manualStop || signal?.aborted) {
+        return this.getStatus();
+      }
       const code = String(error?.code || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
       this.lastError = code ? `Minecraft connection error (${code})` : 'Minecraft connection error';
       this.setState('error', 'connect_failed');
@@ -179,6 +218,7 @@ class MinecraftSession extends EventEmitter {
 
   onSpawn(bot, generation, host) {
     if (this.bot !== bot || generation !== this.generation || this.manualStop) return;
+    this._clearAbortListener();
     if (this.connectTimer) clearTimeout(this.connectTimer);
     this.connectTimer = null;
     this.reconnectAttempts = 0;
@@ -278,7 +318,12 @@ class MinecraftSession extends EventEmitter {
       }
     };
 
-    setTimeout(check, 800);
+    if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
+    this.initialLocationTimer = setTimeout(() => {
+      this.initialLocationTimer = null;
+      check();
+    }, 800);
+    this.initialLocationTimer.unref?.();
     this.locationTimer = setInterval(check, 1500);
     this.locationTimer.unref?.();
   }
@@ -330,6 +375,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   cleanupSessionResources(bot = this.bot) {
+    this._clearAbortListener();
     this.clearTimers();
     if (this.afk) this.afk.stop();
     if (this.monitor) this.monitor.detach();
@@ -347,13 +393,25 @@ class MinecraftSession extends EventEmitter {
       this.locationTimer = null;
     }
     if (bot) {
-      try { bot.removeAllListeners?.(); } catch (_) {}
-      try { bot._client?.removeAllListeners?.(); } catch (_) {}
+      try { bot.removeAllListeners?.(); bot.on?.('error', () => {}); } catch (_) {}
+      try { bot._client?.removeAllListeners?.(); bot._client?.on?.('error', () => {}); } catch (_) {}
       try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
-      try { bot._client?.socket?.destroy?.(); } catch (_) {}
-      try { bot.quit?.('cleanup'); } catch (_) {
-        try { bot.end?.('cleanup'); } catch (_) {}
+      try {
+        if (bot._client?.socket && bot._client.socket.listenerCount?.('error') === 0) {
+          bot._client.socket.on('error', () => {});
+        }
+      } catch (_) {}
+      let ended = false;
+      if (typeof bot.quit === 'function') {
+        try { bot.quit('cleanup'); ended = true; } catch (_) {}
       }
+      if (!ended && typeof bot.end === 'function') {
+        try { bot.end('cleanup'); ended = true; } catch (_) {}
+      }
+      if (!ended && typeof bot._client?.end === 'function') {
+        try { bot._client.end('cleanup'); } catch (_) {}
+      }
+      try { bot._client?.socket?.destroy?.(); } catch (_) {}
       bot.entities = {};
       bot.players = {};
       bot.registry = null;
@@ -419,7 +477,8 @@ class MinecraftSession extends EventEmitter {
     this.reconnectTimer.unref?.();
   }
 
-  async stop(reason = 'manager_stop', { emitEvent = true } = {}) {
+  _haltSession(reason = 'manager_stop', { emitEvent = false } = {}) {
+    this._clearAbortListener();
     this.manualStop = true;
     this.generation += 1;
     this.clearTimers();
@@ -431,12 +490,28 @@ class MinecraftSession extends EventEmitter {
     return this.getStatus();
   }
 
-  async restart() {
+  abortPending(reason = 'command_timeout') {
+    return this._haltSession(reason, { emitEvent: false });
+  }
+
+  async stop(reason = 'manager_stop', { emitEvent = true } = {}) {
+    return this._haltSession(reason, { emitEvent });
+  }
+
+  async restart({ signal } = {}) {
+    if (signal?.aborted) {
+      this.abortPending(this._abortReasonFromSignal(signal));
+      return this.getStatus();
+    }
     this.restriction = null;
     await this.stop('manager_restart');
+    if (signal?.aborted) {
+      this.abortPending(this._abortReasonFromSignal(signal));
+      return this.getStatus();
+    }
     this.manualStop = false;
     this.reconnectAttempts = 0;
-    return this.connect();
+    return this.connect({ signal });
   }
 
   async resetData() {
@@ -532,12 +607,12 @@ class MinecraftSession extends EventEmitter {
     return { ok: true, afkMode: 'still' };
   }
 
-  async setProxy(value) {
+  async setProxy(value, { signal } = {}) {
     if (this.restriction) throw new Error('Proxy settings cannot be changed while the worker is on a server restriction hold.');
     const proxy = parseSocksProxy(value, 'proxy');
     const shouldReconnect = Boolean(this.bot && ['online', 'entering'].includes(this.state));
     this.proxy = proxy;
-    if (shouldReconnect) await this.restart();
+    if (shouldReconnect && !signal?.aborted) await this.restart({ signal });
     return { ok: true, proxyEnabled: Boolean(proxy), reconnecting: shouldReconnect };
   }
 
@@ -749,9 +824,11 @@ class MinecraftSession extends EventEmitter {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
     if (this.locationTimer) clearInterval(this.locationTimer);
+    if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
+    this.initialLocationTimer = null;
   }
 
   getStatus() {
