@@ -246,6 +246,16 @@ class MinecraftSession extends EventEmitter {
       if (bot.health <= 10) void this.fastEquipTotem(bot);
     });
 
+    if (bot.inventory?.on) {
+      bot.inventory.on('updateSlot', (slot) => {
+        if (slot === 45 || slot === 40 || !slot) void this.fastEquipTotem(bot);
+      });
+    }
+
+    bot.on('heldItemChanged', () => {
+      void this.fastEquipTotem(bot);
+    });
+
     bot.on('death', () => {
       const pos = bot.entity?.position;
       const coords = pos ? `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}` : 'Không rõ';
@@ -262,9 +272,9 @@ class MinecraftSession extends EventEmitter {
   async fastEquipTotem(bot) {
     if (!bot || !bot.inventory || this.isEquippingTotem) return;
     const offHand = bot.inventory.slots?.[45];
-    if (offHand && offHand.name === 'totem_of_undying') return;
+    if (offHand && (offHand.name === 'totem_of_undying' || String(offHand.name).includes('totem'))) return;
 
-    const totem = bot.inventory.items().find((i) => i && i.name === 'totem_of_undying');
+    const totem = bot.inventory.items().find((i) => i && (i.name === 'totem_of_undying' || String(i.name).includes('totem')));
     if (!totem) {
       this.logger.warn('no_totem_in_inventory', { bot: this.username });
       this.emit('event', { type: 'low_totem', count: 0, message: 'Bot đã hết Totem trong túi đồ!' });

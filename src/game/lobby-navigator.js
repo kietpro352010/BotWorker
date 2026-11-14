@@ -106,6 +106,16 @@ class LobbyNavigator {
   }
 
   triggerServerJoin(bot, source = 'routine') {
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    if (this.chatTimer) {
+      clearTimeout(this.chatTimer);
+      this.chatTimer = null;
+    }
+    this.clearMenuListener(bot);
+
     if (!bot || this.serverJoinBusy) return;
     const kind = getLocationKind(bot);
     if (kind === 'other') {
