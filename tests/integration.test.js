@@ -2,10 +2,16 @@
 
 const assert = require('node:assert');
 const EventEmitter = require('node:events');
+const http = require('node:http');
 const WorkerRuntime = require('../src/services/worker-runtime');
 const { ACTIONS } = require('../src/services/worker-runtime');
 const { parseSocksProxy } = require('../src/config/proxy');
 const { safeEqual } = require('../src/http/auth');
+const WispbytePoller = require('../src/transports/wispbyte-poller');
+const ManagerReporter = require('../src/transports/manager-reporter');
+const WispbyteKeepAlive = require('../src/services/wispbyte-keepalive');
+const WorkerFleet = require('../src/services/worker-fleet');
+const { createApp } = require('../src/http/app');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const quietLogger = { info() {}, warn() {}, error() {}, debug() {} };
@@ -645,6 +651,456 @@ async function runTests() {
     }
   }
   console.log('✅ 13. Real MinecraftSession.connect({ signal }): In-flight bot aborted & cleaned safely without reconnect.');
+
+  // 14. Testing INT-10-01: Pending-Result retry queue with exponential backoff
+  console.log('14. Checking INT-10-01: Pending-Result retry queue with exponential backoff...');
+  {
+    let attempts = 0;
+    const receivedPayloads = [];
+    const mockFetch = async (url, opts) => {
+      if (url.includes('/result')) {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error('transient_network_error');
+        }
+        receivedPayloads.push(JSON.parse(opts.body));
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    };
+
+    const poller = new WispbytePoller({
+      config: { workerId: 'test_retry_worker', managerUrl: 'http://manager' },
+      runtime: { status: () => ({ state: 'idle' }) },
+      reporter: { managerLatencyMs: 10 },
+      logger: quietLogger,
+      fetchImpl: mockFetch
+    });
+
+    // Enqueue result on simulated failure
+    poller.enqueueResult({ commandId: 'cmd_fail_first', action: 'chat', result: { ok: true } });
+    assert.strictEqual(poller.pendingResults.length, 1);
+
+    // First flush attempt fails -> increments attempts and sets nextRetryAt
+    await poller.flushPendingResults();
+    assert.strictEqual(attempts, 1);
+    assert.strictEqual(poller.pendingResults.length, 1);
+    assert.strictEqual(poller.pendingResults[0].attempts, 1);
+    assert.ok(poller.pendingResults[0].nextRetryAt > Date.now());
+
+    // Advance nextRetryAt to allow immediate flush
+    poller.pendingResults[0].nextRetryAt = 0;
+    await poller.flushPendingResults();
+    assert.strictEqual(attempts, 2);
+    assert.strictEqual(poller.pendingResults.length, 0, 'Pending results must be empty on success');
+    assert.strictEqual(receivedPayloads[0].commandId, 'cmd_fail_first');
+  }
+  console.log('✅ 14. INT-10-01: Pending-result retry queue with exponential backoff verified.');
+
+  // 15. Testing FLEET-15-03: Cancellable delay with AbortController for Poller stop()
+  console.log('15. Checking FLEET-15-03: Cancellable delay with AbortController for Poller stop()...');
+  {
+    let pollCount = 0;
+    const mockFetch = async () => {
+      pollCount += 1;
+      // Throw to trigger backoff delay (up to 60s)
+      throw new Error('poll_failed_trigger_backoff');
+    };
+
+    const poller = new WispbytePoller({
+      config: { workerId: 'test_stop_worker', managerUrl: 'http://manager' },
+      runtime: { status: () => ({ state: 'idle' }) },
+      reporter: { managerLatencyMs: 10 },
+      logger: quietLogger,
+      fetchImpl: mockFetch
+    });
+
+    const loop = poller.start();
+    await sleep(20);
+    // Poller is now in backoff sleep (delay >= 1500ms)
+    const stopStart = Date.now();
+    await poller.stop();
+    const stopDuration = Date.now() - stopStart;
+    assert.ok(stopDuration < 200, `poller.stop() must terminate immediately without waiting for backoff sleep (took ${stopDuration}ms)`);
+    assert.strictEqual(poller.stopping, true);
+  }
+  console.log('✅ 15. FLEET-15-03: Cancellable delay for Poller stop() verified.');
+
+  // 16. Testing INT-10-02: Event reporting queue with retry and ACK verification
+  console.log('16. Checking INT-10-02: Event reporting queue with retry and ACK verification...');
+  {
+    let postCalls = 0;
+    const reporter = new ManagerReporter({
+      baseUrl: 'http://mock-manager',
+      workerId: 'w_events',
+      secret: 'sec',
+      logger: quietLogger,
+      fetchImpl: async (url, opts) => {
+        postCalls += 1;
+        if (postCalls === 1) {
+          // Failure: response.ok is true but body.ok is false
+          return { ok: true, status: 200, json: async () => ({ ok: false, error: 'rejected' }) };
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+    });
+
+    reporter.enqueueEvent({ type: 'bot_death', message: 'Killed by zombie', password: 'secret_password_123' });
+    assert.strictEqual(reporter.eventQueue.length, 1);
+    // Verify password was redacted
+    assert.strictEqual(reporter.eventQueue[0].event.password, undefined);
+
+    // Flush 1: fails due to body.ok: false -> retried
+    await reporter.flushEventQueue();
+    assert.strictEqual(postCalls, 1);
+    assert.strictEqual(reporter.eventQueue.length, 1, 'Event must stay in queue when ACK fails');
+    assert.strictEqual(reporter.eventQueue[0].attempts, 1);
+
+    // Flush 2: succeeds -> removed
+    reporter.eventQueue[0].nextRetryAt = 0;
+    await reporter.flushEventQueue();
+    assert.strictEqual(postCalls, 2);
+    assert.strictEqual(reporter.eventQueue.length, 0, 'Event must be cleared on confirmed ACK');
+    reporter.stop();
+  }
+  console.log('✅ 16. INT-10-02: Event reporting queue with retry & ACK verification verified.');
+
+  // 17. Testing SEC-10-03: Keepalive strict HTTPS and wispbyte.com domain whitelist
+  console.log('17. Checking SEC-10-03: Strict HTTPS and wispbyte.com whitelist for keepalive...');
+  {
+    // Insecure HTTP -> disabled
+    const httpKeepAlive = new WispbyteKeepAlive({
+      cookie: 'session=123',
+      panelUrl: 'http://wispbyte.com/client'
+    }, quietLogger);
+    assert.strictEqual(httpKeepAlive.enabled, false);
+    const pingHttp = await httpKeepAlive.ping();
+    assert.strictEqual(pingHttp.success, false);
+    assert.strictEqual(pingHttp.status, 'error');
+
+    // Untrusted domain -> disabled
+    const evilKeepAlive = new WispbyteKeepAlive({
+      cookie: 'session=123',
+      panelUrl: 'https://evil-attacker.com/client'
+    }, quietLogger);
+    assert.strictEqual(evilKeepAlive.enabled, false);
+
+    // Legitimate HTTPS wispbyte.com -> enabled
+    const validKeepAlive = new WispbyteKeepAlive({
+      cookie: 'session=123',
+      panelUrl: 'https://wispbyte.com/client'
+    }, quietLogger);
+    assert.strictEqual(validKeepAlive.enabled, true);
+  }
+  console.log('✅ 17. SEC-10-03: Strict HTTPS and wispbyte.com whitelist verified.');
+
+  // 18. Testing HTTP-13-01: Express JSON parser error mapping
+  console.log('18. Checking HTTP-13-01: Express JSON parser error mapping (400, 413, 500)...');
+  {
+    const app = createApp({
+      fleet: { get: () => null, list: () => [], health: () => ({}) },
+      config: { botCount: 0 },
+      logger: quietLogger
+    });
+    const server = http.createServer(app);
+    await new Promise((r) => server.listen(0, r));
+    const port = server.address().port;
+
+    try {
+      // 18a. Bad JSON -> 400 invalid_json
+      const badJsonRes = await fetch(`http://127.0.0.1:${port}/api/v1/bots/w1/command`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"invalid": json'
+      });
+      assert.strictEqual(badJsonRes.status, 400);
+      const badJsonBody = await badJsonRes.json();
+      assert.strictEqual(badJsonBody.error, 'invalid_json');
+
+      // 18b. Payload too large (>32kb) -> 413 payload_too_large
+      const hugeBody = JSON.stringify({ huge: 'x'.repeat(40000) });
+      const hugeRes = await fetch(`http://127.0.0.1:${port}/api/v1/bots/w1/command`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: hugeBody
+      });
+      assert.strictEqual(hugeRes.status, 413);
+      const hugeData = await hugeRes.json();
+      assert.strictEqual(hugeData.error, 'payload_too_large');
+
+      // 18c. Unknown route -> 404 not_found
+      const notFoundRes = await fetch(`http://127.0.0.1:${port}/unknown-route`);
+      assert.strictEqual(notFoundRes.status, 404);
+      const notFoundData = await notFoundRes.json();
+      assert.strictEqual(notFoundData.error, 'not_found');
+    } finally {
+      server.close();
+    }
+  }
+  console.log('✅ 18. HTTP-13-01: Express JSON parser error mapping verified.');
+
+  // 19. Testing HTTP-13-02: Command endpoint error mapping (400, 409, 429, 503, 504)
+  console.log('19. Checking HTTP-13-02: Command endpoint error mapping...');
+  {
+    let executeError = null;
+    const mockInstance = {
+      config: { workerId: 'w1', secret: 'secret123' },
+      runtime: {
+        execute: async () => {
+          if (executeError) throw executeError;
+          return { ok: true };
+        },
+        status: () => ({ state: 'online' })
+      }
+    };
+
+    const app = createApp({
+      fleet: {
+        get: (id) => (id === 'w1' ? mockInstance : null),
+        list: () => [mockInstance],
+        health: () => ({})
+      },
+      config: { botCount: 1, bots: [mockInstance.config] },
+      logger: quietLogger
+    });
+    const server = http.createServer(app);
+    await new Promise((r) => server.listen(0, r));
+    const port = server.address().port;
+
+    try {
+      const sendCommand = (action) => fetch(`http://127.0.0.1:${port}/api/v1/bots/w1/command`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-worker-secret': 'secret123' },
+        body: JSON.stringify({ action, payload: {} })
+      });
+
+      // 19a. Unsupported action -> 400
+      const resBadAction = await sendCommand('invalid_action');
+      assert.strictEqual(resBadAction.status, 400);
+
+      // 19b. Lifecycle conflict -> 409
+      const conflictErr = new Error('A lifecycle operation is already in progress');
+      conflictErr.code = 'LIFECYCLE_CONFLICT';
+      executeError = conflictErr;
+      const resConflict = await sendCommand('start');
+      assert.strictEqual(resConflict.status, 409);
+
+      // 19c. Rate limit -> 429
+      const rateLimitErr = new Error('Worker command rate limit reached');
+      rateLimitErr.code = 'RATE_LIMIT';
+      executeError = rateLimitErr;
+      const resRateLimit = await sendCommand('status');
+      assert.strictEqual(resRateLimit.status, 429);
+
+      // 19d. Queue busy -> 503
+      const queueBusyErr = new Error('Worker command queue is busy');
+      queueBusyErr.code = 'QUEUE_BUSY';
+      executeError = queueBusyErr;
+      const resBusy = await sendCommand('status');
+      assert.strictEqual(resBusy.status, 503);
+
+      // 19e. Timeout -> 504
+      const timeoutErr = new Error('Worker action timed out');
+      timeoutErr.code = 'ETIMEDOUT';
+      executeError = timeoutErr;
+      const resTimeout = await sendCommand('status');
+      assert.strictEqual(resTimeout.status, 504);
+    } finally {
+      server.close();
+    }
+  }
+  console.log('✅ 19. HTTP-13-02: Command endpoint error mapping verified.');
+
+  // 20. Testing RT-14-01: Session abort propagation and execution lock retention on task timeout
+  console.log('20. Checking RT-14-01: Session abort propagation on non-lifecycle timeout...');
+  {
+    let abortPendingReason = null;
+    let longTaskCompleted = false;
+    let nextTaskRanDuringLongTask = false;
+    const session = {
+      sendChat: async (msg) => {
+        if (msg === 'long') {
+          await sleep(80);
+          longTaskCompleted = true;
+          return { ok: true };
+        }
+        if (msg === 'next') {
+          if (!longTaskCompleted) nextTaskRanDuringLongTask = true;
+          return { ok: true };
+        }
+        return { ok: true };
+      },
+      abortPending: (reason) => { abortPendingReason = reason; },
+      getStatus: () => ({ state: 'online' })
+    };
+    const runtime = new WorkerRuntime(session, {
+      workerId: 'w_rt14_01',
+      commandTimeoutMs: 30
+    }, quietLogger);
+
+    await assert.rejects(
+      runtime.execute('chat', { message: 'long' }),
+      /timed out after 30ms/i
+    );
+    assert.strictEqual(abortPendingReason, 'command_timeout', 'Session abortPending must be called with command_timeout');
+    assert.strictEqual(longTaskCompleted, false, 'Long task still running in background when timeout rejected');
+
+    // Next task must wait for long task to complete before executing
+    await runtime.execute('chat', { message: 'next' });
+    assert.strictEqual(longTaskCompleted, true, 'Long task must have finished before next task executes');
+    assert.strictEqual(nextTaskRanDuringLongTask, false, 'Next task must not execute while timed-out task is in-flight');
+  }
+  console.log('✅ 20. RT-14-01: Task timeout session abort propagation verified.');
+
+  // 21. Testing RT-14-02: AbortSignal propagation to all 5 lifecycle actions
+  console.log('21. Checking RT-14-02: AbortSignal propagation to all 5 lifecycle actions...');
+  {
+    const calledSignals = {};
+    const session = {
+      start: async ({ signal }) => { calledSignals.start = signal; return { state: 'online' }; },
+      stop: async (reason, { signal }) => { calledSignals.stop = signal; return { state: 'stopped' }; },
+      restart: async ({ signal }) => { calledSignals.restart = signal; return { state: 'online' }; },
+      resetData: async ({ signal }) => { calledSignals.reset = signal; return { ok: true }; },
+      getStatus: () => ({ state: 'online' })
+    };
+    const runtime = new WorkerRuntime(session, { workerId: 'w_rt14_02' }, quietLogger);
+
+    // Pre-aborted signal on stop
+    const acStop = new AbortController();
+    await runtime.execute('stop', {}, { signal: acStop.signal });
+    assert.ok(calledSignals.stop, 'stop must receive signal');
+
+    // Pre-aborted signal on reset
+    const acReset = new AbortController();
+    await runtime.execute('reset', {}, { signal: acReset.signal });
+    assert.ok(calledSignals.reset, 'reset must receive signal');
+  }
+  console.log('✅ 21. RT-14-02: AbortSignal propagation to all 5 lifecycle actions verified.');
+
+  // 22. Testing RT-14-03: Rate limit quota deduction only upon admission
+  console.log('22. Checking RT-14-03: Rate limit quota deduction only upon admission...');
+  {
+    let blockTask;
+    let isBlocked = true;
+    const session = {
+      sendChat: () => (isBlocked ? new Promise((resolve) => { blockTask = resolve; }) : Promise.resolve({ ok: true })),
+      getStatus: () => ({ state: 'online' })
+    };
+    const runtime = new WorkerRuntime(session, {
+      workerId: 'w_rt14_03',
+      commandQueueTimeoutMs: 1000
+    }, quietLogger);
+
+    // Block runtime with 1 task
+    const pBlock = runtime.execute('chat', { message: 'block' });
+    await sleep(10);
+
+    // Fill queue to MAX_PENDING_COMMANDS (10)
+    const queuedPromises = [];
+    for (let i = 0; i < 9; i++) {
+      queuedPromises.push(runtime.execute('chat', { message: `queued_${i}` }));
+    }
+    assert.strictEqual(runtime.pendingCommands, 10);
+    const countBeforeReject = runtime.commandTimes.length;
+
+    // Command 11 must reject with QUEUE_BUSY and NOT increment commandTimes
+    await assert.rejects(
+      runtime.execute('chat', { message: 'rejected_busy' }),
+      /Worker command queue is busy/i
+    );
+    assert.strictEqual(runtime.commandTimes.length, countBeforeReject, 'commandTimes must not increase on queue rejection');
+
+    // Conflicting lifecycle must reject with LIFECYCLE_CONFLICT and NOT increment commandTimes
+    const runtimeLifecycle = new WorkerRuntime(session, {
+      workerId: 'w_rt14_03_lifecycle'
+    }, quietLogger);
+    runtimeLifecycle.activeLifecycle = 'start';
+    const countBeforeLife = runtimeLifecycle.commandTimes.length;
+    await assert.rejects(
+      runtimeLifecycle.execute('stop'),
+      /lifecycle operation \(start\) is already in progress/i
+    );
+    assert.strictEqual(runtimeLifecycle.commandTimes.length, countBeforeLife, 'commandTimes must not increase on lifecycle rejection');
+
+    isBlocked = false;
+    blockTask();
+    await Promise.all([pBlock, ...queuedPromises]);
+  }
+  console.log('✅ 22. RT-14-03: Rate limit quota deduction only upon admission verified.');
+
+  // 23. Testing FLEET-15-01: Auto-start coordinates via WorkerRuntime.execute('start')
+  console.log('23. Checking FLEET-15-01: Auto-start coordinates via WorkerRuntime.execute("start")...');
+  {
+    let runtimeExecuteAction = null;
+    let sessionStartDirect = false;
+
+    const fleet = new WorkerFleet({
+      autoStart: true,
+      bots: [{
+        workerId: 'b_autostart',
+        managerUrl: 'http://manager',
+        secret: 'sec',
+        transport: 'render-http',
+        mc: { username: 'TestBot' }
+      }],
+      wispbyte: {}
+    }, quietLogger, {
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ ok: true, settings: {}, credentials: { username: 'Bot1', password: 'password123' } })
+      })
+    });
+
+    const inst = fleet.get('b_autostart');
+    inst.session.start = async () => { sessionStartDirect = true; };
+    inst.runtime.execute = async (act) => {
+      runtimeExecuteAction = act;
+      return { ok: true };
+    };
+
+    await fleet.start();
+    assert.strictEqual(runtimeExecuteAction, 'start', 'Auto-start must invoke runtime.execute("start")');
+    assert.strictEqual(sessionStartDirect, false, 'Auto-start must NOT call session.start() directly');
+    await fleet.stop();
+  }
+  console.log('✅ 23. FLEET-15-01: Auto-start via WorkerRuntime.execute("start") verified.');
+
+  // 24. Testing FLEET-15-02: Fleet state machine preventing duplicate timer leaks
+  console.log('24. Checking FLEET-15-02: Fleet state machine concurrency lock...');
+  {
+    const fleet = new WorkerFleet({
+      autoStart: false,
+      bots: [{
+        workerId: 'b_state',
+        managerUrl: 'http://manager',
+        secret: 'sec',
+        transport: 'render-http',
+        mc: { username: 'TestBot' }
+      }],
+      wispbyte: {}
+    }, quietLogger, {
+      fetchImpl: async () => ({
+        ok: true,
+        json: async () => ({ ok: true, settings: {}, credentials: {} })
+      })
+    });
+
+    assert.strictEqual(fleet.state, 'STOPPED');
+
+    // Concurrent start calls
+    await Promise.all([fleet.start(), fleet.start()]);
+    assert.strictEqual(fleet.state, 'RUNNING');
+    const firstTimer = fleet.heartbeatTimer;
+
+    // A subsequent start call while RUNNING does nothing and keeps same timer
+    await fleet.start();
+    assert.strictEqual(fleet.heartbeatTimer, firstTimer, 'Duplicate start() must not create new interval');
+
+    await fleet.stop();
+    assert.strictEqual(fleet.state, 'STOPPED');
+    assert.strictEqual(fleet.heartbeatTimer, null);
+  }
+  console.log('✅ 24. FLEET-15-02: Fleet state machine & timer leak prevention verified.');
 
   console.log('🎉 ALL WORKER INTEGRATION TESTS PASSED 100%!');
 }

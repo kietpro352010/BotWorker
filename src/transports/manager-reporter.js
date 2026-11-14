@@ -48,8 +48,12 @@ class ManagerReporter {
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(8000)
     });
-    if (!response.ok) throw new Error(`manager_http_${response.status}`);
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || (body && typeof body.ok === 'boolean' && !body.ok)) {
+      throw new Error(body?.error || `manager_http_${response.status}`);
+    }
     this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
+    return body;
   }
 
   async heartbeat(status) {
@@ -100,17 +104,83 @@ class ManagerReporter {
     return body;
   }
 
-  async sendEvent(event) {
-    // Redact any passwords from event message/reason before sending
+  enqueueEvent(event) {
     const sanitized = {
       ...event,
-      message: event.message ? redactAuditValue(event.message) : undefined,
-      reason: event.reason ? redactAuditValue(event.reason) : undefined,
-      occurredAt: new Date().toISOString()
+      message: event?.message ? redactAuditValue(event.message) : undefined,
+      reason: event?.reason ? redactAuditValue(event.reason) : undefined,
+      occurredAt: event?.occurredAt || new Date().toISOString()
     };
+    delete sanitized.password;
+    delete sanitized.token;
 
+    if (this.eventQueue.length >= 100) {
+      this.eventQueue.shift(); // Bound queue to prevent memory leak
+    }
+
+    this.eventQueue.push({
+      event: sanitized,
+      attempts: 0,
+      nextRetryAt: 0
+    });
+
+    this.scheduleFlush(0);
+  }
+
+  scheduleFlush(delayMs = 1000) {
+    if (this.eventFlushTimer) return;
+    this.eventFlushTimer = setTimeout(() => {
+      this.eventFlushTimer = null;
+      void this.flushEventQueue();
+    }, delayMs);
+    this.eventFlushTimer.unref?.();
+  }
+
+  async flushEventQueue() {
+    if (!this.eventQueue.length) return;
+    const now = Date.now();
+    const remaining = [];
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
-    return this.post(path, sanitized);
+
+    for (const item of this.eventQueue) {
+      if (now < item.nextRetryAt) {
+        remaining.push(item);
+        continue;
+      }
+
+      try {
+        await this.post(path, item.event);
+      } catch (err) {
+        item.attempts += 1;
+        const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 5)));
+        item.nextRetryAt = Date.now() + backoffMs;
+        remaining.push(item);
+        this.logger?.warn?.('manager_event_delivery_retry', {
+          workerId: this.workerId,
+          attempts: item.attempts,
+          nextRetryInMs: backoffMs,
+          error: err.message
+        });
+      }
+    }
+
+    this.eventQueue = remaining;
+    if (this.eventQueue.length > 0) {
+      const nextDelay = Math.max(100, Math.min(...this.eventQueue.map((i) => Math.max(0, i.nextRetryAt - Date.now()))));
+      this.scheduleFlush(nextDelay);
+    }
+  }
+
+  async sendEvent(event) {
+    this.enqueueEvent(event);
+    return this.flushEventQueue();
+  }
+
+  stop() {
+    if (this.eventFlushTimer) {
+      clearTimeout(this.eventFlushTimer);
+      this.eventFlushTimer = null;
+    }
   }
 }
 

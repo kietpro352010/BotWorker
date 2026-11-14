@@ -1,6 +1,20 @@
 'use strict';
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function cancellableSleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    let timer = null;
+    const onAbort = () => {
+      if (timer) clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
 
 class WispbytePoller {
   constructor({ config, runtime, reporter, logger, fetchImpl = global.fetch }) {
@@ -13,13 +27,55 @@ class WispbytePoller {
     this.loopPromise = null;
     this.failures = 0;
     this.activeController = null;
+    this.stopController = new AbortController();
+    this.pendingResults = [];
+    this.maxPendingResults = 100;
   }
 
   start() {
     if (this.loopPromise) return this.loopPromise;
     this.stopping = false;
+    this.stopController = new AbortController();
     this.loopPromise = this.run().finally(() => { this.loopPromise = null; });
     return this.loopPromise;
+  }
+
+  enqueueResult(resultPayload) {
+    if (this.pendingResults.length >= this.maxPendingResults) {
+      this.pendingResults.shift(); // Drop oldest to prevent unbounded growth
+    }
+    this.pendingResults.push({
+      payload: resultPayload,
+      attempts: 0,
+      nextRetryAt: 0
+    });
+  }
+
+  async flushPendingResults() {
+    if (!this.pendingResults.length || this.stopping) return;
+    const now = Date.now();
+    const remaining = [];
+    for (const item of this.pendingResults) {
+      if (now < item.nextRetryAt) {
+        remaining.push(item);
+        continue;
+      }
+      try {
+        await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, item.payload);
+      } catch (err) {
+        item.attempts += 1;
+        const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 6)));
+        item.nextRetryAt = Date.now() + backoffMs;
+        remaining.push(item);
+        this.logger?.warn?.('wispbyte_result_retry_failed', {
+          commandId: item.payload?.commandId,
+          attempts: item.attempts,
+          nextRetryInMs: backoffMs,
+          error: err.message
+        });
+      }
+    }
+    this.pendingResults = remaining;
   }
 
   async request(path, payload) {
@@ -49,6 +105,7 @@ class WispbytePoller {
   async run() {
     while (!this.stopping) {
       try {
+        await this.flushPendingResults();
         const current = { ...this.runtime.status(), managerLatencyMs: this.reporter.managerLatencyMs };
         const response = await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/poll`, {
           status: current, waitMs: 25000, sentAt: new Date().toISOString()
@@ -63,16 +120,28 @@ class WispbytePoller {
             try { result = await this.runtime.execute(command.action, command.payload || {}); }
             catch (error) { result = { ok: false, error: error.message }; }
           }
-          await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, {
-            commandId: command.commandId, action: command.action, result, completedAt: new Date().toISOString()
-          });
-          await sleep(500);
+          const resultPayload = {
+            commandId: command.commandId,
+            action: command.action,
+            result,
+            completedAt: new Date().toISOString()
+          };
+          try {
+            await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, resultPayload);
+          } catch (err) {
+            this.logger?.warn?.('wispbyte_result_send_failed_queueing', {
+              commandId: command.commandId,
+              error: err.message
+            });
+            this.enqueueResult(resultPayload);
+          }
+          await cancellableSleep(500, this.stopController.signal);
         } else {
           // Adaptive polling interval: 1.5s when active/transitioning, 4s-6s when idle (AFK_LOCKED / disconnected)
           const stateStr = String(current.state || '').toLowerCase();
           const isIdle = ['idle', 'stopped', 'disconnected', 'afk_locked'].includes(stateStr);
           const adaptiveDelayMs = isIdle ? (4000 + Math.floor(Math.random() * 2000)) : 1500;
-          await sleep(adaptiveDelayMs);
+          await cancellableSleep(adaptiveDelayMs, this.stopController.signal);
         }
       } catch (error) {
         if (this.stopping) break;
@@ -85,13 +154,14 @@ class WispbytePoller {
         this.failures += 1;
         this.logger.warn('wispbyte_poll_failed', { failures: this.failures, error: error.message });
         const delay = Math.min(60000, 1500 * (2 ** Math.min(this.failures, 5))) + Math.floor(Math.random() * 1000);
-        await sleep(delay);
+        await cancellableSleep(delay, this.stopController.signal);
       }
     }
   }
 
   async stop() {
     this.stopping = true;
+    this.stopController?.abort();
     this.activeController?.abort();
     await this.loopPromise?.catch(() => {});
   }

@@ -494,7 +494,10 @@ class MinecraftSession extends EventEmitter {
     return this._haltSession(reason, { emitEvent: false });
   }
 
-  async stop(reason = 'manager_stop', { emitEvent = true } = {}) {
+  async stop(reason = 'manager_stop', { emitEvent = true, signal } = {}) {
+    if (signal?.aborted) {
+      this.abortPending(this._abortReasonFromSignal(signal));
+    }
     return this._haltSession(reason, { emitEvent });
   }
 
@@ -514,10 +517,14 @@ class MinecraftSession extends EventEmitter {
     return this.connect({ signal });
   }
 
-  async resetData() {
+  async resetData({ signal } = {}) {
+    if (signal?.aborted) {
+      this.abortPending(this._abortReasonFromSignal(signal));
+      return { ok: false, error: 'reset_aborted', worker: this.getStatus() };
+    }
     this.generation += 1;
     this.clearTimers();
-    await this.stop('manager_reset_data', { emitEvent: false });
+    await this.stop('manager_reset_data', { emitEvent: false, signal });
     this.username = '';
     this.password = '';
     this.auth.password = '';

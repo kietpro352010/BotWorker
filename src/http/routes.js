@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { requireWorkerSecret } = require('./auth');
+const { requireWorkerSecret, safeEqual, extractWorkerToken } = require('./auth');
 const { ACTIONS } = require('../services/worker-runtime');
 
 function attachBotRoutes(router, fleet, workerId, { legacy = false } = {}) {
@@ -24,7 +24,22 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false } = {}) {
       const result = await req.workerInstance.runtime.execute(action, req.body?.payload || {});
       return res.json({ ok: true, result });
     } catch (error) {
-      return res.status(400).json({ ok: false, error: error.message || 'command_failed' });
+      const msg = error.message || '';
+      let status = 400;
+      if (error.status && Number.isInteger(error.status) && error.status >= 400 && error.status < 600) {
+        status = error.status;
+      } else if (error.code === 'ETIMEDOUT' || /timed out/i.test(msg)) {
+        status = 504;
+      } else if (error.code === 'QUEUE_BUSY' || /queue is busy/i.test(msg)) {
+        status = 503;
+      } else if (error.code === 'RATE_LIMIT' || /rate limit/i.test(msg)) {
+        status = 429;
+      } else if (error.code === 'LIFECYCLE_CONFLICT' || /already in progress|conflicting/i.test(msg)) {
+        status = 409;
+      } else if (/unsupported|payload/i.test(msg)) {
+        status = 400;
+      }
+      return res.status(status).json({ ok: false, error: msg || 'command_failed', code: error.code || null });
     }
   });
 
@@ -45,9 +60,20 @@ function createRouter({ fleet, config }) {
   router.get(['/', '/health'], (_req, res) => res.json({
     ok: true,
     service: 'kingmc-afk-worker',
-    botCount: config.botCount,
-    resource: fleet.health()
+    botCount: config.botCount
   }));
+
+  router.get('/api/v1/diagnostics', (req, res) => {
+    const secret = extractWorkerToken(req);
+    const authed = Array.isArray(config.bots) && config.bots.some((b) => safeEqual(secret, b.secret));
+    if (!authed) return res.status(401).json({ ok: false, error: 'unauthorized' });
+    return res.json({
+      ok: true,
+      service: 'kingmc-afk-worker',
+      botCount: config.botCount,
+      resource: fleet.health()
+    });
+  });
 
   attachBotRoutes(router, fleet);
 

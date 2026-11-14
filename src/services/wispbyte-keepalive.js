@@ -4,6 +4,16 @@ const DEFAULT_PANEL_URL = 'https://wispbyte.com/client';
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
+function isAllowedPanelUrl(urlStr) {
+  try {
+    const parsed = new URL(urlStr);
+    if (parsed.protocol !== 'https:') return false;
+    return parsed.hostname === 'wispbyte.com' || parsed.hostname.endsWith('.wispbyte.com');
+  } catch {
+    return false;
+  }
+}
+
 class WispbyteKeepAlive {
   constructor(config = {}, logger = console, { fetchImpl = global.fetch } = {}) {
     this.cookie = String(config.cookie || '').trim();
@@ -19,11 +29,25 @@ class WispbyteKeepAlive {
     this.lastStatus = 'idle';
     this.lastMessage = this.enabled ? 'Configured, waiting for initial ping' : 'Disabled (no cookie configured)';
     this.renewCount = 0;
+
+    if (this.enabled && !isAllowedPanelUrl(this.panelUrl)) {
+      this.enabled = false;
+      this.lastStatus = 'error';
+      this.lastMessage = 'Insecure or unwhitelisted panel URL. HTTPS and wispbyte.com domain required.';
+      this.logger.warn?.('wispbyte_keepalive_insecure_url', { url: this.panelUrl });
+    }
   }
 
   async ping() {
     if (!this.enabled || !this.cookie) {
-      return { success: false, status: 'disabled', message: 'WISPBYTE_COOKIE is not configured.' };
+      return {
+        success: false,
+        status: this.lastStatus === 'error' ? 'error' : 'disabled',
+        message: this.lastMessage || 'WISPBYTE_COOKIE is not configured.'
+      };
+    }
+    if (!isAllowedPanelUrl(this.panelUrl)) {
+      return { success: false, status: 'error', message: 'Insecure or unwhitelisted panel URL.' };
     }
 
     try {

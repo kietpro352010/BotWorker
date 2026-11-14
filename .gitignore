@@ -6,3 +6,5 @@ logs/
 data/
 npm-debug.log*
 
+*.log  
+scratch/ 

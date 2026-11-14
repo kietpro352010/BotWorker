@@ -6,7 +6,7 @@ const ACTIONS = new Set([
 ]);
 
 const LIFECYCLE_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset']);
-const CLEANUP_ON_ABORT_ACTIONS = new Set(['start', 'restart', 'reconnect']);
+const CLEANUP_ON_ABORT_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset']);
 
 const DEFAULT_EXEC_TIMEOUT_MS = 10000;
 const DEFAULT_LIFECYCLE_TIMEOUT_MS = 15000;
@@ -50,6 +50,7 @@ class WorkerRuntime {
     this.pendingCommands = 0;
     this.commandTimes = [];
     this.activeLifecycle = null;
+    this.activeLifecycleToken = null;
     this.queuedLifecycles = new Set();
   }
 
@@ -100,17 +101,24 @@ class WorkerRuntime {
       throw createAbortError(externalSignal.reason, action);
     }
 
-    this.applyCommandLimit();
+    this.checkCommandLimit();
     if (this.pendingCommands >= MAX_PENDING_COMMANDS) {
-      throw new Error('Worker command queue is busy. Try again shortly.');
+      const err = new Error('Worker command queue is busy. Try again shortly.');
+      err.code = 'QUEUE_BUSY';
+      throw err;
     }
 
     // Concurrency guard: reject conflicting lifecycle action if one is active OR queued
     const isLifecycle = LIFECYCLE_ACTIONS.has(action);
     const conflictingLifecycle = this.activeLifecycle || this.getQueuedLifecycleAction();
     if (isLifecycle && conflictingLifecycle) {
-      throw new Error(`A lifecycle operation (${conflictingLifecycle}) is already in progress. Conflicting ${action} command rejected.`);
+      const err = new Error(`A lifecycle operation (${conflictingLifecycle}) is already in progress. Conflicting ${action} command rejected.`);
+      err.code = 'LIFECYCLE_CONFLICT';
+      throw err;
     }
+
+    this.recordCommandLimit();
+    this.pendingCommands += 1;
 
     const defaultExecMs = isLifecycle ? DEFAULT_LIFECYCLE_TIMEOUT_MS : DEFAULT_EXEC_TIMEOUT_MS;
     const configExecMs = isLifecycle
@@ -119,7 +127,6 @@ class WorkerRuntime {
     const execTimeoutMs = resolveTimeoutMs(defaultExecMs, options?.timeoutMs, payload.timeoutMs, payload.execTimeoutMs, configExecMs);
     const queueTimeoutMs = resolveTimeoutMs(DEFAULT_QUEUE_TIMEOUT_MS, options?.queueTimeoutMs, payload.queueTimeoutMs, this.config?.commandQueueTimeoutMs);
 
-    this.pendingCommands += 1;
     const lifecycleToken = isLifecycle ? { action } : null;
     if (lifecycleToken) {
       this.queuedLifecycles.add(lifecycleToken);
@@ -140,6 +147,9 @@ class WorkerRuntime {
     let started = false;
     let queueTimer = null;
     let onQueueAbort = null;
+    let execPromise = null;
+    let releaseSettleLock = null;
+    const settleLock = new Promise((resolve) => { releaseSettleLock = resolve; });
 
     const clearQueueWait = () => {
       if (queueTimer) {
@@ -158,6 +168,7 @@ class WorkerRuntime {
         cancelled = true;
         clearQueueWait();
         releaseSlot();
+        releaseSettleLock();
         reject(err);
       };
 
@@ -178,13 +189,17 @@ class WorkerRuntime {
     });
 
     const runTask = async () => {
-      if (cancelled) return;
+      if (cancelled) {
+        releaseSettleLock();
+        return;
+      }
       started = true;
       clearQueueWait();
 
       if (lifecycleToken) {
         this.queuedLifecycles.delete(lifecycleToken);
         this.activeLifecycle = action;
+        this.activeLifecycleToken = lifecycleToken;
       }
 
       const execController = new AbortController();
@@ -217,7 +232,7 @@ class WorkerRuntime {
         }, execTimeoutMs);
       });
 
-      const execPromise = Promise.resolve().then(() =>
+      execPromise = Promise.resolve().then(() =>
         this.executeNow(action, payload, { signal: execController.signal })
       );
       execPromise.catch(() => {});
@@ -225,8 +240,12 @@ class WorkerRuntime {
       try {
         return await Promise.race([execPromise, execTimeoutOrAbortPromise]);
       } catch (err) {
-        if (execController.signal.aborted && isLifecycle) {
-          await this.cleanupAbortedLifecycle(action, err);
+        if (execController.signal.aborted) {
+          if (isLifecycle) {
+            await this.cleanupAbortedLifecycle(action, err);
+          } else if (typeof this.session?.abortPending === 'function') {
+            try { this.session.abortPending(err?.code === 'ETIMEDOUT' ? 'command_timeout' : 'command_aborted'); } catch (_) {}
+          }
         }
         throw err;
       } finally {
@@ -235,15 +254,27 @@ class WorkerRuntime {
         if (externalSignal && onExternalAbort) externalSignal.removeEventListener('abort', onExternalAbort);
         if (lifecycleToken) {
           this.queuedLifecycles.delete(lifecycleToken);
-          if (this.activeLifecycle === action) {
+          if (this.activeLifecycleToken === lifecycleToken) {
             this.activeLifecycle = null;
+            this.activeLifecycleToken = null;
           }
+        }
+        if (!isLifecycle) {
+          // For non-lifecycle tasks, retain execution lock until task terminates (or 10s safety timeout)
+          const waitSettle = Promise.race([
+            execPromise ? execPromise.catch(() => {}) : Promise.resolve(),
+            new Promise((r) => { const t = setTimeout(r, 10000); t.unref?.(); })
+          ]);
+          waitSettle.finally(() => releaseSettleLock());
+        } else {
+          releaseSettleLock();
         }
       }
     };
 
-    const task = this.execution.then(() => runTask());
-    this.execution = task.then(() => undefined, () => undefined);
+    const prevExecution = this.execution;
+    this.execution = Promise.allSettled([prevExecution, settleLock]).then(() => undefined);
+    const task = prevExecution.then(() => runTask());
     try {
       return await Promise.race([task, queueWaitAbortPromise]);
     } finally {
@@ -252,11 +283,23 @@ class WorkerRuntime {
     }
   }
 
-  applyCommandLimit() {
+  checkCommandLimit() {
     const now = Date.now();
     this.commandTimes = this.commandTimes.filter((time) => now - time < 60000);
-    if (this.commandTimes.length >= 30) throw new Error('Worker command rate limit reached. Try again in a minute.');
-    this.commandTimes.push(now);
+    if (this.commandTimes.length >= 30) {
+      const err = new Error('Worker command rate limit reached. Try again in a minute.');
+      err.code = 'RATE_LIMIT';
+      throw err;
+    }
+  }
+
+  recordCommandLimit() {
+    this.commandTimes.push(Date.now());
+  }
+
+  applyCommandLimit() {
+    this.checkCommandLimit();
+    this.recordCommandLimit();
   }
 
   async executeNow(action, payload, { signal } = {}) {
@@ -266,7 +309,7 @@ class WorkerRuntime {
         await this.refreshManagerConfig({ signal });
         if (signal?.aborted) throw createAbortError(signal.reason, action);
         return this.session.start({ signal });
-      case 'stop': return this.session.stop('manager_stop');
+      case 'stop': return this.session.stop('manager_stop', { signal });
       case 'restart':
       case 'reconnect':
         await this.refreshManagerConfig({ signal });
@@ -274,7 +317,7 @@ class WorkerRuntime {
         return this.session.restart({ signal });
       case 'status': return this.status();
       case 'chat': return this.session.sendChat(payload.message || payload.text);
-      case 'reset': return this.session.resetData();
+      case 'reset': return this.session.resetData({ signal });
       case 'set-afk-mode': return this.session.setAfkMode(payload.mode);
       case 'set-proxy': return this.session.setProxy(payload.url || payload.proxy || payload.proxyUrl, { signal });
       case 'respawn': return this.session.respawn();

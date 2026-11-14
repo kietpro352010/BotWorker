@@ -6,6 +6,13 @@ const ManagerReporter = require('../transports/manager-reporter');
 const WispbytePoller = require('../transports/wispbyte-poller');
 const WispbyteKeepAlive = require('./wispbyte-keepalive');
 
+const FleetState = Object.freeze({
+  STOPPED: 'STOPPED',
+  STARTING: 'STARTING',
+  RUNNING: 'RUNNING',
+  STOPPING: 'STOPPING'
+});
+
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function scopeLogger(logger, workerId) {
@@ -20,6 +27,7 @@ class WorkerFleet {
   constructor(config, logger, { fetchImpl = global.fetch } = {}) {
     this.config = config;
     this.logger = logger;
+    this.state = FleetState.STOPPED;
     this.stopping = false;
     this.heartbeatTimer = null;
     this.resourceTimer = null;
@@ -50,9 +58,7 @@ class WorkerFleet {
       this.instances.set(botConfig.workerId, instance);
 
       session.on('event', (event) => {
-        void reporter.sendEvent(event).catch((error) => logger.warn('manager_event_delivery_failed', {
-          workerId: botConfig.workerId, error: error.message
-        }));
+        reporter.enqueueEvent(event);
       });
       session.on('state', (status) => {
         void reporter.heartbeat(status).catch(() => {});
@@ -93,7 +99,8 @@ class WorkerFleet {
   }
 
   async start() {
-    if (this.heartbeatTimer) return;
+    if (this.state === FleetState.STARTING || this.state === FleetState.RUNNING || this.heartbeatTimer) return;
+    this.state = FleetState.STARTING;
     this.stopping = false;
     this.wispbyteKeepAlive.start();
 
@@ -108,7 +115,10 @@ class WorkerFleet {
         this.logger.warn('worker_bootstrap_check_failed', { workerId: instance.config.workerId, error: error.message });
       }
     }
-    if (this.stopping) return;
+    if (this.stopping) {
+      this.state = FleetState.STOPPED;
+      return;
+    }
 
     for (const instance of this.instances.values()) {
       if (instance.poller) void instance.poller.start();
@@ -144,6 +154,8 @@ class WorkerFleet {
     }, 20000);
     this.resourceTimer.unref?.();
 
+    this.state = FleetState.RUNNING;
+
     if (this.config.autoStart) {
       let position = 0;
       for (const instance of this.instances.values()) {
@@ -155,13 +167,19 @@ class WorkerFleet {
           await delay(5000);
         }
         if (position > 0) await delay(8000);
-        if (!this.stopping && !instance.session.isHeld()) await instance.session.start();
+        if (!this.stopping && !instance.session.isHeld()) {
+          await instance.runtime.execute('start').catch((error) => {
+            this.logger.warn('worker_auto_start_failed', { workerId: instance.config.workerId, error: error.message });
+          });
+        }
         position += 1;
       }
     }
   }
 
   async stop() {
+    if (this.state === FleetState.STOPPING || this.state === FleetState.STOPPED) return;
+    this.state = FleetState.STOPPING;
     this.stopping = true;
     this.wispbyteKeepAlive.stop();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
@@ -169,9 +187,11 @@ class WorkerFleet {
     this.heartbeatTimer = null;
     this.resourceTimer = null;
     await Promise.all(this.list().map(async (instance) => {
+      instance.reporter?.stop?.();
       await instance.poller?.stop();
       await instance.session.stop('process_shutdown');
     }));
+    this.state = FleetState.STOPPED;
   }
 }
 
