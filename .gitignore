@@ -8,3 +8,7 @@ npm-debug.log*
 
 *.log  
 scratch/ 
+
+# Local internal notes & docs (archived locally in D:\kbot_internal_archive)
+CLAUDE.md
+FEATURES.md
