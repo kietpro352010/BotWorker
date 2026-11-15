@@ -6,18 +6,18 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node --max-old-space-size=384 src/index.js",
-    "test": "node tests/integration.test.js && node tests/challenger_stress.test.js && node tests/remediation-audit.test.js",
     "start:render": "cross-env WORKER_TRANSPORT=render-http node --max-old-space-size=384 src/index.js",
     "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 src/index.js"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "cross-env": "^7.0.3",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
     "helmet": "^8.1.0",
     "mineflayer": "^4.37.1",
-    "socks": "^2.8.3",
-    "cross-env": "^7.0.3"
+    "socks": "^2.8.3"
   }
 }
-

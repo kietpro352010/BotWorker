@@ -66,7 +66,7 @@ At 04:30 every day in `Asia/Ho_Chi_Minh` (Vietnam time, UTC+7), an active bot st
 
 ### Render
 
-Use this folder as the Render Web Service root and apply `render.yaml`. Set both worker identities and secrets plus the manager URL. Minecraft usernames/passwords are entered in the Discord manager, not in Render environment variables. The service exposes `/health`; manager control requests use the per-slot endpoint and secret. Use an always-on plan for continuous AFK. The free Render service spins down and cannot keep a Minecraft connection alive; see [Render's free instance limits](https://render.com/docs/free).
+Use this repository as the Render Web Service root. Set both worker identities and secrets plus the manager URL. Minecraft usernames/passwords are entered in the Discord manager, not in Render environment variables. The service exposes `/health`; manager control requests use the per-slot endpoint and secret. Use an always-on plan for continuous AFK. The free Render service spins down and cannot keep a Minecraft connection alive; see [Render's free instance limits](https://render.com/docs/free).
 
 ### Wispbyte
 
