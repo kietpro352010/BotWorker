@@ -42,6 +42,7 @@ function readSlot(env, slot, common) {
 
   return Object.freeze({
     ...common,
+    slot,
     workerId,
     secret,
     mc: Object.freeze({ ...common.mc, username, password, authType, viewDistance, proxy }),

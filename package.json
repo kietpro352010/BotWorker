@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node --max-old-space-size=384 src/index.js",
     "start:render": "cross-env WORKER_TRANSPORT=render-http node --max-old-space-size=384 src/index.js",
-    "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 src/index.js"
+    "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 src/index.js",
+    "test": "node test/integration.test.js && node test/remediation-audit.test.js && node test/challenger_stress.test.js"
   },
   "engines": {
     "node": ">=20"

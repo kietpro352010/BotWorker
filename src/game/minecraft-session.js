@@ -428,6 +428,7 @@ class MinecraftSession extends EventEmitter {
       bot.world = null;
       bot.blockAt = null;
     }
+    this.networkSockets.clear();
     this.bot = null;
     this.connectedAt = null;
   }
@@ -823,9 +824,11 @@ class MinecraftSession extends EventEmitter {
     if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
     this.chunkPruneTimer = null;
     const bot = this.bot;
+    if (bot) {
+      this.cleanupSessionResources(bot);
+    }
     this.bot = null;
     this.connectedAt = null;
-    if (bot) { try { bot.end('fixed_maintenance_window'); } catch (_) {} }
     this.setState('maintenance', 'fixed_maintenance_window');
     this.emit('event', { type: 'maintenance_window', message: 'Scheduled stop 04:30–05:30 Vietnam time (UTC+7).' });
   }

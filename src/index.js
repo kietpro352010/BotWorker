@@ -68,6 +68,7 @@ async function main() {
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    setTimeout(() => process.exit(0), 2000).unref();
     clearInterval(memorySweepInterval);
     logger.info('worker_shutdown', { signal, botCount: config.botCount });
     await fleet.stop();
@@ -76,6 +77,12 @@ async function main() {
   };
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
   process.once('SIGINT', () => void shutdown('SIGINT'));
+  process.on('uncaughtException', (error) => {
+    logger.error('worker_uncaught_exception', { error: error?.message || String(error), stack: error?.stack });
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error('worker_unhandled_rejection', { error: reason?.message || String(reason), stack: reason?.stack });
+  });
 
   try {
     await fleet.start();

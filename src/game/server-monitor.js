@@ -32,7 +32,7 @@ class ServerMonitor {
     const itemsSummary = [];
 
     if (this.bot?.inventory) {
-      const items = this.bot.inventory.items();
+      const items = (this.bot.inventory.items() || []).filter((item) => item && item.slot !== 45);
       for (const item of items) {
         if (!item) continue;
         if (item.name === 'totem_of_undying') {

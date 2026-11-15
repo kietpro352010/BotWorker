@@ -14,5 +14,6 @@ scratch/
 CLAUDE.md
 FEATURES.md
 tests/
+test/
 render.yaml
 .github/
