@@ -20,7 +20,7 @@ src/
 ## Configure one or two bots
 
 1. Install Node.js 20 or newer.
-2. Copy `.env.example` to `.env` and set `MANAGER_URL`.
+2. Configure environment variables in `.env` (refer to the Settings table below) and set `MANAGER_URL`.
 3. In the Discord manager, register each slot separately. Copy each one-time secret to the matching `WORKER_SECRET_1` or `WORKER_SECRET_2` variable.
 4. Set a different `WORKER_ID` and worker secret for each slot. Enter the Minecraft username/password from the private Discord panel; do not put them in worker environment variables.
 5. Run `npm ci` and `npm start`.
