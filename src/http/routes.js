@@ -60,7 +60,8 @@ function createRouter({ fleet, config }) {
   router.get(['/', '/health'], (_req, res) => res.json({
     ok: true,
     service: 'kingmc-afk-worker',
-    botCount: config.botCount
+    botCount: config.botCount,
+    bots: Array.isArray(config.bots) ? config.bots.map((b) => ({ workerId: b.workerId, slot: b.slot })) : []
   }));
 
   router.get('/api/v1/diagnostics', (req, res) => {
