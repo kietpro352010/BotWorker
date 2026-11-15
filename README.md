@@ -42,36 +42,21 @@ src/
 
 ---
 
-## 2. Cấu hình biến môi trường (Environment Variables)
+## 2. Cấu hình biến môi trường (Tối Giản — Chỉ 3 biến trên Render/Wispbyte)
 
-### A. Cấu hình kết nối Manager & Bot Slot (Bắt buộc)
+Để khởi chạy Worker, bạn **chỉ cần cấu hình đúng 3 biến duy nhất** cho mỗi host:
 
 | Tên biến | Bắt buộc | Mô tả |
 |---|---|---|
-| `MANAGER_URL` | Có | HTTPS URL của dịch vụ Manager (`https://<manager-url>`) |
-| `WORKER_ID_1` | Có | ID định danh của Bot Slot 1 được tạo trên Discord Manager (chữ thường, số, gạch ngang) |
-| `WORKER_SECRET_1` | Có | Khóa bí mật của Slot 1 (chuỗi ngẫu nhiên từ 32 ký tự trở lên do Manager cấp) |
-| `WORKER_ID_2` | Không | ID định danh của Bot Slot 2 (nếu host chạy 2 bot) |
-| `WORKER_SECRET_2` | Không | Khóa bí mật của Bot Slot 2 |
-| `WORKER_BOT_COUNT` | Không | Số lượng bot chạy trên host này (`1` hoặc `2`). Mặc định tự động bật 2 slot nếu có `WORKER_ID_2` |
+| `MANAGER_URL` | **Có** | HTTPS URL của dịch vụ Manager trên Render (`https://<manager-name>.onrender.com`) |
+| `WORKER_ID_1` | **Có** | ID định danh của Bot Slot 1 được cấp từ Manager (chữ thường, số, gạch ngang) |
+| `WORKER_SECRET_1` | **Có** | Khóa bí mật của Slot 1 (chuỗi ngẫu nhiên 32+ ký tự do Manager cấp) |
 
-> **Lưu ý quan trọng**: Mật khẩu và tài khoản Minecraft được quản lý tập trung và mã hóa an toàn trên Manager, worker nhận thông tin qua HTTPS bootstrap khi khởi động. **Tuyệt đối không điền mật khẩu Minecraft vào biến môi trường của Worker.**
-
-### B. Cấu hình Server Game & Proxy
-
-| Tên biến | Mặc định | Mô tả |
-|---|---|---|
-| `MC_SERVER_HOSTS` | `sgp.kingmc.vn,kingmc.vn` | Danh sách IP/domain server KingMC được phê duyệt |
-| `MC_SERVER_PORT` | `25565` | Cổng kết nối server Minecraft |
-| `MC_SERVER_VERSION` | `1.20.1` | Phiên bản giao thức Minecraft |
-| `MC_AUTH_TYPE` | `offline` | Kiểu tài khoản Minecraft (`offline` hoặc `microsoft`) |
-| `MC_AUTH_ENABLED` | `true` | Tự động trả lời lệnh `/login <mật khẩu>` khi vào server |
-| `MC_VIEW_DISTANCE` | `short` | Khoảng cách nhìn (`tiny`, `short`, `normal`, `far`) — chọn `short` để tiết kiệm RAM |
-| `MC_PROXY_URL_1` | *(trống)* | URL Proxy SOCKS5 riêng cho slot 1 (ví dụ `socks5://user:pass@host:1080`) |
-| `MC_PROXY_URL_2` | *(trống)* | URL Proxy SOCKS5 riêng cho slot 2 |
-| `JOIN_COMMAND` | *(trống)* | Lệnh gửi vào game sau khi spawn (ví dụ lệnh vào cụm server) |
-| `AUTO_START` | `true` | Tự động kết nối vào server ngay khi khởi động worker |
-| `AUTO_RECONNECT` | `true` | Tự động kết nối lại khi bị ngắt kết nối với cơ chế backoff |
+> 💡 **Tất cả các thông số khác đều được cấu hình qua Web Dashboard & Discord**:
+> - **Tài khoản & Mật khẩu game Minecraft**: Được lưu trữ mã hóa an toàn trên Manager, worker tự động nạp qua kết nối bảo mật khi chạy. **Tuyệt đối không cần nhập mật khẩu game vào biến môi trường.**
+> - **Proxy SOCKS5, đổi tên hiển thị (Alias), máy chủ game**: Cài đặt trực tiếp trên Web Dashboard hoặc lệnh Discord `/bots`.
+> - **Cấu hình mạng & kết nối lại**: Mặc định đã tự động chọn máy chủ `sgp.kingmc.vn` (cổng 25565), chế độ AFK `still`, tự động trang bị Totem và tự động kết nối lại khi rớt mạng.
+> - *(Tùy chọn nếu host chạy 2 bot song song)*: Thêm `WORKER_ID_2` và `WORKER_SECRET_2`.
 
 ---
 
