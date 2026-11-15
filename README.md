@@ -1,81 +1,105 @@
-# KingMC AFK Worker
+# KingMC AFK Worker (`BotWorker`)
 
-One worker process can run up to two independent Minecraft bot slots on the same Render or Wispbyte host. Each slot keeps its own manager ID, secret, account, connection state, reconnect counter, and command queue. The host shares one Node process, HTTP server, and resource monitor.
+Ứng dụng AFK Worker thông minh cho KingMC, hỗ trợ chạy tối đa 2 bot slot độc lập trong cùng một tiến trình trên Render hoặc Wispbyte.
 
-The normal AFK mode is `still`: after account login and optional lobby entry, it sends no movement input. Authorized users can send a chat message from the Discord panel. GUI, inventory, container and hotbar control, repeated auto-chat and configurable schedules are not part of this worker.
+---
 
-## Project layout
+## 1. Cấu trúc mã nguồn
+
+Toàn bộ mã nguồn nằm hoàn toàn trong thư mục `src/`, tự đóng gói và không phụ thuộc file bên ngoài:
 
 ```text
 src/
-  config/       environment validation and SOCKS5 parsing
-  domain/       normalized worker states
-  game/         Mineflayer session, AFK, login, lobby navigation, status
-  http/         health and per-worker-secret control endpoints
-  services/     two-slot worker fleet and serialized command runtime
-  transports/   manager heartbeat and Wispbyte long-poll transport
-  utils/        redacted structured logs
+├── index.js                     # Entrypoint khởi động Worker Fleet
+├── config/                      # Nạp và kiểm tra biến môi trường
+│   ├── env.js                   # Kiểm tra cấu hình slot 1 và slot 2
+│   ├── host-runtime.js          # Tự động nhận diện Render / Wispbyte
+│   └── proxy.js                 # Bộ phân tích và kiểm tra an toàn SOCKS5 proxy
+├── domain/                      # Chuẩn hóa trạng thái
+│   └── worker-state.js          # Định nghĩa các trạng thái (online, offline, error, ...)
+├── game/                        # Tương tác Minecraft & Mineflayer
+│   ├── afk-controller.js        # Điều khiển hành vi giữ kết nối AFK
+│   ├── lobby-navigator.js       # Tự động điều hướng và chọn cụm server qua GUI/chat
+│   ├── minecraft-session.js     # Quản lý phiên Mineflayer, Auto-Totem và kết nối lại
+│   ├── packet-optimization.js   # Giảm tải tài nguyên và tối ưu hóa gói tin
+│   ├── server-auth.js           # Xử lý tự động đăng nhập mật khẩu in-game (/login)
+│   └── server-monitor.js        # Giám sát ping, TPS và lưu lượng mạng
+├── http/                        # Web server nội bộ phục vụ health check và điều khiển
+│   ├── app.js                   # Khởi tạo Express app với giới hạn bộ nhớ
+│   ├── auth.js                  # Xác thực worker secret bằng timing-safe comparison
+│   └── routes.js                # Endpoints /health và /api/v1/bots/:workerId/*
+├── services/                    # Dịch vụ quản trị tiến trình worker
+│   ├── maintenance-window.js    # Khung giờ bảo trì cố định hàng ngày (04:30 - 05:30 UTC+7)
+│   ├── wispbyte-keepalive.js    # Duy trì phiên hoạt động panel Wispbyte
+│   ├── worker-fleet.js          # Điều phối 1 hoặc 2 slot bot song song
+│   └── worker-runtime.js        # Xếp hàng và tuần tự hóa các lệnh điều khiển
+├── transports/                  # Kênh giao tiếp với Manager
+│   ├── manager-reporter.js      # Báo cáo heartbeat và sự kiện định kỳ lên Manager
+│   └── wispbyte-poller.js       # Long polling nhận lệnh từ Manager (dành cho Wispbyte)
+└── utils/                       # Tiện ích bổ trợ
+    └── logger.js                # Ghi log có cấu trúc và tự động ẩn dữ liệu nhạy cảm
 ```
 
-## Configure one or two bots
+---
 
-1. Install Node.js 20 or newer.
-2. Configure environment variables in `.env` (refer to the Settings table below) and set `MANAGER_URL`.
-3. In the Discord manager, register each slot separately. Copy each one-time secret to the matching `WORKER_SECRET_1` or `WORKER_SECRET_2` variable.
-4. Set a different `WORKER_ID` and worker secret for each slot. Enter the Minecraft username/password from the private Discord panel; do not put them in worker environment variables.
-5. Run `npm ci` and `npm start`.
+## 2. Cấu hình biến môi trường (Environment Variables)
 
-When `WORKER_ID_2` is set, the worker automatically starts two slots; otherwise it starts one. `WORKER_BOT_COUNT` is only an optional override. Minecraft account credentials are manager-managed and arrive through the authenticated HTTPS bootstrap before connect/reconnect commands.
+### A. Cấu hình kết nối Manager & Bot Slot (Bắt buộc)
 
-Each slot uses its own `/api/v1/workers/:workerId` identity at the manager. A Render host has one public service URL shared by both slots; manager control uses `/api/v1/bots/:workerId/status` and `/api/v1/bots/:workerId/command`. Wispbyte slots each make their own authenticated outbound poll. Worker IDs and secrets must be registered separately in the manager.
+| Tên biến | Bắt buộc | Mô tả |
+|---|---|---|
+| `MANAGER_URL` | Có | HTTPS URL của dịch vụ Manager (`https://<manager-url>`) |
+| `WORKER_ID_1` | Có | ID định danh của Bot Slot 1 được tạo trên Discord Manager (chữ thường, số, gạch ngang) |
+| `WORKER_SECRET_1` | Có | Khóa bí mật của Slot 1 (chuỗi ngẫu nhiên từ 32 ký tự trở lên do Manager cấp) |
+| `WORKER_ID_2` | Không | ID định danh của Bot Slot 2 (nếu host chạy 2 bot) |
+| `WORKER_SECRET_2` | Không | Khóa bí mật của Bot Slot 2 |
+| `WORKER_BOT_COUNT` | Không | Số lượng bot chạy trên host này (`1` hoặc `2`). Mặc định tự động bật 2 slot nếu có `WORKER_ID_2` |
 
-## Settings
+> **Lưu ý quan trọng**: Mật khẩu và tài khoản Minecraft được quản lý tập trung và mã hóa an toàn trên Manager, worker nhận thông tin qua HTTPS bootstrap khi khởi động. **Tuyệt đối không điền mật khẩu Minecraft vào biến môi trường của Worker.**
 
-| Variable | Purpose |
-|---|---|
-| `WORKER_BOT_COUNT` | One or two accounts in this host process. |
-| `WORKER_TRANSPORT` | Optional override. Normally auto-detected: Render uses direct authenticated HTTP; Wispbyte uses outbound polling. |
-| `WORKER_ID_1`, `WORKER_SECRET_1` | Identity and secret for slot 1. Slot 2 uses the `_2` suffix. Minecraft credentials are set in Discord Manager. |
-| `MANAGER_URL` | HTTPS URL of the manager service. |
-| `MC_AUTH_TYPE` | Mineflayer account mode: `offline` or `microsoft`. Each slot may override it. |
-| `MC_AUTH_ENABLED` | Replies to KingMC registration/login prompts using the password saved for that worker in Discord Manager. |
-| `MC_SERVER_HOSTS`, `MC_SERVER_PORT`, `MC_SERVER_VERSION` | Approved KingMC endpoint and protocol version. Host fallback is used only for ordinary connection failures. |
-| `MC_VIEW_DISTANCE` | Defaults to `short` to reduce loaded chunks and memory for an AFK worker. Set per slot with `MC_VIEW_DISTANCE_1` or `_2`. |
-| `MC_PROXY_URL_1`, `MC_PROXY_URL_2` | Optional fixed SOCKS5 connection for that slot, e.g. `socks5://user:password@host:1080`. Do not place credentials in source control. |
-| `AFK_MODE` | `still` by default; optional `look` or `sneak`. Per-slot overrides are supported. |
-| `JOIN_COMMAND` | Optional one-time lobby entry command sent after spawn. Account registration/password commands are blocked. No menu click or repeated auto-chat is run. |
-| `AUTO_START`, `AUTO_RECONNECT`, `RECONNECT_BASE_MS`, `RECONNECT_MAX_MS` | Startup and bounded retry settings. The two slots start eight seconds apart to smooth connection and memory spikes. |
-| `CONNECT_TIMEOUT_MS` | Maximum duration for a connection attempt. |
-| `WORKER_RSS_WARN_MB` | Log a warning when host RSS reaches this threshold; it does not stop a bot. |
+### B. Cấu hình Server Game & Proxy
 
-`MC_AUTH_ENABLED` is for KingMC's in-game `/login` prompt. It is separate from `MC_AUTH_TYPE`, which selects the Minecraft account authentication mode. The manager encrypts account credentials in Supabase; the worker receives them only through the per-worker authenticated HTTPS bootstrap. Credentials are not included in status, events, command queue, or structured logs.
+| Tên biến | Mặc định | Mô tả |
+|---|---|---|
+| `MC_SERVER_HOSTS` | `sgp.kingmc.vn,kingmc.vn` | Danh sách IP/domain server KingMC được phê duyệt |
+| `MC_SERVER_PORT` | `25565` | Cổng kết nối server Minecraft |
+| `MC_SERVER_VERSION` | `1.20.1` | Phiên bản giao thức Minecraft |
+| `MC_AUTH_TYPE` | `offline` | Kiểu tài khoản Minecraft (`offline` hoặc `microsoft`) |
+| `MC_AUTH_ENABLED` | `true` | Tự động trả lời lệnh `/login <mật khẩu>` khi vào server |
+| `MC_VIEW_DISTANCE` | `short` | Khoảng cách nhìn (`tiny`, `short`, `normal`, `far`) — chọn `short` để tiết kiệm RAM |
+| `MC_PROXY_URL_1` | *(trống)* | URL Proxy SOCKS5 riêng cho slot 1 (ví dụ `socks5://user:pass@host:1080`) |
+| `MC_PROXY_URL_2` | *(trống)* | URL Proxy SOCKS5 riêng cho slot 2 |
+| `JOIN_COMMAND` | *(trống)* | Lệnh gửi vào game sau khi spawn (ví dụ lệnh vào cụm server) |
+| `AUTO_START` | `true` | Tự động kết nối vào server ngay khi khởi động worker |
+| `AUTO_RECONNECT` | `true` | Tự động kết nối lại khi bị ngắt kết nối với cơ chế backoff |
 
-## Manager controls and status
+---
 
-The authenticated worker API accepts `start`, `stop`, `restart`, `resume`, `status`, `reset`, `set-afk-mode`, `set-proxy`, and `chat`. Every slot is authenticated with its own high-entropy `WORKER_SECRET`.
+## 3. Hướng dẫn triển khai (Deployment Guide)
 
-Status reports state, AFK mode, ping when available, manager request latency, uptime, reconnect counts, a local TPS estimate from worker physics ticks, process CPU/RAM, measured Minecraft socket bytes per second, restriction state, and proxy enabled/disabled. CPU/RAM are shared process values when two slots share a host. Discord panel/status omits host and Minecraft IP/hostname. Public `/health` reveals only bot count and process resource totals; per-bot state requires the matching worker secret.
+### Cách 1: Triển khai trên Render (Web Service)
 
-The manager receives connection events and public chat messages in the same event stream; Discord shows the five newest lines only when the panel is opened or refreshed by an action. Remote Minecraft `/login`, `/register`, and password-change commands are blocked. Chat payload size and command rates are bounded and serialized.
+1. Tạo mới **Web Service** trên [Render Dashboard](https://dashboard.render.com) kết nối repository này.
+2. Cấu hình:
+   - **Name**: `kingmc-afk-worker-01`
+   - **Region**: `Singapore` (để kết nối server KingMC mượt nhất)
+   - **Runtime**: `Node`
+   - **Build Command**: `npm ci --omit=dev`
+   - **Start Command**: `npm start`
+   - **Health Check Path**: `/health`
+3. Thêm các biến môi trường: `MANAGER_URL`, `WORKER_ID_1`, `WORKER_SECRET_1` (và slot 2 nếu có).
 
-The old event filter is adapted at the parsed Mineflayer event/plugin layer: selected particles, sounds, light/entity effects and optional plugins are ignored to lower local processing and world memory. Minecraft protocol packets still need to arrive and required keepalive/player/chat traffic must remain enabled; this does not save the bytes already received from the server.
+### Cách 2: Triển khai trên Wispbyte / Pterodactyl (Node.js Bot Hosting)
 
-At 04:30 every day in `Asia/Ho_Chi_Minh` (Vietnam time, UTC+7), an active bot stops; automatic reconnect remains disabled through the window. It resumes at 05:30 if it had been started and was not manually stopped or held by a server restriction. The window is fixed in code and cannot be edited from Discord.
+1. Upload toàn bộ repository này vào file manager của server Wispbyte.
+2. Đặt lệnh khởi động: `npm run start:wispbyte`.
+3. Thêm các biến môi trường vào file cấu hình `.env` hoặc Startup Variables trên panel.
+4. Worker sẽ tự động kết nối long-poll ra ngoài Manager, **không cần mở cổng mạng (port forwarding)** hay cấu hình domain.
 
-## Hosting
+---
 
-### Render
+## 4. Tính năng bảo vệ và tối ưu tự động
 
-Use this repository as the Render Web Service root. Set both worker identities and secrets plus the manager URL. Minecraft usernames/passwords are entered in the Discord manager, not in Render environment variables. The service exposes `/health`; manager control requests use the per-slot endpoint and secret. Use an always-on plan for continuous AFK. The free Render service spins down and cannot keep a Minecraft connection alive; see [Render's free instance limits](https://render.com/docs/free).
-
-### Wispbyte
-
-Upload this project as one Node process and configure both slots. The worker recognizes Render markers or Wispbyte/Pterodactyl environment markers and selects the matching transport; port is read from `SERVER_PORT`, `P_SERVER_PORT`, `ALLOCATION_PORT` or `PORT`. Each Wispbyte bot slot opens its own authenticated long poll to the manager, so the manager does not need inbound access to Wispbyte. Render and Wispbyte workers can be registered and managed at the same time. The Discord token and Supabase secret belong only on the manager.
-
-## Runtime safeguards
-
-- AFK is idle by default; `still` never sends movement input.
-- A ban or IP limit stops the session and requires an explicit manager resume after review. Proxy settings never rotate automatically and cannot be changed during a restriction hold.
-- Reconnect backoff is bounded and jittered. Alternate approved hosts are used only for ordinary connection failures.
-- Shutdown stops both pollers and sessions cleanly. The worker process reserves a 384 MB V8 heap ceiling and warns before host RSS approaches the default 440 MB threshold.
-- Worker health and controls expose no passwords, proxy credentials, or manager secrets.
+- **Auto-Totem siêu tốc**: Tự động phát hiện nổ Totem hoặc máu tụt xuống mức nguy hiểm để lập tức trang bị Totem vào tay phụ với mutex chống kẹt packet.
+- **Tiết kiệm tài nguyên**: Giới hạn heap V8 ở mức 384MB, tự động lọc bớt các gói tin đồ họa và âm thanh không cần thiết cho AFK.
+- **Khung giờ bảo trì tự động**: Dừng bot an toàn vào lúc `04:30` và tự động kết nối lại lúc `05:30` (giờ Việt Nam, UTC+7) mỗi ngày để đồng bộ với lịch restart của cụm máy chủ KingMC.
