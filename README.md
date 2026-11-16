@@ -70,7 +70,7 @@ src/
    - **Region**: `Singapore` (để kết nối server KingMC mượt nhất)
    - **Runtime**: `Node`
    - **Build Command**: `npm ci --omit=dev`
-   - **Start Command**: `npm start`
+   - **Start Command**: `npm start` (hoặc để mặc định `node index.js`)
    - **Health Check Path**: `/health`
 3. Thêm các biến môi trường: `MANAGER_URL`, `WORKER_ID_1`, `WORKER_SECRET_1` (và slot 2 nếu có).
 

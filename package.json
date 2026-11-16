@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "description": "Modular KingMC AFK worker with Render HTTP and Wispbyte poll transports.",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node --max-old-space-size=384 src/index.js",
-    "start:render": "cross-env WORKER_TRANSPORT=render-http node --max-old-space-size=384 src/index.js",
-    "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 src/index.js",
+    "start": "node --max-old-space-size=384 index.js",
+    "start:render": "cross-env WORKER_TRANSPORT=render-http node --max-old-space-size=384 index.js",
+    "start:wispbyte": "cross-env WORKER_TRANSPORT=wispbyte-poll node --max-old-space-size=384 index.js",
     "test": "node test/integration.test.js && node test/remediation-audit.test.js && node test/challenger_stress.test.js"
   },
   "engines": {
