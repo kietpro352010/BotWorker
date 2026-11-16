@@ -94,9 +94,9 @@ class MinecraftSession extends EventEmitter {
     }
     if (!this.hasCredentials()) {
       this.manualStop = true;
-      this.lastError = 'Minecraft account credentials are not configured in Discord Manager.';
+      this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
-      this.emit('event', { type: 'credentials_missing', message: 'Set this worker account in the private Discord panel before starting.' });
+      this.emit('event', { type: 'credentials_missing', message: 'Set this worker account on the Web Dashboard or Discord before starting.' });
       return this.getStatus();
     }
     this.restriction = null;
@@ -127,7 +127,7 @@ class MinecraftSession extends EventEmitter {
     }
     if (!this.hasCredentials()) {
       this.manualStop = true;
-      this.lastError = 'Minecraft account credentials are not configured in Discord Manager.';
+      this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
       return this.getStatus();
     }
