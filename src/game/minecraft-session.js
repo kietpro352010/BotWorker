@@ -161,14 +161,17 @@ class MinecraftSession extends EventEmitter {
       const options = {
         host, port: this.config.mc.port, username: this.username,
         version: this.config.mc.version,
-        viewDistance: this.config.mc.viewDistance,
+        viewDistance: this.config.mc.viewDistance || 'tiny',
+        physicsEnabled: true,
+        hideErrors: true,
+        logErrors: false,
+        fakeHost: 'kingmc.vn',
         auth: this.config.mc.authType === 'microsoft' ? 'microsoft' : 'offline',
-        plugins: DISABLED_PLUGINS,
-        hideErrors: false
+        plugins: DISABLED_PLUGINS
       };
       if (this.proxy) {
         delete options.host;
-        options.fakeHost = host;
+        options.fakeHost = 'kingmc.vn';
         options.connect = createSocksConnector(this.proxy, host, this.config.mc.port, {
           timeoutMs: this.config.connectTimeoutMs || 10000,
           logger: this.logger
@@ -178,6 +181,22 @@ class MinecraftSession extends EventEmitter {
       const bot = this.bot;
       attachEarlyPacketDropFilter(bot);
       this.attachNetworkMetrics(bot);
+
+      if (bot._client) {
+        bot._client.on('error', (err) => {
+          const msg = err && err.message ? err.message : String(err || '');
+          if (
+            msg.includes('bounds of the managed data') ||
+            msg.includes('Attempted to read beyond') ||
+            msg.includes('chunk failed to load') ||
+            msg.includes('Partial packet')
+          ) {
+            return;
+          }
+          this.logger.warn('minecraft_tcp_socket_error', { host, port: this.config.mc.port, error: msg });
+        });
+      }
+
       this.connectTimer = setTimeout(() => {
         if (this.bot === bot && generation === this.generation && !this.manualStop && this.state === 'connecting') {
           this.logger.warn('minecraft_connect_timeout', { host });
@@ -188,6 +207,16 @@ class MinecraftSession extends EventEmitter {
 
       bot.on('error', (error) => {
         if (this.bot !== bot || generation !== this.generation) return;
+        const msg = error && error.message ? error.message : String(error || '');
+        if (
+          msg.includes('bounds of the managed data') ||
+          msg.includes('Attempted to read beyond') ||
+          msg.includes('chunk failed to load') ||
+          msg.includes('Partial packet')
+        ) {
+          this.logger.warn('minecraft_chunk_packet_incompatible_ignored', { error: msg });
+          return;
+        }
         const code = String(error?.code || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
         this.lastError = code ? `Minecraft connection error (${code})` : 'Minecraft connection error';
         this.logger.warn('minecraft_connection_error', { code });
@@ -261,6 +290,15 @@ class MinecraftSession extends EventEmitter {
       const coords = pos ? `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}` : 'Không rõ';
       this.logger.warn('bot_died', { coords });
       this.emit('event', { type: 'bot_death', reason: `Bot bị chết tại tọa độ ${coords}` });
+      bot.physicsEnabled = true;
+      if (this.deathRtpTimer) clearTimeout(this.deathRtpTimer);
+      this.deathRtpTimer = setTimeout(() => {
+        this.deathRtpTimer = null;
+        if (this.bot === bot) {
+          this.navigator.performRtp(bot);
+        }
+      }, 5000);
+      this.deathRtpTimer.unref?.();
     });
 
     // Check off-hand totem immediately on spawn
@@ -315,6 +353,12 @@ class MinecraftSession extends EventEmitter {
         }
       } else if (kind === 'lobby') {
         if (this.state !== 'entering') this.setState('entering', 'server_lobby');
+        bot.physicsEnabled = true;
+        const now = Date.now();
+        if (now - this.lastAuthSendAt >= 3000) {
+          this.lastAuthSendAt = now;
+          this.auth.sendDirectAuth(bot, 'dn');
+        }
         this.navigator.tryJoin(bot);
       } else if (kind === 'other') {
         if (this.state !== 'online') {
@@ -349,6 +393,37 @@ class MinecraftSession extends EventEmitter {
     } else if (classification === 'ip_limited' || classification === 'banned') {
       this.pauseForRestriction(classification, text);
     } else {
+      const lower = text.toLowerCase();
+      // KingMC Lobby chat detection (mc-bot.js:591-635)
+      if (lower.includes('kingmc.vn')) {
+        const pos = bot.entity ? bot.entity.position : null;
+        let isLobby = false;
+        if (pos) {
+          const dx = Math.min(Math.abs(pos.x - 0.50), Math.abs(pos.x - 1.0));
+          const dy = Math.abs(pos.y - 41.00);
+          const dz = Math.min(Math.abs(pos.z - 0.80), Math.abs(pos.z - 1.0));
+          if (dx <= 2.5 && dy <= 2.5 && dz <= 2.5) {
+            isLobby = true;
+          }
+        }
+        if (isLobby) {
+          bot.physicsEnabled = true;
+          const now = Date.now();
+          if (!this.lastLobbyAuthAt || now - this.lastLobbyAuthAt > 5000) {
+            this.lastLobbyAuthAt = now;
+            this.auth.sendDirectAuth(bot, 'dn');
+            if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
+            this.lobbyRoutineTimer = setTimeout(() => {
+              this.lobbyRoutineTimer = null;
+              if (this.bot === bot) {
+                this.navigator.triggerServerJoin(bot, 'lobby_chat_confirmed');
+              }
+            }, 2500);
+            this.lobbyRoutineTimer.unref?.();
+          }
+          return;
+        }
+      }
       if (this.auth.handleMessage(bot, text)) return;
     }
   }
@@ -841,10 +916,14 @@ class MinecraftSession extends EventEmitter {
     if (this.connectTimer) clearTimeout(this.connectTimer);
     if (this.locationTimer) clearInterval(this.locationTimer);
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
+    if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
+    if (this.deathRtpTimer) clearTimeout(this.deathRtpTimer);
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
     this.initialLocationTimer = null;
+    this.lobbyRoutineTimer = null;
+    this.deathRtpTimer = null;
   }
 
   getStatus() {

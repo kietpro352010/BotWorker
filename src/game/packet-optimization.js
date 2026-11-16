@@ -5,7 +5,6 @@ const DROP_EVENTS = new Set([
   'spawn_entity_experience_orb', 'experience_orb',
   'spawn_entity_weather', 'spawn_entity_painting',
   'world_particles', 'particle', 'sound_effect', 'named_sound_effect', 'sound_entity',
-  'update_light', 'light_update', 'map_chunk', 'chunk_data',
   'explosion', 'block_break_animation',
   'entity_effect', 'remove_entity_effect', 'open_horse_window',
   'animation', 'step', 'resource_pack_send', 'add_resource_pack', 'remove_resource_pack',
@@ -83,6 +82,15 @@ function applyEcoPhysics(bot) {
   if (bot) bot.physicsEnabled = true;
 }
 
+function setPhysicsEnabled(bot, enabled, logger, reason = '') {
+  if (!bot) return;
+  const prev = bot.physicsEnabled !== false;
+  bot.physicsEnabled = Boolean(enabled);
+  if (prev !== bot.physicsEnabled && logger) {
+    logger.info('physics_toggled', { enabled: bot.physicsEnabled, reason });
+  }
+}
+
 function pruneFarChunks(bot, radius = 2) {
   const position = bot?.entity?.position;
   const world = bot?.world;
@@ -121,6 +129,7 @@ module.exports = {
   optimizeBotPackets: attachEarlyPacketDropFilter,
   enforceZeroFarmEntities,
   applyEcoPhysics,
+  setPhysicsEnabled,
   pruneFarChunks,
   startChunkPruner
 };

@@ -70,11 +70,23 @@ function inRadius(pos, target, radiusXZ = 2.5, radiusY = 3.0) {
   return (dx * dx + dz * dz <= radiusXZ * radiusXZ) && (dy <= radiusY);
 }
 
+function isLobbyPosition(pos) {
+  if (!pos) return false;
+  const x = Number(pos.x);
+  const y = Number(pos.y);
+  const z = Number(pos.z);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return false;
+  const dx = Math.min(Math.abs(x - 0.50), Math.abs(x - 1.0));
+  const dy = Math.abs(y - 41.00);
+  const dz = Math.min(Math.abs(z - 0.80), Math.abs(z - 1.0));
+  return dx <= 2.5 && dy <= 2.5 && dz <= 2.5;
+}
+
 function getLocationKind(bot) {
   const pos = bot?.entity?.position;
   if (!pos) return 'unknown';
   if (inRadius(pos, AUTH_COORDS)) return 'login';
-  if (inRadius(pos, LOBBY_COORDS)) return 'lobby';
+  if (inRadius(pos, LOBBY_COORDS) || isLobbyPosition(pos)) return 'lobby';
   return 'other';
 }
 
@@ -139,6 +151,7 @@ module.exports = {
   AUTH_COORDS,
   LOBBY_COORDS,
   inRadius,
+  isLobbyPosition,
   getLocationKind,
   isVerificationSuccessNotice,
   redactAuditValue

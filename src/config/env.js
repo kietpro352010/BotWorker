@@ -57,7 +57,7 @@ function loadConfig(env = process.env) {
     throw new Error('MANAGER_URL must use HTTPS.');
   }
 
-  const hosts = String(env.MC_SERVER_HOSTS || 'sgp.kingmc.vn,kingmc.vn')
+  const hosts = String(env.MC_SERVER_HOSTS || 'kingmc.vn,sgp.kingmc.vn')
     .split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
   const validHost = (host) => isIP(host) !== 0 || /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(host);
   if (!hosts.length || hosts.some((host) => !validHost(host))) {
@@ -70,7 +70,7 @@ function loadConfig(env = process.env) {
   const authType = String(env.MC_AUTH_TYPE || 'offline').trim().toLowerCase();
   if (!['offline', 'microsoft'].includes(authType)) throw new Error('MC_AUTH_TYPE must be offline or microsoft.');
   const afkMode = 'still';
-  const viewDistance = String(env.MC_VIEW_DISTANCE || 'short').trim().toLowerCase();
+  const viewDistance = String(env.MC_VIEW_DISTANCE || 'tiny').trim().toLowerCase();
   if (!['tiny', 'short', 'normal', 'far'].includes(viewDistance)) throw new Error('MC_VIEW_DISTANCE must be tiny, short, normal, or far.');
 
   const authEnabled = bool(env.MC_AUTH_ENABLED, true);

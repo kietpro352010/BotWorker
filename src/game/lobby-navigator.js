@@ -2,6 +2,56 @@
 
 const { isRestrictedMinecraftCommand, cleanText, getLocationKind } = require('./server-auth');
 
+function waitForGuiUpdate(bot, timeoutMs = 2500) {
+  return new Promise((resolve) => {
+    let isResolved = false;
+    let debounceTimer = null;
+    let timeoutTimer = null;
+
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (debounceTimer) clearTimeout(debounceTimer);
+      try { bot.removeListener('windowOpen', onWindowOpen); } catch (_) {}
+      if (bot.currentWindow && typeof bot.currentWindow.removeListener === 'function') {
+        try { bot.currentWindow.removeListener('updateSlot', onSlotUpdate); } catch (_) {}
+      }
+    };
+
+    const done = () => {
+      if (isResolved) return;
+      isResolved = true;
+      cleanup();
+      resolve(bot.currentWindow || null);
+    };
+
+    timeoutTimer = setTimeout(() => {
+      done();
+    }, timeoutMs);
+    timeoutTimer.unref?.();
+
+    const onWindowOpen = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(done, 150);
+      debounceTimer.unref?.();
+    };
+
+    const onSlotUpdate = (slot) => {
+      if (slot >= 0 && slot < 45) {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(done, 150);
+        debounceTimer.unref?.();
+      }
+    };
+
+    if (typeof bot.once === 'function') {
+      bot.once('windowOpen', onWindowOpen);
+    }
+    if (bot.currentWindow && typeof bot.currentWindow.on === 'function') {
+      bot.currentWindow.on('updateSlot', onSlotUpdate);
+    }
+  });
+}
+
 function isMenuSelectorItem(item) {
   if (!item) return false;
   const name = String(item.name || '').toLowerCase();
@@ -40,7 +90,7 @@ function findMenuSelectorSlot(bot) {
 }
 
 class LobbyNavigator {
-  constructor({ joinCommand = '', joinDelayMs = 4000, logger }) {
+  constructor({ joinCommand = '', joinDelayMs = 7000, logger } = {}) {
     this.joinCommand = joinCommand;
     this.joinDelayMs = joinDelayMs;
     this.logger = logger;
@@ -55,6 +105,9 @@ class LobbyNavigator {
     this.menuCommandIndex = 0;
     this.retryTimer = null;
     this.chatTimer = null;
+    this.postJoinTimer = null;
+    this.rtpDelayTimer = null;
+    this.rtpRepeatTimer = null;
   }
 
   transitionTo(newState, context = {}) {
@@ -153,12 +206,13 @@ class LobbyNavigator {
           } catch (clickErr) {
             this.logger.warn('lobby_menu_click_failed', { error: clickErr.message });
           } finally {
-            setTimeout(() => {
+            if (this.postJoinTimer) clearTimeout(this.postJoinTimer);
+            this.postJoinTimer = setTimeout(() => {
+              this.postJoinTimer = null;
               this.serverJoinBusy = false;
-              if (getLocationKind(bot) === 'other') {
-                this.transitionTo('AFK_LOCKED', { verified: true });
-              }
-            }, 2000);
+              this.performRtp(bot);
+            }, 6000);
+            this.postJoinTimer.unref?.();
           }
         } else {
           this.serverJoinBusy = false;
@@ -250,13 +304,56 @@ class LobbyNavigator {
     this.pendingMenuListener = null;
   }
 
+  performRtp(bot = this.bot) {
+    if (!bot) return;
+    this.logger.info('lobby_performing_rtp');
+    try { bot.chat('/rtp'); } catch (_) {}
+
+    if (this.rtpDelayTimer) clearTimeout(this.rtpDelayTimer);
+    this.rtpDelayTimer = setTimeout(() => {
+      this.rtpDelayTimer = null;
+      if (this.bot !== bot) return;
+      this.logger.info('lobby_rtp_clicking_slot_15');
+      try {
+        const currentWindow = bot.currentWindow;
+        if (currentWindow) {
+          bot.clickWindow(15, 0, 0);
+        } else {
+          this.logger.info('lobby_rtp_window_not_found');
+        }
+      } catch (err) {
+        this.logger.warn('lobby_rtp_click_failed', { error: err.message });
+      }
+
+      bot.physicsEnabled = false;
+      this.transitionTo('AFK_LOCKED', { verified: true });
+      this.logger.info('lobby_rtp_completed_afk_ready');
+
+      // Repeat /rtp every 1 hour (3600000 ms) as in CheckStatsKingMC
+      if (this.rtpRepeatTimer) clearTimeout(this.rtpRepeatTimer);
+      this.rtpRepeatTimer = setTimeout(() => {
+        if (this.bot === bot) {
+          this.performRtp(bot);
+        }
+      }, 3600000);
+      this.rtpRepeatTimer.unref?.();
+    }, 2000);
+    this.rtpDelayTimer.unref?.();
+  }
+
   clear() {
     if (this.timer) clearTimeout(this.timer);
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.chatTimer) clearTimeout(this.chatTimer);
+    if (this.postJoinTimer) clearTimeout(this.postJoinTimer);
+    if (this.rtpDelayTimer) clearTimeout(this.rtpDelayTimer);
+    if (this.rtpRepeatTimer) clearTimeout(this.rtpRepeatTimer);
     this.timer = null;
     this.retryTimer = null;
     this.chatTimer = null;
+    this.postJoinTimer = null;
+    this.rtpDelayTimer = null;
+    this.rtpRepeatTimer = null;
     this.clearMenuListener(this.bot);
     this.serverJoinBusy = false;
     this.serverJoinAttempts = 0;
@@ -266,3 +363,4 @@ class LobbyNavigator {
 }
 
 module.exports = LobbyNavigator;
+module.exports.waitForGuiUpdate = waitForGuiUpdate;
