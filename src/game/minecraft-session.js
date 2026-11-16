@@ -275,11 +275,7 @@ class MinecraftSession extends EventEmitter {
     if (offHand && (offHand.name === 'totem_of_undying' || String(offHand.name).includes('totem'))) return;
 
     const totem = bot.inventory.items().find((i) => i && (i.name === 'totem_of_undying' || String(i.name).includes('totem')));
-    if (!totem) {
-      this.logger.warn('no_totem_in_inventory', { bot: this.username });
-      this.emit('event', { type: 'low_totem', count: 0, message: 'Bot đã hết Totem trong túi đồ!' });
-      return;
-    }
+    if (!totem) return;
 
     try {
       this.isEquippingTotem = true;
