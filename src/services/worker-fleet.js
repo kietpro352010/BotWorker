@@ -245,4 +245,3 @@ class WorkerFleet {
 }
 
 module.exports = WorkerFleet;
-
