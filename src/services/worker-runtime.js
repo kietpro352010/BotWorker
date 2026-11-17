@@ -89,11 +89,29 @@ class WorkerRuntime {
   }
 
   async execute(action, payload = {}, options = {}) {
-    if (!ACTIONS.has(action)) throw new Error(`Unsupported worker action: ${action}`);
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Command payload must be an object.');
-    if (Buffer.byteLength(JSON.stringify(payload)) > 4096) throw new Error('Command payload is too large.');
+    if (!ACTIONS.has(action)) {
+      const err = new Error(`Unsupported worker action: ${action}`);
+      err.code = 'UNSUPPORTED_ACTION';
+      err.status = 400;
+      throw err;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      const err = new Error('Command payload must be an object.');
+      err.code = 'INVALID_PAYLOAD';
+      err.status = 400;
+      throw err;
+    }
+    if (Buffer.byteLength(JSON.stringify(payload)) > 4096) {
+      const err = new Error('Command payload is too large.');
+      err.code = 'PAYLOAD_TOO_LARGE';
+      err.status = 413;
+      throw err;
+    }
     if (options !== undefined && options !== null && (typeof options !== 'object' || Array.isArray(options))) {
-      throw new Error('Command options must be an object.');
+      const err = new Error('Command options must be an object.');
+      err.code = 'INVALID_PAYLOAD';
+      err.status = 400;
+      throw err;
     }
 
     const externalSignal = options?.signal;
@@ -105,6 +123,7 @@ class WorkerRuntime {
     if (this.pendingCommands >= MAX_PENDING_COMMANDS) {
       const err = new Error('Worker command queue is busy. Try again shortly.');
       err.code = 'QUEUE_BUSY';
+      err.status = 503;
       throw err;
     }
 
@@ -114,6 +133,7 @@ class WorkerRuntime {
     if (isLifecycle && conflictingLifecycle) {
       const err = new Error(`A lifecycle operation (${conflictingLifecycle}) is already in progress. Conflicting ${action} command rejected.`);
       err.code = 'LIFECYCLE_CONFLICT';
+      err.status = 409;
       throw err;
     }
 
@@ -233,7 +253,10 @@ class WorkerRuntime {
       });
 
       execPromise = Promise.resolve().then(() =>
-        this.executeNow(action, payload, { signal: execController.signal })
+        this.executeNow(action, payload, {
+          signal: execController.signal,
+          skipManagerRefresh: options?.skipManagerRefresh === true
+        })
       );
       execPromise.catch(() => {});
 
@@ -243,8 +266,6 @@ class WorkerRuntime {
         if (execController.signal.aborted) {
           if (isLifecycle) {
             await this.cleanupAbortedLifecycle(action, err);
-          } else if (typeof this.session?.abortPending === 'function') {
-            try { this.session.abortPending(err?.code === 'ETIMEDOUT' ? 'command_timeout' : 'command_aborted'); } catch (_) {}
           }
         }
         throw err;
@@ -289,6 +310,7 @@ class WorkerRuntime {
     if (this.commandTimes.length >= 30) {
       const err = new Error('Worker command rate limit reached. Try again in a minute.');
       err.code = 'RATE_LIMIT';
+      err.status = 429;
       throw err;
     }
   }
@@ -302,17 +324,17 @@ class WorkerRuntime {
     this.recordCommandLimit();
   }
 
-  async executeNow(action, payload, { signal } = {}) {
+  async executeNow(action, payload, { signal, skipManagerRefresh = false } = {}) {
     if (signal?.aborted) throw createAbortError(signal.reason, action);
     switch (action) {
       case 'start':
-        await this.refreshManagerConfig({ signal });
+        if (!skipManagerRefresh) await this.refreshManagerConfig({ signal });
         if (signal?.aborted) throw createAbortError(signal.reason, action);
         return this.session.start({ signal });
       case 'stop': return this.session.stop('manager_stop', { signal });
       case 'restart':
       case 'reconnect':
-        await this.refreshManagerConfig({ signal });
+        if (!skipManagerRefresh) await this.refreshManagerConfig({ signal });
         if (signal?.aborted) throw createAbortError(signal.reason, action);
         return this.session.restart({ signal });
       case 'status': return this.status();

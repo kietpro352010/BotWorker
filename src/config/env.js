@@ -5,13 +5,18 @@ const { parseSocksProxy } = require('./proxy');
 const { detectHostRuntime } = require('./host-runtime');
 
 function positiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
-  const parsed = Number.parseInt(value, 10);
+  const text = String(value ?? '').trim();
+  if (!/^\d+$/.test(text)) return fallback;
+  const parsed = Number(text);
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
 }
 
 function bool(value, fallback = false) {
   if (value === undefined || value === '') return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  throw new Error(`Boolean environment value is invalid: ${String(value).slice(0, 32)}`);
 }
 
 function required(value, key) {

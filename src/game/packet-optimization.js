@@ -74,7 +74,16 @@ function enforceZeroFarmEntities(bot) {
     } catch (_) {}
   }, 5000);
   timer.unref?.();
-  bot.once?.('end', () => clearInterval(timer));
+  bot._kingmcEntityPruneTimer = timer;
+  bot.once?.('end', () => stopEntityPruner(bot));
+}
+
+function stopEntityPruner(bot) {
+  const timer = bot?._kingmcEntityPruneTimer;
+  if (!timer) return false;
+  clearInterval(timer);
+  bot._kingmcEntityPruneTimer = null;
+  return true;
 }
 
 function applyEcoPhysics(bot) {
@@ -128,6 +137,7 @@ module.exports = {
   attachEarlyPacketDropFilter,
   optimizeBotPackets: attachEarlyPacketDropFilter,
   enforceZeroFarmEntities,
+  stopEntityPruner,
   applyEcoPhysics,
   setPhysicsEnabled,
   pruneFarChunks,

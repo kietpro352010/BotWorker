@@ -9,11 +9,11 @@ const LobbyNavigator = require('./lobby-navigator');
 const ServerMonitor = require('./server-monitor');
 const {
   ServerAuth, cleanText, normalize, isRestrictedMinecraftCommand,
-  getLocationKind, isVerificationSuccessNotice, extractChatMessage
+  getLocationKind, isVerificationSuccessNotice, extractChatMessage, redactAuditValue
 } = require('./server-auth');
 const { parseSocksProxy, createSocksConnector } = require('../config/proxy');
 const { normalizeState } = require('../domain/worker-state');
-const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, startChunkPruner } = require('./packet-optimization');
+const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, setPhysicsEnabled, startChunkPruner, stopEntityPruner } = require('./packet-optimization');
 const { TIME_ZONE, isMaintenanceWindow, nextMaintenanceBoundary } = require('../services/maintenance-window');
 
 function classifyServerText(message) {
@@ -94,15 +94,20 @@ class MinecraftSession extends EventEmitter {
       this.abortPending(this._abortReasonFromSignal(signal));
       return this.getStatus();
     }
+    if (this.restriction) {
+      return {
+        ok: false, error: 'worker_restricted', code: 'WORKER_RESTRICTED', status: 409,
+        detail: 'Worker is held by a Manager restriction and cannot start.', worker: this.getStatus()
+      };
+    }
     if (!this.hasCredentials()) {
       this.manualStop = true;
       this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
       this.emit('event', { type: 'credentials_missing', message: 'Set this worker account on the Web Dashboard or Discord before starting.' });
       const worker = this.getStatus();
-      return { ok: false, error: 'credentials_missing', detail: this.lastError, worker };
+      return { ok: false, error: 'credentials_missing', code: 'CREDENTIALS_MISSING', status: 422, detail: this.lastError, worker };
     }
-    this.restriction = null;
     this.manualStop = false;
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
@@ -122,6 +127,12 @@ class MinecraftSession extends EventEmitter {
       this.abortPending(this._abortReasonFromSignal(signal));
       return this.getStatus();
     }
+    if (this.restriction) {
+      return {
+        ok: false, error: 'worker_restricted', code: 'WORKER_RESTRICTED', status: 409,
+        detail: 'Worker is held by a Manager restriction and cannot connect.', worker: this.getStatus()
+      };
+    }
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
       this.clearTimers();
@@ -133,7 +144,7 @@ class MinecraftSession extends EventEmitter {
       this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
       const worker = this.getStatus();
-      return { ok: false, error: 'credentials_missing', detail: this.lastError, worker };
+      return { ok: false, error: 'credentials_missing', code: 'CREDENTIALS_MISSING', status: 422, detail: this.lastError, worker };
     }
     if (this.manualStop) return this.getStatus();
     if (this.bot && ['connecting', 'authenticating', 'entering', 'online'].includes(this.state)) return this.getStatus();
@@ -160,7 +171,7 @@ class MinecraftSession extends EventEmitter {
     }
     this.emit('state', this.getStatus());
     this.logger.info('minecraft_connecting', { host, port: this.config.mc.port });
-    logMinecraftHostResolution(host, this.config.mc.port, this.logger);
+    logMinecraftHostResolution(host, this.config.mc.port, this.logger, this.proxy ? 'socks5' : 'direct');
 
     try {
       const options = {
@@ -296,7 +307,7 @@ class MinecraftSession extends EventEmitter {
       const coords = pos ? `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}` : 'Không rõ';
       this.logger.warn('bot_died', { coords });
       this.emit('event', { type: 'bot_death', reason: `Bot bị chết tại tọa độ ${coords}` });
-      bot.physicsEnabled = true;
+      setPhysicsEnabled(bot, true, this.logger, 'death');
     });
 
     // Check off-hand totem immediately on spawn
@@ -352,7 +363,7 @@ class MinecraftSession extends EventEmitter {
       } else if (kind === 'lobby') {
         if (prevKind === 'login') this.auth.markAuthenticated('login_area_exit');
         if (this.state !== 'entering') this.setState('entering', 'server_lobby');
-        bot.physicsEnabled = true;
+        setPhysicsEnabled(bot, true, this.logger, 'kingmc_lobby');
         const now = Date.now();
         if (!this.auth.isAuthenticated() && now - this.lastAuthSendAt >= 3000) {
           this.lastAuthSendAt = now;
@@ -361,6 +372,7 @@ class MinecraftSession extends EventEmitter {
         this.navigator.tryJoin(bot);
       } else if (kind === 'other') {
         this.auth.markAuthenticated('kingmc_world');
+        setPhysicsEnabled(bot, false, this.logger, 'kingmc_world');
         if (this.state !== 'online') {
           this.setState('online', 'kingmc_in_game');
           this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
@@ -382,7 +394,8 @@ class MinecraftSession extends EventEmitter {
     if (this.bot !== bot || generation !== this.generation) return;
     const text = extractChatMessage(json);
     if (!text) return;
-    this.logger.info('minecraft_message_received', { text: text.slice(0, 160) });
+    const safeText = redactAuditValue(text);
+    this.logger.info('minecraft_message_received', { text: safeText.slice(0, 160) });
     const classification = classifyServerText(text);
     if (classification === 'maintenance') {
       if (this.state === 'maintenance') return;
@@ -391,7 +404,7 @@ class MinecraftSession extends EventEmitter {
       this.emit('event', { type: 'maintenance', message: 'Server maintenance notice received.' });
       try { bot.quit('server_maintenance'); } catch (_) { try { bot.end('server_maintenance'); } catch (_) {} }
     } else if (classification === 'ip_limited' || classification === 'banned') {
-      this.pauseForRestriction(classification, text);
+      this.pauseForRestriction(classification, safeText);
     } else {
       const wasAuthenticated = this.auth.isAuthenticated();
       if (this.auth.handleMessage(bot, text)) {
@@ -413,7 +426,7 @@ class MinecraftSession extends EventEmitter {
           }
         }
         if (isLobby) {
-          bot.physicsEnabled = true;
+          setPhysicsEnabled(bot, true, this.logger, 'kingmc_lobby_chat');
           const now = Date.now();
           if (!this.auth.isAuthenticated() && (!this.lastLobbyAuthAt || now - this.lastLobbyAuthAt > 5000)) {
             this.lastLobbyAuthAt = now;
@@ -435,8 +448,9 @@ class MinecraftSession extends EventEmitter {
 
   onKicked(bot, generation, reason) {
     if (this.bot !== bot || generation !== this.generation) return;
-    const text = extractChatMessage(reason) || cleanText(typeof reason === 'string' ? reason : JSON.stringify(reason));
-    this.lastKickReason = text.slice(0, 300);
+    const text = extractChatMessage(reason) || cleanText(typeof reason === 'string' ? reason : '');
+    const safeText = redactAuditValue(text);
+    this.lastKickReason = safeText.slice(0, 300);
     const isVerificationKick = isVerificationSuccessNotice(text);
     const classification = classifyServerText(text);
 
@@ -447,7 +461,7 @@ class MinecraftSession extends EventEmitter {
     });
 
     if (classification === 'ip_limited' || classification === 'banned') {
-      this.pauseForRestriction(classification, text);
+      this.pauseForRestriction(classification, safeText);
     } else if (classification === 'maintenance') {
       this.setState('maintenance', 'maintenance_kick');
     } else if (isVerificationKick) {
@@ -479,6 +493,7 @@ class MinecraftSession extends EventEmitter {
       this.locationTimer = null;
     }
     if (bot) {
+      stopEntityPruner(bot);
       try { bot.removeAllListeners?.(); bot.on?.('error', () => {}); } catch (_) {}
       try { bot._client?.removeAllListeners?.(); bot._client?.on?.('error', () => {}); } catch (_) {}
       try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
@@ -528,7 +543,7 @@ class MinecraftSession extends EventEmitter {
 
   pauseForRestriction(kind, message) {
     this.restriction = kind;
-    this.lastKickReason = cleanText(message).slice(0, 300);
+    this.lastKickReason = redactAuditValue(cleanText(message)).slice(0, 300);
     this.setState(kind, kind === 'ip_limited' ? 'server_ip_limit' : 'server_ban');
     this.emit('event', { type: kind, message: this.lastKickReason });
     this.manualStop = true;
@@ -593,7 +608,12 @@ class MinecraftSession extends EventEmitter {
       this.abortPending(this._abortReasonFromSignal(signal));
       return this.getStatus();
     }
-    this.restriction = null;
+    if (this.restriction) {
+      return {
+        ok: false, error: 'worker_restricted', code: 'WORKER_RESTRICTED', status: 409,
+        detail: 'Worker is held by a Manager restriction and cannot restart.', worker: this.getStatus()
+      };
+    }
     await this.stop('manager_restart');
     if (signal?.aborted) {
       this.abortPending(this._abortReasonFromSignal(signal));
@@ -619,7 +639,7 @@ class MinecraftSession extends EventEmitter {
     this.reconnectCount = 0;
     this.lastError = null;
     this.lastKickReason = null;
-    this.state = this.restriction || 'stopped';
+    this.state = ['ip_limited', 'banned'].includes(this.restriction) ? this.restriction : 'stopped';
     this.lastStateAt = new Date().toISOString();
     this.emit('state', this.getStatus());
     return { ok: true, worker: this.getStatus() };
@@ -639,7 +659,7 @@ class MinecraftSession extends EventEmitter {
     if (!credentials || typeof credentials !== 'object') return false;
     const username = String(credentials.username || '').trim();
     const password = String(credentials.password ?? '');
-    if (!username || username.length > 64 || !password || password.length > 256) {
+    if (!username || username.length > 64 || (this.config.authEnabled && !password) || password.length > 256) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
     this.username = username;
@@ -650,6 +670,18 @@ class MinecraftSession extends EventEmitter {
 
   restoreManagerState({ restricted, restriction, state } = {}) {
     const recoveredRestriction = restriction || (['ip_limited', 'banned'].includes(state) ? state : null);
+    if (restricted === false && !recoveredRestriction) {
+      if (['manager_check_failed', 'manager_hold'].includes(this.restriction)) {
+        this.restriction = null;
+        this.manualStop = true;
+        this.state = 'stopped';
+        this.lastStateAt = new Date().toISOString();
+        this.logger.info('worker_manager_hold_cleared');
+        this.emit('state', this.getStatus());
+        return true;
+      }
+      return false;
+    }
     if (!restricted && !recoveredRestriction) return false;
     this.restriction = recoveredRestriction || 'manager_hold';
     this.manualStop = true;
@@ -677,7 +709,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   clearManagerCheckHold() {
-    if (this.restriction !== 'manager_check_failed') return false;
+    if (!['manager_check_failed', 'manager_hold'].includes(this.restriction)) return false;
     this.restriction = null;
     this.manualStop = true;
     this.state = 'stopped';
@@ -922,7 +954,7 @@ class MinecraftSession extends EventEmitter {
 
   recordChat(bot, username, message) {
     if (this.bot !== bot || username === bot.username) return;
-    const clean = cleanText(message).replace(/[\r\n\t]+/g, ' ').slice(0, 240);
+    const clean = redactAuditValue(cleanText(message).replace(/[\r\n\t]+/g, ' ')).slice(0, 240);
     if (!clean) return;
     this.emit('event', { type: 'chat', message: `[${String(username || 'player').slice(0, 40)}] ${clean}` });
   }

@@ -48,7 +48,7 @@ function normalize(input) {
 }
 
 function isRestrictedMinecraftCommand(value) {
-  return /^\/\s*(?:[a-z0-9_-]+:)?(?:register|login|changepassword|changepass|password|unregister|email)\b/i.test(String(value || '').trim());
+  return /^\/\s*(?:[a-z0-9_-]+:)?(?:register|login|dn|dk|changepassword|changepass|password|unregister|email)\b/i.test(String(value || '').trim());
 }
 
 function redactAuditValue(text) {
@@ -130,7 +130,7 @@ class ServerAuth {
   }
 
   handleMessage(bot, message) {
-    if (!bot) return false;
+    if (!bot || !this.enabled) return false;
     const text = normalize(message);
     if (isAuthenticationFailureMessage(text)) {
       this.authenticated = false;
@@ -141,7 +141,7 @@ class ServerAuth {
       this.markAuthenticated('server_message');
       return true;
     }
-    if (!this.enabled || !this.password) return false;
+    if (!this.password) return false;
     const isRegister = /(?:^|\s)\/(?:register|dk)\b/.test(text)
       || /(?:please|you must|first|hay|vui long|ban can|can) .{0,32}(?:register|dang ky)/.test(text)
       || /(?:register|dang ky).{0,32}(?:account|tai khoan|before|first|de tiep tuc)/.test(text);

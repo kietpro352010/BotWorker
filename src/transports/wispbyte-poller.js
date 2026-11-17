@@ -30,6 +30,7 @@ class WispbytePoller {
     this.stopController = new AbortController();
     this.pendingResults = [];
     this.maxPendingResults = 100;
+    this.resultFlushPromise = null;
   }
 
   start() {
@@ -52,10 +53,24 @@ class WispbytePoller {
   }
 
   async flushPendingResults() {
+    if (this.resultFlushPromise) return this.resultFlushPromise;
     if (!this.pendingResults.length || this.stopping) return;
+    this.resultFlushPromise = this._flushPendingResults().finally(() => {
+      this.resultFlushPromise = null;
+    });
+    return this.resultFlushPromise;
+  }
+
+  async _flushPendingResults() {
+    const batch = this.pendingResults;
+    this.pendingResults = [];
+    if (this.stopping) {
+      this.pendingResults = [...batch, ...this.pendingResults].slice(-this.maxPendingResults);
+      return;
+    }
     const now = Date.now();
     const remaining = [];
-    for (const item of this.pendingResults) {
+    for (const item of batch) {
       if (now < item.nextRetryAt) {
         remaining.push(item);
         continue;
@@ -75,7 +90,7 @@ class WispbytePoller {
         });
       }
     }
-    this.pendingResults = remaining;
+    this.pendingResults = [...remaining, ...this.pendingResults].slice(-this.maxPendingResults);
   }
 
   async request(path, payload) {
@@ -118,7 +133,7 @@ class WispbytePoller {
             result = { ok: false, error: 'command_expired' };
           } else {
             try { result = await this.runtime.execute(command.action, command.payload || {}); }
-            catch (error) { result = { ok: false, error: error.message }; }
+            catch (error) { result = { ok: false, error: error.message, code: error.code || null, status: error.status || null }; }
           }
           const resultPayload = {
             commandId: command.commandId,

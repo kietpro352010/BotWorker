@@ -2,24 +2,29 @@
 
 const dns = require('node:dns');
 
-function logMinecraftHostResolution(host, port, logger) {
+function logMinecraftHostResolution(host, port, logger, transport = 'direct') {
   try {
     dns.lookup(host, { all: true }, (error, addresses) => {
       if (error) {
         logger.warn('minecraft_dns_lookup_failed', {
-          host, port, code: String(error.code || 'dns_lookup_failed').slice(0, 48),
+          host, port, resolvers: dns.getServers(), transport,
+          code: String(error.code || 'dns_lookup_failed').slice(0, 48),
           error: String(error.message || error).slice(0, 180)
         });
         return;
       }
       logger.info('minecraft_dns_resolved', {
         host, port,
+        resolvers: dns.getServers(),
+        resolverMode: transport === 'socks5' ? 'system_diagnostic_only' : 'system',
+        transport,
         addresses: addresses.map(({ address, family }) => ({ address, family }))
       });
     });
   } catch (error) {
     logger.warn('minecraft_dns_lookup_failed', {
-      host, port, code: String(error.code || 'dns_lookup_failed').slice(0, 48),
+      host, port, resolvers: dns.getServers(), transport,
+      code: String(error.code || 'dns_lookup_failed').slice(0, 48),
       error: String(error.message || error).slice(0, 180)
     });
   }

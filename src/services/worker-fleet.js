@@ -46,10 +46,20 @@ class WorkerFleet {
         secret: botConfig.secret, logger: botLogger, fetchImpl
       });
       const refreshManagerConfig = async () => {
+        const previousRestriction = session.restriction;
         const state = await reporter.bootstrap();
         session.applyManagerSettings(state.settings);
         session.applyManagerCredentials(state.credentials);
         session.restoreManagerState(state);
+        const wasManagerHold = ['manager_check_failed', 'manager_hold'].includes(previousRestriction);
+        if (wasManagerHold && !session.isHeld()) {
+          try {
+            await reporter.heartbeat(session.getStatus());
+          } catch (error) {
+            session.requireManualResume('manager_check_failed');
+            throw error;
+          }
+        }
         return state;
       };
       const runtime = new WorkerRuntime(session, botConfig, botLogger, { refreshManagerConfig });
@@ -83,25 +93,16 @@ class WorkerFleet {
         if (!instance.session.hasCredentials()) {
           throw new Error('Manager bootstrap has no usable Minecraft credentials yet.');
         }
-        const clearedManagerCheckHold = instance.session.clearManagerCheckHold();
-        if (clearedManagerCheckHold) {
-          try {
-            // Persist the cleared hold before start() re-reads Manager state.
-            await instance.reporter.heartbeat(instance.session.getStatus());
-          } catch (heartbeatError) {
-            instance.session.requireManualResume('manager_check_failed');
-            throw heartbeatError;
-          }
-        }
         if (instance.session.isHeld()) {
           this.logger.info('worker_manager_bootstrap_restored_but_held', {
             workerId, restriction: instance.session.getStatus().restriction
           });
+          this.scheduleManagerBootstrapRetry(instance);
           return;
         }
         this.logger.info('worker_manager_bootstrap_recovered', { workerId });
         if (this.config.autoStart && !this.stopping) {
-          await instance.runtime.execute('start').catch((error) => {
+          await instance.runtime.execute('start', {}, { skipManagerRefresh: true }).catch((error) => {
             this.logger.warn('worker_auto_start_failed', { workerId, error: error.message });
           });
         }
@@ -152,10 +153,7 @@ class WorkerFleet {
 
     for (const instance of this.instances.values()) {
       try {
-        const state = await instance.reporter.bootstrap();
-        instance.session.applyManagerSettings(state.settings);
-        instance.session.applyManagerCredentials(state.credentials);
-        instance.session.restoreManagerState(state);
+        await instance.refreshManagerConfig();
       } catch (error) {
         instance.session.requireManualResume('manager_check_failed');
         this.logger.warn('worker_bootstrap_check_failed', { workerId: instance.config.workerId, error: error.message });
@@ -215,7 +213,7 @@ class WorkerFleet {
         }
         if (position > 0) await delay(8000);
         if (!this.stopping && !instance.session.isHeld()) {
-          await instance.runtime.execute('start').catch((error) => {
+          await instance.runtime.execute('start', {}, { skipManagerRefresh: true }).catch((error) => {
             this.logger.warn('worker_auto_start_failed', { workerId: instance.config.workerId, error: error.message });
           });
         }

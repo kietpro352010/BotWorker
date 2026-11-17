@@ -87,4 +87,7 @@ src/
 
 - **Auto-Totem siêu tốc**: Tự động phát hiện nổ Totem hoặc máu tụt xuống mức nguy hiểm để lập tức trang bị Totem vào tay phụ với mutex chống kẹt packet.
 - **Tiết kiệm tài nguyên**: Giới hạn heap V8 ở mức 384MB, tự động lọc bớt các gói tin đồ họa và âm thanh không cần thiết cho AFK.
+- **Tiết kiệm dung lượng deploy**: sau `npm ci`, script postinstall chỉ xóa dữ liệu phiên bản Bedrock không dùng và giữ nguyên `data/bedrock/common/features.json`. Nếu file lõi thiếu hoặc hỏng, script bỏ qua việc dọn dẹp.
+- **Tối ưu phiên game**: Dùng `viewDistance=tiny`, tắt plugin Mineflayer không cần thiết; bật physics ở lobby và tắt sau khi vào thế giới KingMC. Polling Wispbyte vẫn dùng khoảng nghỉ thích ứng hiện có.
+- **Chẩn đoán kết nối**: Log DNS và resolver hệ thống, transport direct/SOCKS5, cùng vòng đời TCP/login. Worker giữ nguyên DNS của host; không ép DNS công khai.
 - **Khung giờ bảo trì tự động**: Dừng bot an toàn vào lúc `04:30` và tự động kết nối lại lúc `05:30` (giờ Việt Nam, UTC+7) mỗi ngày để đồng bộ với lịch restart của cụm máy chủ KingMC.
