@@ -1,93 +1,133 @@
-# KingMC AFK Worker (`BotWorker`)
+# KingMC BotWorker
 
-Ứng dụng AFK Worker thông minh cho KingMC, hỗ trợ chạy tối đa 2 bot slot độc lập trong cùng một tiến trình trên Render hoặc Wispbyte.
+Worker Node.js dùng Mineflayer để giữ bot AFK trên KingMC. Worker nhận cấu hình tài khoản và lệnh từ [Manager](https://github.com/kietpro352010/Manager); mỗi tiến trình hỗ trợ một hoặc hai bot slot.
 
----
+## Yêu cầu
 
-## 1. Cấu trúc mã nguồn
+- Node.js 20 trở lên.
+- Một Worker đã được đăng ký trong Manager.
+- URL Manager công khai qua HTTPS khi Worker chạy trên host khác.
+- Tài khoản Minecraft được cấu hình trong Manager. Không đặt mật khẩu Minecraft trong biến môi trường của Worker.
 
-Toàn bộ mã nguồn nằm hoàn toàn trong thư mục `src/`, tự đóng gói và không phụ thuộc file bên ngoài:
+## Worker hoạt động thế nào
 
-```text
-src/
-├── index.js                     # Entrypoint khởi động Worker Fleet
-├── config/                      # Nạp và kiểm tra biến môi trường
-│   ├── env.js                   # Kiểm tra cấu hình slot 1 và slot 2
-│   ├── host-runtime.js          # Tự động nhận diện Render / Wispbyte
-│   └── proxy.js                 # Bộ phân tích và kiểm tra an toàn SOCKS5 proxy
-├── domain/                      # Chuẩn hóa trạng thái
-│   └── worker-state.js          # Định nghĩa các trạng thái (online, offline, error, ...)
-├── game/                        # Tương tác Minecraft & Mineflayer
-│   ├── afk-controller.js        # Điều khiển hành vi giữ kết nối AFK
-│   ├── lobby-navigator.js       # Tự động điều hướng và chọn cụm server qua GUI/chat
-│   ├── minecraft-session.js     # Quản lý phiên Mineflayer, Auto-Totem và kết nối lại
-│   ├── packet-optimization.js   # Giảm tải tài nguyên và tối ưu hóa gói tin
-│   ├── server-auth.js           # Xử lý tự động đăng nhập mật khẩu in-game (/login)
-│   └── server-monitor.js        # Giám sát ping, TPS và lưu lượng mạng
-├── http/                        # Web server nội bộ phục vụ health check và điều khiển
-│   ├── app.js                   # Khởi tạo Express app với giới hạn bộ nhớ
-│   ├── auth.js                  # Xác thực worker secret bằng timing-safe comparison
-│   └── routes.js                # Endpoints /health và /api/v1/bots/:workerId/*
-├── services/                    # Dịch vụ quản trị tiến trình worker
-│   ├── maintenance-window.js    # Khung giờ bảo trì cố định hàng ngày (04:30 - 05:30 UTC+7)
-│   ├── wispbyte-keepalive.js    # Duy trì phiên hoạt động panel Wispbyte
-│   ├── worker-fleet.js          # Điều phối 1 hoặc 2 slot bot song song
-│   └── worker-runtime.js        # Xếp hàng và tuần tự hóa các lệnh điều khiển
-├── transports/                  # Kênh giao tiếp với Manager
-│   ├── manager-reporter.js      # Báo cáo heartbeat và sự kiện định kỳ lên Manager
-│   └── wispbyte-poller.js       # Long polling nhận lệnh từ Manager (dành cho Wispbyte)
-└── utils/                       # Tiện ích bổ trợ
-    └── logger.js                # Ghi log có cấu trúc và tự động ẩn dữ liệu nhạy cảm
+```mermaid
+flowchart LR
+    M[Manager] <-->|bootstrap, heartbeat, sự kiện, lệnh| W[BotWorker]
+    W -->|Minecraft TCP; SOCKS5 tùy chọn| K[KingMC]
 ```
 
----
+Render dùng transport HTTP. Wispbyte/Pterodactyl thường dùng long polling để Worker kết nối ra ngoài tới Manager, không cần mở cổng vào cho Worker.
 
-## 2. Cấu hình biến môi trường (Tối Giản — Chỉ 3 biến trên Render/Wispbyte)
+## Cấu hình bắt buộc
 
-Để khởi chạy Worker, bạn **chỉ cần cấu hình đúng 3 biến duy nhất** cho mỗi host:
-
-| Tên biến | Bắt buộc | Mô tả |
+| Biến | Bắt buộc | Mô tả |
 |---|---|---|
-| `MANAGER_URL` | **Có** | HTTPS URL của dịch vụ Manager trên Render (`https://<manager-name>.onrender.com`) |
-| `WORKER_ID_1` | **Có** | ID định danh của Bot Slot 1 được cấp từ Manager (chữ thường, số, gạch ngang) |
-| `WORKER_SECRET_1` | **Có** | Khóa bí mật của Slot 1 (chuỗi ngẫu nhiên 32+ ký tự do Manager cấp) |
+| `MANAGER_URL` | Có | URL gốc của Manager, ví dụ `https://manager.example.com`; không thêm `/` ở cuối. `MANAGER_BASE_URL` là tên tương thích cũ. |
+| `WORKER_ID_1` | Có | ID slot thứ nhất, gồm chữ thường, số, `_` hoặc `-`. |
+| `WORKER_SECRET_1` | Có | Secret riêng của slot, tối thiểu 32 ký tự; lấy từ Manager. |
 
-> 💡 **Tất cả các thông số khác đều được cấu hình qua Web Dashboard & Discord**:
-> - **Tài khoản & Mật khẩu game Minecraft**: Được lưu trữ mã hóa an toàn trên Manager, worker tự động nạp qua kết nối bảo mật khi chạy. **Tuyệt đối không cần nhập mật khẩu game vào biến môi trường.**
-> - **Proxy SOCKS5, đổi tên hiển thị (Alias), máy chủ game**: Cài đặt trực tiếp trên Web Dashboard hoặc lệnh Discord `/bots`.
-> - **Cấu hình mạng & kết nối lại**: Mặc định đã tự động chọn máy chủ `sgp.kingmc.vn` (cổng 25565), chế độ AFK `still`, tự động trang bị Totem và tự động kết nối lại khi rớt mạng.
-> - *(Tùy chọn nếu host chạy 2 bot song song)*: Thêm `WORKER_ID_2` và `WORKER_SECRET_2`.
+Slot thứ hai là tùy chọn: đặt thêm `WORKER_ID_2` và `WORKER_SECRET_2`. Nếu không đặt `WORKER_BOT_COUNT`, Worker tự dùng 2 slot khi có `WORKER_ID_2`, còn lại dùng 1. ID và secret giữa các slot phải khác nhau.
 
----
+### Biến tùy chọn thường dùng
 
-## 3. Hướng dẫn triển khai (Deployment Guide)
+| Biến | Mặc định | Mô tả |
+|---|---:|---|
+| `WORKER_TRANSPORT` | Tự nhận diện | `render-http` hoặc `wispbyte-poll`. Có thể đặt rõ khi host không được tự nhận diện. |
+| `PORT` | Theo host | Cổng HTTP health/status; Render và Pterodactyl thường cấp cổng qua môi trường. |
+| `MC_SERVER_HOSTS` | `kingmc.vn,sgp.kingmc.vn` | Danh sách host Minecraft, phân cách bằng dấu phẩy. |
+| `MC_SERVER_PORT` | `25565` | Cổng Minecraft. |
+| `MC_SERVER_VERSION` | `1.20.1` | Phiên bản giao thức Mineflayer. |
+| `MC_AUTH_ENABLED` | `true` | Bật xử lý đăng nhập tài khoản tại server. |
+| `MC_AUTH_TYPE` | `offline` | `offline` hoặc `microsoft`; chọn phù hợp với tài khoản Minecraft. |
+| `MC_PROXY_URL` | Không dùng proxy | SOCKS5 proxy dùng cho kết nối Minecraft, nếu cần. |
+| `AUTO_START` | `true` | Tự kết nối sau khi bootstrap Manager thành công. |
+| `AUTO_RECONNECT` | `true` | Tự thử kết nối lại sau khi mất kết nối. |
+| `JOIN_COMMAND` | Luồng mặc định của KingMC | Lệnh vào server phụ; để trống để Worker dùng menu KingMC. |
+| `JOIN_DELAY_MS` | `4000` | Thời gian chờ tối thiểu sau spawn trước khi bắt đầu điều hướng; điều hướng vẫn chờ xác thực. |
+| `CONNECT_TIMEOUT_MS` | `40000` | Thời gian watchdog kết nối trước khi kết thúc lần thử. |
+| `WISPBYTE_COOKIE` | Không dùng | Cookie cho tính năng giữ phiên panel Wispbyte. |
 
-### Cách 1: Triển khai trên Render (Web Service)
+Tài khoản và mật khẩu trong game được lưu ở Manager rồi Worker nhận qua endpoint bootstrap đã xác thực. Sau khi tạo worker, nhập/cập nhật thông tin Minecraft trong Dashboard Manager.
 
-1. Tạo mới **Web Service** trên [Render Dashboard](https://dashboard.render.com) kết nối repository này.
-2. Cấu hình:
-   - **Name**: `kingmc-afk-worker-01`
-   - **Region**: `Singapore` (để kết nối server KingMC mượt nhất)
-   - **Runtime**: `Node`
-   - **Build Command**: `npm ci --omit=dev`
-   - **Start Command**: `npm start` (hoặc để mặc định `node index.js`)
-   - **Health Check Path**: `/health`
-3. Thêm các biến môi trường: `MANAGER_URL`, `WORKER_ID_1`, `WORKER_SECRET_1` (và slot 2 nếu có).
+## Chạy cục bộ
 
-### Cách 2: Triển khai trên Wispbyte / Pterodactyl (Node.js Bot Hosting)
+```powershell
+npm ci
+$env:MANAGER_URL="https://manager.example.com"
+$env:WORKER_ID_1="worker-01"
+$env:WORKER_SECRET_1="<secret-do-manager-cap>"
+npm start
+```
 
-1. Upload toàn bộ repository này vào file manager của server Wispbyte.
-2. Đặt lệnh khởi động: `npm run start:wispbyte`.
-3. Thêm các biến môi trường vào file cấu hình `.env` hoặc Startup Variables trên panel.
-4. Worker sẽ tự động kết nối long-poll ra ngoài Manager, **không cần mở cổng mạng (port forwarding)** hay cấu hình domain.
+Trên môi trường Wispbyte, dùng:
 
----
+```bash
+npm ci
+npm run start:wispbyte
+```
 
-## 4. Tính năng bảo vệ và tối ưu tự động
+Đặt biến môi trường trong Startup Variables của panel. Khi thử cục bộ, có thể dùng `http://localhost:<port>` cho `MANAGER_URL`; host từ xa phải dùng HTTPS.
 
-- **Auto-Totem siêu tốc**: Tự động phát hiện nổ Totem hoặc máu tụt xuống mức nguy hiểm để lập tức trang bị Totem vào tay phụ với mutex chống kẹt packet.
-- **Tiết kiệm tài nguyên**: Giới hạn heap V8 ở mức 384MB, tự động lọc bớt các gói tin đồ họa và âm thanh không cần thiết cho AFK.
-- **Tiết kiệm dung lượng deploy**: sau `npm ci`, script postinstall chỉ xóa dữ liệu phiên bản Bedrock không dùng và giữ nguyên `data/bedrock/common/features.json`. Nếu file lõi thiếu hoặc hỏng, script bỏ qua việc dọn dẹp.
-- **Tối ưu phiên game**: Dùng `viewDistance=tiny`, tắt plugin Mineflayer không cần thiết; bật physics ở lobby và tắt sau khi vào thế giới KingMC. Polling Wispbyte vẫn dùng khoảng nghỉ thích ứng hiện có.
-- **Chẩn đoán kết nối**: Log DNS và resolver hệ thống, transport direct/SOCKS5, cùng vòng đời TCP/login. Worker giữ nguyên DNS của host; không ép DNS công khai.
-- **Khung giờ bảo trì tự động**: Dừng bot an toàn vào lúc `04:30` và tự động kết nối lại lúc `05:30` (giờ Việt Nam, UTC+7) mỗi ngày để đồng bộ với lịch restart của cụm máy chủ KingMC.
+## Triển khai
+
+### Render
+
+1. Tạo Web Service từ repository này.
+2. Dùng Node.js 20+, Build Command `npm ci --omit=dev`, Start Command `npm start`.
+3. Đặt Health Check Path là `/health`.
+4. Thêm `MANAGER_URL`, `WORKER_ID_1`, `WORKER_SECRET_1` và các biến slot 2 nếu dùng.
+5. Chọn transport `render-http` nếu host không tự nhận diện Render.
+
+### Wispbyte/Pterodactyl
+
+1. Deploy mã nguồn và dùng Startup Command `npm run start:wispbyte`.
+2. Đặt ID/secret slot và URL Manager trong Startup Variables.
+3. Để `WORKER_TRANSPORT` theo lệnh start hoặc đặt `wispbyte-poll`.
+4. Worker sẽ poll Manager qua kết nối đi ra ngoài; không cần public HTTP port để nhận lệnh.
+
+## Health và API nội bộ
+
+- `GET /health`: health check công khai, trả tên service và danh sách slot.
+- `GET /api/v1/diagnostics`: thông tin tài nguyên; cần gửi `x-worker-secret` hợp lệ.
+- `GET /api/v1/bots/:workerId/status`: trạng thái worker, cần `x-worker-secret`.
+- `POST /api/v1/bots/:workerId/command`: gửi lệnh đã hỗ trợ, cần `x-worker-secret`.
+
+Ví dụ xem health:
+
+```bash
+curl https://worker.example.com/health
+```
+
+Không đưa Worker secret vào URL, log công khai hoặc mã frontend. Secret chỉ nên được lưu trong biến môi trường của host.
+
+## Tính năng và vận hành
+
+- Tự đăng nhập KingMC và chờ xác thực trước khi thao tác menu.
+- Điều hướng vào KingSMP, theo dõi phiên, tự kết nối lại và hỗ trợ SOCKS5.
+- Điều khiển AFK, tự trang bị Totem và gửi trạng thái/sự kiện về Manager.
+- Giảm tải Mineflayer bằng view distance thấp, lọc plugin/packet và điều chỉnh physics theo khu vực.
+- DNS/TCP diagnostics ghi lại resolver hệ thống và transport. Worker không tự thay DNS của host.
+- Postinstall chỉ dọn dữ liệu phiên bản Bedrock không cần; giữ `data/bedrock/common/features.json` và bỏ qua cleanup nếu file lõi không hợp lệ.
+- Trong khung bảo trì KingMC 04:30–05:30 giờ Việt Nam (UTC+7), Worker tạm dừng và lên lịch chạy lại.
+
+Log JSON được ghi ra console. Không gửi log chứa secret hoặc mật khẩu khi cần nhờ hỗ trợ.
+
+## Xử lý sự cố
+
+| Triệu chứng | Kiểm tra |
+|---|---|
+| `fetch failed` khi bootstrap | Manager có đang chạy và truy cập được từ Worker không? `MANAGER_URL` có đúng URL gốc/HTTPS không? |
+| `401` hoặc Worker không được nhận diện | Kiểm tra đúng cặp `WORKER_ID_n`/`WORKER_SECRET_n`, trạng thái worker trong Manager và secret có bị xoay vòng không. |
+| `credentials_missing` | Nhập username/password Minecraft trong Dashboard Manager và xác nhận chúng được gán cho đúng worker. |
+| Bot kết nối nhưng chưa vào KingSMP | Xem log xác thực, vị trí lobby và trạng thái click menu; xác nhận `MC_AUTH_ENABLED` và thông tin tài khoản. |
+| Không kết nối được từ host | Xem log DNS/TCP, kiểm tra host/cổng, firewall của nhà cung cấp và cấu hình SOCKS5 nếu đang dùng proxy. |
+
+## Phát triển
+
+```bash
+npm ci
+npm start
+```
+
+Mã nguồn nằm trong `src/`; `index.js` là entry point của package.
