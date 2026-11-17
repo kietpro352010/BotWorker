@@ -55,7 +55,7 @@ class WorkerFleet {
       const runtime = new WorkerRuntime(session, botConfig, botLogger, { refreshManagerConfig });
       const poller = botConfig.transport === 'wispbyte-poll'
         ? new WispbytePoller({ config: botConfig, runtime, reporter, logger: botLogger, fetchImpl }) : null;
-      const instance = { config: botConfig, session, runtime, reporter, poller };
+      const instance = { config: botConfig, session, runtime, reporter, poller, refreshManagerConfig };
       this.instances.set(botConfig.workerId, instance);
 
       session.on('event', (event) => {
@@ -79,14 +79,20 @@ class WorkerFleet {
       this.bootstrapRetryTimers.delete(workerId);
       if (this.stopping) return;
       try {
-        const state = await instance.reporter.bootstrap();
-        instance.session.applyManagerSettings(state.settings);
-        instance.session.applyManagerCredentials(state.credentials);
+        await instance.refreshManagerConfig();
         if (!instance.session.hasCredentials()) {
           throw new Error('Manager bootstrap has no usable Minecraft credentials yet.');
         }
-        instance.session.restoreManagerState(state);
-        instance.session.clearManagerCheckHold();
+        const clearedManagerCheckHold = instance.session.clearManagerCheckHold();
+        if (clearedManagerCheckHold) {
+          try {
+            // Persist the cleared hold before start() re-reads Manager state.
+            await instance.reporter.heartbeat(instance.session.getStatus());
+          } catch (heartbeatError) {
+            instance.session.requireManualResume('manager_check_failed');
+            throw heartbeatError;
+          }
+        }
         if (instance.session.isHeld()) {
           this.logger.info('worker_manager_bootstrap_restored_but_held', {
             workerId, restriction: instance.session.getStatus().restriction
@@ -239,3 +245,4 @@ class WorkerFleet {
 }
 
 module.exports = WorkerFleet;
+
