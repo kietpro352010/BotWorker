@@ -61,7 +61,7 @@ class MinecraftSession extends EventEmitter {
     this.networkSampleAt = Date.now();
     this.resourceMetrics = { cpuPercent: 0, rssMb: 0, heapUsedMb: 0 };
     this.afk = new AfkController({ ...config.afk, logger });
-    this.auth = new ServerAuth({ password: this.password, enabled: config.mc.authEnabled, logger });
+    this.auth = new ServerAuth({ password: this.password, enabled: config.authEnabled, logger });
     this.navigator = new LobbyNavigator({
       joinCommand: config.joinCommand, joinDelayMs: config.joinDelayMs, logger,
       isAuthenticated: () => this.auth.isAuthenticated()
@@ -99,7 +99,8 @@ class MinecraftSession extends EventEmitter {
       this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
       this.emit('event', { type: 'credentials_missing', message: 'Set this worker account on the Web Dashboard or Discord before starting.' });
-      return this.getStatus();
+      const worker = this.getStatus();
+      return { ok: false, error: 'credentials_missing', detail: this.lastError, worker };
     }
     this.restriction = null;
     this.manualStop = false;
@@ -131,7 +132,8 @@ class MinecraftSession extends EventEmitter {
       this.manualStop = true;
       this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
-      return this.getStatus();
+      const worker = this.getStatus();
+      return { ok: false, error: 'credentials_missing', detail: this.lastError, worker };
     }
     if (this.manualStop) return this.getStatus();
     if (this.bot && ['connecting', 'authenticating', 'entering', 'online'].includes(this.state)) return this.getStatus();
