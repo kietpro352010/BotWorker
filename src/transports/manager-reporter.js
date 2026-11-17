@@ -16,23 +16,19 @@ class ManagerReporter {
     this.lastFullReportAt = 0;
     this.eventQueue = [];
     this.eventFlushTimer = null;
+    this.flushPromise = null;
+    this.pendingHeartbeat = null;
+    this.heartbeatPromise = null;
   }
 
   hasPositionMovedSignificantly(newPos) {
     if (!newPos || !Number.isFinite(newPos.x)) return false;
-    if (!this.lastReportedPosition) {
-      this.lastReportedPosition = { ...newPos };
-      return true;
-    }
+    if (!this.lastReportedPosition) return true;
     const dx = newPos.x - this.lastReportedPosition.x;
     const dy = (newPos.y || 0) - (this.lastReportedPosition.y || 0);
     const dz = newPos.z - this.lastReportedPosition.z;
     const distSq = dx * dx + dy * dy + dz * dz;
-    if (distSq >= 25.0) { // >= 5.0 blocks (matched with RPC record_bot_position_change)
-      this.lastReportedPosition = { ...newPos };
-      return true;
-    }
-    return false;
+    return distSq >= 25.0; // >= 5.0 blocks (matched with RPC record_bot_position_change)
   }
 
   async post(path, payload) {
@@ -57,6 +53,29 @@ class ManagerReporter {
   }
 
   async heartbeat(status) {
+    this.pendingHeartbeat = status;
+    if (this.heartbeatPromise) return this.heartbeatPromise;
+
+    this.heartbeatPromise = this.flushHeartbeats().finally(() => {
+      this.heartbeatPromise = null;
+      if (this.pendingHeartbeat) {
+        void this.heartbeat(this.pendingHeartbeat).catch((error) => {
+          this.logger?.warn?.('manager_heartbeat_failed', { workerId: this.workerId, error: error.message });
+        });
+      }
+    });
+    return this.heartbeatPromise;
+  }
+
+  async flushHeartbeats() {
+    while (this.pendingHeartbeat) {
+      const status = this.pendingHeartbeat;
+      this.pendingHeartbeat = null;
+      await this.sendHeartbeat(status);
+    }
+  }
+
+  async sendHeartbeat(status) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/heartbeat`;
     const now = Date.now();
     const digest = computeBotStateDigest(status);
@@ -71,21 +90,23 @@ class ManagerReporter {
 
     if (digestUnchanged) {
       sanitizedStatus.isLightweight = true;
-    } else {
-      this.lastStateDigest = digest;
-      this.lastFullReportAt = now;
     }
 
+    const positionMoved = status.position && this.hasPositionMovedSignificantly(status.position);
     if (status.position) {
-      if (!this.hasPositionMovedSignificantly(status.position)) {
-        sanitizedStatus.positionUnchanged = true;
-      }
+      if (!positionMoved) sanitizedStatus.positionUnchanged = true;
     }
 
-    return this.post(path, {
+    const response = await this.post(path, {
       status: sanitizedStatus,
       sentAt: new Date().toISOString()
     });
+    if (!digestUnchanged) {
+      this.lastStateDigest = digest;
+      this.lastFullReportAt = now;
+    }
+    if (positionMoved) this.lastReportedPosition = { ...status.position };
+    return response;
   }
 
   async bootstrap() {
@@ -105,14 +126,25 @@ class ManagerReporter {
   }
 
   enqueueEvent(event) {
-    const sanitized = {
-      ...event,
-      message: event?.message ? redactAuditValue(event.message) : undefined,
-      reason: event?.reason ? redactAuditValue(event.reason) : undefined,
-      occurredAt: event?.occurredAt || new Date().toISOString()
+    const sanitize = (value, depth = 0, seen = new WeakSet()) => {
+      if (typeof value === 'string') return redactAuditValue(value);
+      if (!value || typeof value !== 'object') return value;
+      if (depth >= 4) return '[truncated]';
+      if (seen.has(value)) return '[circular]';
+      seen.add(value);
+      if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitize(item, depth + 1, seen));
+      const output = {};
+      for (const [key, item] of Object.entries(value)) {
+        if (/(?:password|token|authorization|credentials?|secret|api[_-]?key)/i.test(key)) continue;
+        output[key] = sanitize(item, depth + 1, seen);
+      }
+      return output;
     };
-    delete sanitized.password;
-    delete sanitized.token;
+    const cleaned = sanitize(event || {});
+    const sanitized = cleaned && typeof cleaned === 'object' && !Array.isArray(cleaned)
+      ? cleaned
+      : { message: String(cleaned ?? '') };
+    sanitized.occurredAt = sanitized.occurredAt || new Date().toISOString();
 
     if (this.eventQueue.length >= 100) {
       this.eventQueue.shift(); // Bound queue to prevent memory leak
@@ -137,12 +169,26 @@ class ManagerReporter {
   }
 
   async flushEventQueue() {
+    if (this.flushPromise) return this.flushPromise;
     if (!this.eventQueue.length) return;
+    this.flushPromise = this._flushEventQueue().finally(() => {
+      this.flushPromise = null;
+      if (this.eventQueue.length) {
+        const delay = Math.max(100, Math.min(...this.eventQueue.map((item) => Math.max(0, item.nextRetryAt - Date.now()))));
+        this.scheduleFlush(delay);
+      }
+    });
+    return this.flushPromise;
+  }
+
+  async _flushEventQueue() {
+    const batch = this.eventQueue;
+    this.eventQueue = [];
     const now = Date.now();
     const remaining = [];
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
 
-    for (const item of this.eventQueue) {
+    for (const item of batch) {
       if (now < item.nextRetryAt) {
         remaining.push(item);
         continue;
@@ -164,11 +210,7 @@ class ManagerReporter {
       }
     }
 
-    this.eventQueue = remaining;
-    if (this.eventQueue.length > 0) {
-      const nextDelay = Math.max(100, Math.min(...this.eventQueue.map((i) => Math.max(0, i.nextRetryAt - Date.now()))));
-      this.scheduleFlush(nextDelay);
-    }
+    this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
   }
 
   async sendEvent(event) {

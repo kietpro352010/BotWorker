@@ -1,6 +1,6 @@
 'use strict';
 
-const { isRestrictedMinecraftCommand, cleanText, getLocationKind } = require('./server-auth');
+const { isRestrictedMinecraftCommand, getLocationKind, redactAuditValue } = require('./server-auth');
 
 function waitForGuiUpdate(bot, timeoutMs = 2500) {
   return new Promise((resolve) => {
@@ -90,8 +90,9 @@ function findMenuSelectorSlot(bot) {
 }
 
 class LobbyNavigator {
-  constructor({ joinCommand = '', joinDelayMs = 7000, logger } = {}) {
+  constructor({ joinCommand = '', joinDelayMs = 7000, logger, isAuthenticated = () => true } = {}) {
     this.joinCommand = joinCommand;
+    this.isAuthenticated = isAuthenticated;
     this.joinDelayMs = joinDelayMs;
     this.logger = logger;
     this.state = 'IDLE'; // FSM: IDLE -> SELECT_COMPASS -> USE_COMPASS -> WAIT_MENU -> CLICK_SERVER -> AFK_LOCKED
@@ -106,8 +107,9 @@ class LobbyNavigator {
     this.retryTimer = null;
     this.chatTimer = null;
     this.postJoinTimer = null;
-    this.rtpDelayTimer = null;
-    this.rtpRepeatTimer = null;
+    this.clickTimer = null;
+    this.clickInProgress = false;
+    this.lastWaitLogAt = 0;
   }
 
   transitionTo(newState, context = {}) {
@@ -119,8 +121,8 @@ class LobbyNavigator {
   }
 
   onSpawn(bot) {
-    this.bot = bot;
     this.clear();
+    this.bot = bot;
     this.transitionTo('IDLE');
     // Schedule initial check/join after spawn
     this.timer = setTimeout(() => {
@@ -129,13 +131,34 @@ class LobbyNavigator {
     }, Math.max(1500, this.joinDelayMs));
   }
 
-  tryJoin(bot) {
-    if (!bot || this.serverJoinBusy) return;
+  isReadyForNavigation(bot, source) {
+    if (!bot) return false;
+    if (!this.isAuthenticated()) {
+      if (Date.now() - this.lastWaitLogAt >= 15000) {
+        this.lastWaitLogAt = Date.now();
+        this.logger.info('lobby_navigation_waiting_for_auth', { source });
+      }
+      return false;
+    }
     const kind = getLocationKind(bot);
     if (kind === 'other') {
       this.transitionTo('IDLE', { reason: 'already_in_game' });
-      return; // Already in game
+      return false;
     }
+    if (kind !== 'lobby') {
+      if (Date.now() - this.lastWaitLogAt >= 15000) {
+        this.lastWaitLogAt = Date.now();
+        this.logger.info('lobby_navigation_waiting_for_lobby', { source, location: kind });
+      }
+      return false;
+    }
+    return true;
+  }
+
+  tryJoin(bot) {
+    if (!bot || this.serverJoinBusy) return;
+    this.bot = bot;
+    if (!this.isReadyForNavigation(bot, 'try_join')) return;
 
     if (this.joinCommand) {
       if (Date.now() - this.lastJoinAt < 3000) return;
@@ -147,7 +170,7 @@ class LobbyNavigator {
       }
       try {
         bot.chat(cmd);
-        this.logger.info('lobby_join_command_sent', { command: cmd });
+        this.logger.info('lobby_join_command_sent', { command: redactAuditValue(cmd) });
       } catch (error) {
         this.logger.warn('lobby_join_command_failed', { code: error?.code || 'send_failed' });
       }
@@ -170,11 +193,7 @@ class LobbyNavigator {
     this.clearMenuListener(bot);
 
     if (!bot || this.serverJoinBusy) return;
-    const kind = getLocationKind(bot);
-    if (kind === 'other') {
-      this.transitionTo('IDLE', { reason: 'already_in_game' });
-      return;
-    }
+    if (!this.isReadyForNavigation(bot, source)) return;
 
     this.serverJoinBusy = true;
     this.serverJoinAttempts += 1;
@@ -182,43 +201,99 @@ class LobbyNavigator {
     this.logger.info('lobby_server_join_triggered', { source, attempt: this.serverJoinAttempts });
 
     let clicked = false;
-    const doClickSlot24 = (window) => {
-      if (clicked || this.bot !== bot) return;
-      clicked = true;
-      this.clearMenuListener(bot);
-      this.transitionTo('CLICK_SERVER');
-
-      setTimeout(() => {
+    const scheduleJoinVerification = (deadline) => {
+      const verify = () => {
+        this.postJoinTimer = null;
         if (this.bot !== bot) return;
-        const targetWindow = bot.currentWindow || window;
-        if (targetWindow) {
-          try {
-            if (Array.isArray(targetWindow.slots) && targetWindow.slots.length <= 24) {
-              this.logger.warn('lobby_menu_missing_slot_24', { totalSlots: targetWindow.slots.length });
-              this.serverJoinBusy = false;
-              try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
-              this.transitionTo('IDLE', { reason: 'missing_slot_24' });
-              return;
-            }
-            this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
-            bot.clickWindow(24, 0, 0);
-            this.transitionTo('AFK_LOCKED');
-          } catch (clickErr) {
-            this.logger.warn('lobby_menu_click_failed', { error: clickErr.message });
-          } finally {
-            if (this.postJoinTimer) clearTimeout(this.postJoinTimer);
-            this.postJoinTimer = setTimeout(() => {
-              this.postJoinTimer = null;
-              this.serverJoinBusy = false;
-              this.performRtp(bot);
-            }, 6000);
-            this.postJoinTimer.unref?.();
-          }
-        } else {
+        const kind = getLocationKind(bot);
+        if (kind === 'other') {
           this.serverJoinBusy = false;
-          this.transitionTo('IDLE');
+          this.serverJoinAttempts = 0;
+          this.transitionTo('AFK_LOCKED', { verified: true });
+          return;
+        }
+        if (!this.isAuthenticated()) {
+          this.serverJoinBusy = false;
+          this.transitionTo('IDLE', { reason: 'authentication_lost' });
+          return;
+        }
+        if (Date.now() < deadline) {
+          this.postJoinTimer = setTimeout(verify, 400);
+          this.postJoinTimer.unref?.();
+          return;
+        }
+        this.serverJoinBusy = false;
+        this.transitionTo('IDLE', { reason: 'join_not_confirmed' });
+        if (kind === 'lobby' && this.serverJoinAttempts < 3) {
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            this.triggerServerJoin(bot, `retry_after_unconfirmed_${this.serverJoinAttempts}`);
+          }, 1000);
+          this.retryTimer.unref?.();
+        }
+      };
+      if (this.postJoinTimer) clearTimeout(this.postJoinTimer);
+      this.postJoinTimer = setTimeout(verify, 400);
+      this.postJoinTimer.unref?.();
+    };
+
+    const doClickSlot24 = async (window) => {
+      if (clicked || this.bot !== bot) return;
+      if (!this.isReadyForNavigation(bot, 'menu_click')) {
+        this.serverJoinBusy = false;
+        return;
+      }
+      clicked = true;
+      this.clickInProgress = true;
+      this.clearMenuListener(bot);
+      if (this.retryTimer) clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+      this.transitionTo('CLICK_SERVER');
+      this.clickTimer = setTimeout(async () => {
+        this.clickTimer = null;
+        if (this.bot !== bot) return;
+        if (!this.isReadyForNavigation(bot, 'menu_click')) {
+          this.clickInProgress = false;
+          this.serverJoinBusy = false;
+          return;
+        }
+        const targetWindow = bot.currentWindow || window;
+        if (!targetWindow) {
+          this.clickInProgress = false;
+          this.serverJoinBusy = false;
+          this.transitionTo('IDLE', { reason: 'menu_window_missing' });
+          return;
+        }
+        if (Array.isArray(targetWindow.slots) && targetWindow.slots.length <= 24) {
+          this.logger.warn('lobby_menu_missing_slot_24', { totalSlots: targetWindow.slots.length });
+          this.clickInProgress = false;
+          this.serverJoinBusy = false;
+          try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
+          this.transitionTo('IDLE', { reason: 'missing_slot_24' });
+          return;
+        }
+        try {
+          this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
+          await bot.clickWindow(24, 0, 0);
+          if (this.bot !== bot) return;
+          scheduleJoinVerification(Date.now() + 6000);
+        } catch (clickErr) {
+          if (this.bot !== bot) return;
+          this.logger.warn('lobby_menu_click_failed', { error: clickErr?.message || 'click_failed' });
+          this.serverJoinBusy = false;
+          this.transitionTo('IDLE', { reason: 'click_failed' });
+          if (this.serverJoinAttempts < 3 && this.isReadyForNavigation(bot, 'click_retry')) {
+            this.retryTimer = setTimeout(() => {
+              this.retryTimer = null;
+              this.triggerServerJoin(bot, `retry_after_click_error_${this.serverJoinAttempts}`);
+            }, 1000);
+            this.retryTimer.unref?.();
+          }
+        } finally {
+          if (this.bot === bot) this.clickInProgress = false;
         }
       }, 300);
+      this.clickTimer.unref?.();
     };
 
     if (bot.currentWindow) {
@@ -264,8 +339,7 @@ class LobbyNavigator {
 
     this.chatTimer = setTimeout(() => {
       this.chatTimer = null;
-      if (this.bot !== bot || clicked) return;
-      if (getLocationKind(bot) === 'other') return;
+      if (this.bot !== bot || clicked || !this.isReadyForNavigation(bot, 'fallback_command')) return;
       try {
         bot.chat(cmd);
         this.logger.info('lobby_fallback_command_sent', { command: cmd });
@@ -276,11 +350,16 @@ class LobbyNavigator {
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       if (this.bot !== bot) return;
+      if (this.clickInProgress || this.postJoinTimer) return;
       const currentKind = getLocationKind(bot);
       if (currentKind === 'other') {
         this.serverJoinAttempts = 0;
         this.serverJoinBusy = false;
         this.transitionTo('AFK_LOCKED', { verified: true });
+        return;
+      }
+      if (!this.isReadyForNavigation(bot, 'retry')) {
+        this.serverJoinBusy = false;
         return;
       }
       if (this.serverJoinAttempts < 3) {
@@ -304,56 +383,18 @@ class LobbyNavigator {
     this.pendingMenuListener = null;
   }
 
-  performRtp(bot = this.bot) {
-    if (!bot) return;
-    this.logger.info('lobby_performing_rtp');
-    try { bot.chat('/rtp'); } catch (_) {}
-
-    if (this.rtpDelayTimer) clearTimeout(this.rtpDelayTimer);
-    this.rtpDelayTimer = setTimeout(() => {
-      this.rtpDelayTimer = null;
-      if (this.bot !== bot) return;
-      this.logger.info('lobby_rtp_clicking_slot_15');
-      try {
-        const currentWindow = bot.currentWindow;
-        if (currentWindow) {
-          bot.clickWindow(15, 0, 0);
-        } else {
-          this.logger.info('lobby_rtp_window_not_found');
-        }
-      } catch (err) {
-        this.logger.warn('lobby_rtp_click_failed', { error: err.message });
-      }
-
-      bot.physicsEnabled = false;
-      this.transitionTo('AFK_LOCKED', { verified: true });
-      this.logger.info('lobby_rtp_completed_afk_ready');
-
-      // Repeat /rtp every 1 hour (3600000 ms) as in CheckStatsKingMC
-      if (this.rtpRepeatTimer) clearTimeout(this.rtpRepeatTimer);
-      this.rtpRepeatTimer = setTimeout(() => {
-        if (this.bot === bot) {
-          this.performRtp(bot);
-        }
-      }, 3600000);
-      this.rtpRepeatTimer.unref?.();
-    }, 2000);
-    this.rtpDelayTimer.unref?.();
-  }
-
   clear() {
     if (this.timer) clearTimeout(this.timer);
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.chatTimer) clearTimeout(this.chatTimer);
     if (this.postJoinTimer) clearTimeout(this.postJoinTimer);
-    if (this.rtpDelayTimer) clearTimeout(this.rtpDelayTimer);
-    if (this.rtpRepeatTimer) clearTimeout(this.rtpRepeatTimer);
+    if (this.clickTimer) clearTimeout(this.clickTimer);
     this.timer = null;
     this.retryTimer = null;
     this.chatTimer = null;
     this.postJoinTimer = null;
-    this.rtpDelayTimer = null;
-    this.rtpRepeatTimer = null;
+    this.clickTimer = null;
+    this.clickInProgress = false;
     this.clearMenuListener(this.bot);
     this.serverJoinBusy = false;
     this.serverJoinAttempts = 0;

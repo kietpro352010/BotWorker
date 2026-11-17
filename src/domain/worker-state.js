@@ -44,7 +44,7 @@ class CircularLogBuffer {
   push(item) {
     this.logSeq++;
     const entry = typeof item === 'object' && item !== null
-      ? { seq: this.logSeq, ...item, loggedAt: item.loggedAt || new Date().toISOString() }
+      ? { ...item, seq: this.logSeq, loggedAt: item.loggedAt || new Date().toISOString() }
       : { seq: this.logSeq, message: String(item), loggedAt: new Date().toISOString() };
 
     this.buffer[this.head] = entry;

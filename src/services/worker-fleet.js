@@ -35,6 +35,7 @@ class WorkerFleet {
     this.lastCpuSample = process.cpuUsage();
     this.lastResourceSampleAt = Date.now();
     this.instances = new Map();
+    this.bootstrapRetryTimers = new Map();
     this.wispbyteKeepAlive = new WispbyteKeepAlive(config.wispbyte, logger, { fetchImpl });
 
     for (const botConfig of config.bots) {
@@ -45,16 +46,26 @@ class WorkerFleet {
         secret: botConfig.secret, logger: botLogger, fetchImpl
       });
       const refreshManagerConfig = async () => {
+        const previousRestriction = session.restriction;
         const state = await reporter.bootstrap();
         session.applyManagerSettings(state.settings);
         session.applyManagerCredentials(state.credentials);
         session.restoreManagerState(state);
+        const wasManagerHold = ['manager_check_failed', 'manager_hold'].includes(previousRestriction);
+        if (wasManagerHold && !session.isHeld()) {
+          try {
+            await reporter.heartbeat(session.getStatus());
+          } catch (error) {
+            session.requireManualResume('manager_check_failed');
+            throw error;
+          }
+        }
         return state;
       };
       const runtime = new WorkerRuntime(session, botConfig, botLogger, { refreshManagerConfig });
       const poller = botConfig.transport === 'wispbyte-poll'
         ? new WispbytePoller({ config: botConfig, runtime, reporter, logger: botLogger, fetchImpl }) : null;
-      const instance = { config: botConfig, session, runtime, reporter, poller };
+      const instance = { config: botConfig, session, runtime, reporter, poller, refreshManagerConfig };
       this.instances.set(botConfig.workerId, instance);
 
       session.on('event', (event) => {
@@ -68,6 +79,42 @@ class WorkerFleet {
 
   get(workerId) { return this.instances.get(String(workerId || '')) || null; }
   list() { return [...this.instances.values()]; }
+
+  scheduleManagerBootstrapRetry(instance) {
+    const workerId = instance.config.workerId;
+    if (this.stopping || this.bootstrapRetryTimers.has(workerId)) return;
+    const delayMs = 30000;
+    this.logger.info('worker_manager_bootstrap_retry_scheduled', { workerId, delayMs });
+    const timer = setTimeout(async () => {
+      this.bootstrapRetryTimers.delete(workerId);
+      if (this.stopping) return;
+      try {
+        await instance.refreshManagerConfig();
+        if (!instance.session.hasCredentials()) {
+          throw new Error('Manager bootstrap has no usable Minecraft credentials yet.');
+        }
+        if (instance.session.isHeld()) {
+          this.logger.info('worker_manager_bootstrap_restored_but_held', {
+            workerId, restriction: instance.session.getStatus().restriction
+          });
+          this.scheduleManagerBootstrapRetry(instance);
+          return;
+        }
+        this.logger.info('worker_manager_bootstrap_recovered', { workerId });
+        if (this.config.autoStart && !this.stopping) {
+          await instance.runtime.execute('start', {}, { skipManagerRefresh: true }).catch((error) => {
+            this.logger.warn('worker_auto_start_failed', { workerId, error: error.message });
+          });
+        }
+      } catch (error) {
+        if (this.stopping) return;
+        this.logger.warn('worker_manager_bootstrap_retry_failed', { workerId, error: error.message });
+        this.scheduleManagerBootstrapRetry(instance);
+      }
+    }, delayMs);
+    timer.unref?.();
+    this.bootstrapRetryTimers.set(workerId, timer);
+  }
 
   health() {
     const memory = process.memoryUsage();
@@ -106,13 +153,11 @@ class WorkerFleet {
 
     for (const instance of this.instances.values()) {
       try {
-        const state = await instance.reporter.bootstrap();
-        instance.session.applyManagerSettings(state.settings);
-        instance.session.applyManagerCredentials(state.credentials);
-        instance.session.restoreManagerState(state);
+        await instance.refreshManagerConfig();
       } catch (error) {
         instance.session.requireManualResume('manager_check_failed');
         this.logger.warn('worker_bootstrap_check_failed', { workerId: instance.config.workerId, error: error.message });
+        this.scheduleManagerBootstrapRetry(instance);
       }
     }
     if (this.stopping) {
@@ -168,7 +213,7 @@ class WorkerFleet {
         }
         if (position > 0) await delay(8000);
         if (!this.stopping && !instance.session.isHeld()) {
-          await instance.runtime.execute('start').catch((error) => {
+          await instance.runtime.execute('start', {}, { skipManagerRefresh: true }).catch((error) => {
             this.logger.warn('worker_auto_start_failed', { workerId: instance.config.workerId, error: error.message });
           });
         }
@@ -182,6 +227,8 @@ class WorkerFleet {
     this.state = FleetState.STOPPING;
     this.stopping = true;
     this.wispbyteKeepAlive.stop();
+    for (const timer of this.bootstrapRetryTimers.values()) clearTimeout(timer);
+    this.bootstrapRetryTimers.clear();
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.resourceTimer) clearInterval(this.resourceTimer);
     this.heartbeatTimer = null;
