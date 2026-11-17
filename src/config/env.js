@@ -101,7 +101,7 @@ function loadConfig(env = process.env) {
     joinCommand: String(env.JOIN_COMMAND || '').trim(),
     joinDelayMs: positiveInt(env.JOIN_DELAY_MS, 4000, 0, 120000),
     maintenanceWaitMs: 600000,
-    connectTimeoutMs: positiveInt(env.CONNECT_TIMEOUT_MS, 30000, 5000, 180000),
+    connectTimeoutMs: positiveInt(env.CONNECT_TIMEOUT_MS, 40000, 5000, 180000),
     reconnectBaseMs: positiveInt(env.RECONNECT_BASE_MS, 5000, 1000, 300000),
     reconnectMaxMs: positiveInt(env.RECONNECT_MAX_MS, 120000, 5000, 3600000),
     rssWarnMb: positiveInt(env.WORKER_RSS_WARN_MB, 440, 128, 16384),

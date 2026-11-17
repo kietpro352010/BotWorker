@@ -3,6 +3,7 @@
 const EventEmitter = require('node:events');
 const mineflayer = require('mineflayer');
 const { SocksClient } = require('socks');
+const { logMinecraftHostResolution, attachMinecraftConnectionDiagnostics } = require('./connection-diagnostics');
 const AfkController = require('./afk-controller');
 const LobbyNavigator = require('./lobby-navigator');
 const ServerMonitor = require('./server-monitor');
@@ -62,7 +63,8 @@ class MinecraftSession extends EventEmitter {
     this.afk = new AfkController({ ...config.afk, logger });
     this.auth = new ServerAuth({ password: this.password, enabled: config.mc.authEnabled, logger });
     this.navigator = new LobbyNavigator({
-      joinCommand: config.joinCommand, joinDelayMs: config.joinDelayMs, logger
+      joinCommand: config.joinCommand, joinDelayMs: config.joinDelayMs, logger,
+      isAuthenticated: () => this.auth.isAuthenticated()
     });
     this.monitor = new ServerMonitor();
     this.isEquippingTotem = false;
@@ -156,6 +158,7 @@ class MinecraftSession extends EventEmitter {
     }
     this.emit('state', this.getStatus());
     this.logger.info('minecraft_connecting', { host, port: this.config.mc.port });
+    logMinecraftHostResolution(host, this.config.mc.port, this.logger);
 
     try {
       const options = {
@@ -181,6 +184,7 @@ class MinecraftSession extends EventEmitter {
       const bot = this.bot;
       attachEarlyPacketDropFilter(bot);
       this.attachNetworkMetrics(bot);
+      attachMinecraftConnectionDiagnostics(bot, { host, port: this.config.mc.port, logger: this.logger });
 
       if (bot._client) {
         bot._client.on('error', (err) => {
@@ -291,14 +295,6 @@ class MinecraftSession extends EventEmitter {
       this.logger.warn('bot_died', { coords });
       this.emit('event', { type: 'bot_death', reason: `Bot bị chết tại tọa độ ${coords}` });
       bot.physicsEnabled = true;
-      if (this.deathRtpTimer) clearTimeout(this.deathRtpTimer);
-      this.deathRtpTimer = setTimeout(() => {
-        this.deathRtpTimer = null;
-        if (this.bot === bot) {
-          this.navigator.performRtp(bot);
-        }
-      }, 5000);
-      this.deathRtpTimer.unref?.();
     });
 
     // Check off-hand totem immediately on spawn
@@ -343,7 +339,7 @@ class MinecraftSession extends EventEmitter {
       if (kind === 'login') {
         if (this.state !== 'authenticating') this.setState('authenticating', 'auth_lobby');
         const now = Date.now();
-        if (now - this.lastAuthSendAt >= 1500) {
+        if (!this.auth.isAuthenticated() && now - this.lastAuthSendAt >= 1500) {
           this.lastAuthSendAt = now;
           if (prevKind === 'login') {
             this.auth.sendDirectAuth(bot, 'dn');
@@ -352,15 +348,17 @@ class MinecraftSession extends EventEmitter {
           }
         }
       } else if (kind === 'lobby') {
+        if (prevKind === 'login') this.auth.markAuthenticated('login_area_exit');
         if (this.state !== 'entering') this.setState('entering', 'server_lobby');
         bot.physicsEnabled = true;
         const now = Date.now();
-        if (now - this.lastAuthSendAt >= 3000) {
+        if (!this.auth.isAuthenticated() && now - this.lastAuthSendAt >= 3000) {
           this.lastAuthSendAt = now;
           this.auth.sendDirectAuth(bot, 'dn');
         }
         this.navigator.tryJoin(bot);
       } else if (kind === 'other') {
+        this.auth.markAuthenticated('kingmc_world');
         if (this.state !== 'online') {
           this.setState('online', 'kingmc_in_game');
           this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
@@ -393,6 +391,12 @@ class MinecraftSession extends EventEmitter {
     } else if (classification === 'ip_limited' || classification === 'banned') {
       this.pauseForRestriction(classification, text);
     } else {
+      const wasAuthenticated = this.auth.isAuthenticated();
+      if (this.auth.handleMessage(bot, text)) {
+        if (wasAuthenticated && !this.auth.isAuthenticated()) this.navigator.clear();
+        else if (!wasAuthenticated && this.auth.isAuthenticated() && getLocationKind(bot) === 'lobby') this.navigator.tryJoin(bot);
+        return;
+      }
       const lower = text.toLowerCase();
       // KingMC Lobby chat detection (mc-bot.js:591-635)
       if (lower.includes('kingmc.vn')) {
@@ -409,7 +413,7 @@ class MinecraftSession extends EventEmitter {
         if (isLobby) {
           bot.physicsEnabled = true;
           const now = Date.now();
-          if (!this.lastLobbyAuthAt || now - this.lastLobbyAuthAt > 5000) {
+          if (!this.auth.isAuthenticated() && (!this.lastLobbyAuthAt || now - this.lastLobbyAuthAt > 5000)) {
             this.lastLobbyAuthAt = now;
             this.auth.sendDirectAuth(bot, 'dn');
             if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
@@ -424,7 +428,6 @@ class MinecraftSession extends EventEmitter {
           return;
         }
       }
-      if (this.auth.handleMessage(bot, text)) return;
     }
   }
 
@@ -609,7 +612,7 @@ class MinecraftSession extends EventEmitter {
     await this.stop('manager_reset_data', { emitEvent: false, signal });
     this.username = '';
     this.password = '';
-    this.auth.password = '';
+    this.auth.setPassword('');
     this.reconnectAttempts = 0;
     this.reconnectCount = 0;
     this.lastError = null;
@@ -628,7 +631,7 @@ class MinecraftSession extends EventEmitter {
     if (credentials === null) {
       this.username = '';
       this.password = '';
-      this.auth.password = '';
+      this.auth.setPassword('');
       return true;
     }
     if (!credentials || typeof credentials !== 'object') return false;
@@ -639,7 +642,7 @@ class MinecraftSession extends EventEmitter {
     }
     this.username = username;
     this.password = password;
-    this.auth.password = password;
+    this.auth.setPassword(password);
     return true;
   }
 
@@ -669,6 +672,17 @@ class MinecraftSession extends EventEmitter {
     this.lastStateAt = new Date().toISOString();
     this.logger.warn('worker_manual_resume_required', { reason });
     this.emit('state', this.getStatus());
+  }
+
+  clearManagerCheckHold() {
+    if (this.restriction !== 'manager_check_failed') return false;
+    this.restriction = null;
+    this.manualStop = true;
+    this.state = 'stopped';
+    this.lastStateAt = new Date().toISOString();
+    this.logger.info('worker_manager_check_recovered');
+    this.emit('state', this.getStatus());
+    return true;
   }
 
   isHeld() { return Boolean(this.restriction); }
@@ -917,13 +931,11 @@ class MinecraftSession extends EventEmitter {
     if (this.locationTimer) clearInterval(this.locationTimer);
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
     if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
-    if (this.deathRtpTimer) clearTimeout(this.deathRtpTimer);
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
     this.initialLocationTimer = null;
     this.lobbyRoutineTimer = null;
-    this.deathRtpTimer = null;
   }
 
   getStatus() {

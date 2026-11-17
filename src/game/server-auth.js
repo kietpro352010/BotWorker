@@ -95,6 +95,16 @@ function isVerificationSuccessNotice(message) {
   return /xac minh thanh cong|vui long vao lai server de bat dau choi/i.test(text);
 }
 
+function isAuthenticationSuccessMessage(message) {
+  const text = normalize(message);
+  return /(?:login|log in|dang nhap|xac thuc).{0,35}(?:successful|successfully|thanh cong)|(?:successfully logged in|logged in successfully|login successful|authenticated successfully|already logged in|ban da dang nhap|da dang nhap)/i.test(text);
+}
+
+function isAuthenticationFailureMessage(message) {
+  const text = normalize(message);
+  return /(?:wrong|incorrect|invalid|failed|failure|that bai|khong thanh cong|sai).{0,40}(?:password|mat khau|login|dang nhap|authentication|xac thuc)|(?:password|mat khau|login|dang nhap).{0,40}(?:wrong|incorrect|invalid|failed|failure|that bai|khong thanh cong|sai)/i.test(text);
+}
+
 class ServerAuth {
   constructor({ password, enabled = true, logger }) {
     this.password = password;
@@ -102,11 +112,36 @@ class ServerAuth {
     this.logger = logger;
     this.lastActionAt = 0;
     this.lastAuthDnActionAt = 0;
+    this.authenticated = !enabled;
+  }
+
+  setPassword(password) {
+    this.password = String(password || '');
+    this.authenticated = !this.enabled;
+  }
+
+  isAuthenticated() { return this.authenticated; }
+
+  markAuthenticated(source = 'server') {
+    if (this.authenticated) return false;
+    this.authenticated = true;
+    this.logger.info('minecraft_authentication_confirmed', { source });
+    return true;
   }
 
   handleMessage(bot, message) {
-    if (!this.enabled || !this.password || !bot) return false;
+    if (!bot) return false;
     const text = normalize(message);
+    if (isAuthenticationFailureMessage(text)) {
+      this.authenticated = false;
+      this.logger.warn('minecraft_authentication_failed');
+      return true;
+    }
+    if (isAuthenticationSuccessMessage(text)) {
+      this.markAuthenticated('server_message');
+      return true;
+    }
+    if (!this.enabled || !this.password) return false;
     const isRegister = /(?:^|\s)\/(?:register|dk)\b/.test(text)
       || /(?:please|you must|first|hay|vui long|ban can|can) .{0,32}(?:register|dang ky)/.test(text)
       || /(?:register|dang ky).{0,32}(?:account|tai khoan|before|first|de tiep tuc)/.test(text);
@@ -118,6 +153,7 @@ class ServerAuth {
     const command = isRegister
       ? `/register ${this.password} ${this.password}`
       : `/login ${this.password}`;
+    this.authenticated = false;
     this.lastActionAt = Date.now();
     this.logger.info('minecraft_auth_prompt_detected', { kind: isRegister ? 'register' : 'login' });
     try { bot.chat(command); }
@@ -131,6 +167,7 @@ class ServerAuth {
     if (now - this.lastActionAt < 2000) return false;
     this.lastActionAt = now;
     const command = kind === 'dn' ? `/dn ${this.password}` : `/login ${this.password}`;
+    this.authenticated = false;
     this.logger.info('minecraft_direct_auth_sent', { kind });
     try {
       bot.chat(command);
@@ -154,5 +191,7 @@ module.exports = {
   isLobbyPosition,
   getLocationKind,
   isVerificationSuccessNotice,
+  isAuthenticationSuccessMessage,
+  isAuthenticationFailureMessage,
   redactAuditValue
 };
