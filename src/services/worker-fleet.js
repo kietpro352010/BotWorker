@@ -45,16 +45,18 @@ class WorkerFleet {
         baseUrl: botConfig.managerUrl, workerId: botConfig.workerId,
         secret: botConfig.secret, logger: botLogger, fetchImpl
       });
-      const refreshManagerConfig = async () => {
+      const refreshManagerConfig = async ({ signal } = {}) => {
+        if (signal?.aborted) throw new Error('Aborted');
         const previousRestriction = session.restriction;
-        const state = await reporter.bootstrap();
+        const state = await reporter.bootstrap({ signal });
+        if (signal?.aborted) throw new Error('Aborted');
         session.applyManagerSettings(state.settings);
         session.applyManagerCredentials(state.credentials);
         session.restoreManagerState(state);
         const wasManagerHold = ['manager_check_failed', 'manager_hold'].includes(previousRestriction);
         if (wasManagerHold && !session.isHeld()) {
           try {
-            await reporter.heartbeat(session.getStatus());
+            await reporter.heartbeat(session.getStatus(), { signal });
           } catch (error) {
             session.requireManualResume('manager_check_failed');
             throw error;

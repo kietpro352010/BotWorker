@@ -19,6 +19,7 @@ class ManagerReporter {
     this.flushPromise = null;
     this.pendingHeartbeat = null;
     this.heartbeatPromise = null;
+    this.stopping = false;
   }
 
   hasPositionMovedSignificantly(newPos) {
@@ -31,9 +32,11 @@ class ManagerReporter {
     return distSq >= 25.0; // >= 5.0 blocks (matched with RPC record_bot_position_change)
   }
 
-  async post(path, payload) {
-    if (!this.baseUrl || !this.fetch) return;
+  async post(path, payload, { signal } = {}) {
+    if (!this.baseUrl || !this.fetch || this.stopping) return;
     const startedAt = Date.now();
+    const timeoutSignal = AbortSignal.timeout(8000);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     const response = await this.fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
       headers: {
@@ -42,24 +45,26 @@ class ManagerReporter {
         'x-manager-bot-id': String(this.workerId)
       },
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(8000)
+      signal: combinedSignal
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || (body && typeof body.ok === 'boolean' && !body.ok)) {
-      throw new Error(body?.error || `manager_http_${response.status}`);
+      const err = new Error(body?.error || `manager_http_${response.status}`);
+      err.status = response.status;
+      throw err;
     }
     this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
     return body;
   }
 
-  async heartbeat(status) {
+  async heartbeat(status, { signal } = {}) {
     this.pendingHeartbeat = status;
     if (this.heartbeatPromise) return this.heartbeatPromise;
 
-    this.heartbeatPromise = this.flushHeartbeats().finally(() => {
+    this.heartbeatPromise = this.flushHeartbeats({ signal }).finally(() => {
       this.heartbeatPromise = null;
-      if (this.pendingHeartbeat) {
-        void this.heartbeat(this.pendingHeartbeat).catch((error) => {
+      if (this.pendingHeartbeat && !this.stopping) {
+        void this.heartbeat(this.pendingHeartbeat, { signal }).catch((error) => {
           this.logger?.warn?.('manager_heartbeat_failed', { workerId: this.workerId, error: error.message });
         });
       }
@@ -67,15 +72,15 @@ class ManagerReporter {
     return this.heartbeatPromise;
   }
 
-  async flushHeartbeats() {
-    while (this.pendingHeartbeat) {
+  async flushHeartbeats({ signal } = {}) {
+    while (this.pendingHeartbeat && !this.stopping) {
       const status = this.pendingHeartbeat;
       this.pendingHeartbeat = null;
-      await this.sendHeartbeat(status);
+      await this.sendHeartbeat(status, { signal });
     }
   }
 
-  async sendHeartbeat(status) {
+  async sendHeartbeat(status, { signal } = {}) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/heartbeat`;
     const now = Date.now();
     const digest = computeBotStateDigest(status);
@@ -100,7 +105,7 @@ class ManagerReporter {
     const response = await this.post(path, {
       status: sanitizedStatus,
       sentAt: new Date().toISOString()
-    });
+    }, { signal });
     if (!digestUnchanged) {
       this.lastStateDigest = digest;
       this.lastFullReportAt = now;
@@ -109,19 +114,25 @@ class ManagerReporter {
     return response;
   }
 
-  async bootstrap() {
+  async bootstrap({ signal } = {}) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/bootstrap`;
     const startedAt = Date.now();
+    const timeoutSignal = AbortSignal.timeout(8000);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
     const response = await this.fetch(`${this.baseUrl}${path}`, {
       headers: {
         'x-worker-secret': this.secret,
         'x-manager-bot-id': String(this.workerId)
       },
-      signal: AbortSignal.timeout(8000)
+      signal: combinedSignal
     });
     this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
     const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.ok) throw new Error(body.error || `manager_http_${response.status}`);
+    if (!response.ok || !body.ok) {
+      const err = new Error(body?.error || `manager_http_${response.status}`);
+      err.status = response.status;
+      throw err;
+    }
     return body;
   }
 
@@ -189,6 +200,7 @@ class ManagerReporter {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
 
     for (const item of batch) {
+      if (this.stopping) break;
       if (now < item.nextRetryAt) {
         remaining.push(item);
         continue;
@@ -197,7 +209,24 @@ class ManagerReporter {
       try {
         await this.post(path, item.event);
       } catch (err) {
+        // Discard permanent 4xx (except 429) errors without retrying forever
+        if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          this.logger?.warn?.('manager_event_delivery_rejected_permanent', {
+            workerId: this.workerId,
+            status: err.status,
+            error: err.message
+          });
+          continue;
+        }
         item.attempts += 1;
+        if (item.attempts >= 10) {
+          this.logger?.warn?.('manager_event_delivery_exhausted', {
+            workerId: this.workerId,
+            attempts: item.attempts,
+            error: err.message
+          });
+          continue;
+        }
         const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 5)));
         item.nextRetryAt = Date.now() + backoffMs;
         remaining.push(item);
@@ -219,6 +248,7 @@ class ManagerReporter {
   }
 
   stop() {
+    this.stopping = true;
     if (this.eventFlushTimer) {
       clearTimeout(this.eventFlushTimer);
       this.eventFlushTimer = null;

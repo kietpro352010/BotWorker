@@ -19,7 +19,7 @@ class WispbyteKeepAlive {
     this.cookie = String(config.cookie || '').trim();
     this.panelUrl = String(config.panelUrl || DEFAULT_PANEL_URL).trim();
     this.userAgent = String(config.userAgent || DEFAULT_USER_AGENT).trim();
-    this.intervalMs = Number(config.intervalMs) || TWENTY_FOUR_HOURS_MS;
+    this.intervalMs = Math.max(60000, Math.min(604800000, Number(config.intervalMs) || TWENTY_FOUR_HOURS_MS));
     this.logger = logger;
     this.fetch = fetchImpl;
     this.enabled = Boolean(this.cookie);
@@ -52,24 +52,34 @@ class WispbyteKeepAlive {
 
     try {
       this.logger.info?.('wispbyte_keepalive_ping_start', { url: this.panelUrl });
-      const res = await this.fetch(this.panelUrl, {
-        method: 'GET',
-        headers: {
-          'Cookie': this.cookie,
-          'User-Agent': this.userAgent,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-          'Cache-Control': 'no-cache'
-        },
-        redirect: 'manual'
-      });
+      const controller = new AbortController();
+      const timeoutTimer = setTimeout(() => controller.abort(new Error('Keepalive request timed out after 15000ms.')), 15000);
+      timeoutTimer.unref?.();
+      let res;
+      try {
+        res = await this.fetch(this.panelUrl, {
+          method: 'GET',
+          headers: {
+            'Cookie': this.cookie,
+            'User-Agent': this.userAgent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Cache-Control': 'no-cache'
+          },
+          redirect: 'manual',
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeoutTimer);
+      }
 
       const location = res.headers.get('location') || '';
       const html = await res.text().catch(() => '');
       this.lastPingAt = new Date().toISOString();
 
-      if (res.status === 301 || res.status === 302 || res.status === 307 || res.status === 308) {
-        if (location.includes('login') || location.includes('auth') || location.includes('discord')) {
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        const lowerLoc = location.toLowerCase();
+        if (lowerLoc.includes('login') || lowerLoc.includes('auth') || lowerLoc.includes('discord')) {
           this.lastStatus = 'expired';
           this.lastMessage = `Session cookie expired (redirected to ${location})`;
           this.logger.warn?.('wispbyte_keepalive_cookie_expired', { location });

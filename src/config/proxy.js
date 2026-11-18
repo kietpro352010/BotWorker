@@ -2,18 +2,41 @@
 
 const { isIP } = require('node:net');
 
+function decodeIpv4Mapped(host) {
+  const match = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (match) return match[1];
+  const hexMatch = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (hexMatch) {
+    const p1 = parseInt(hexMatch[1], 16);
+    const p2 = parseInt(hexMatch[2], 16);
+    return `${(p1 >> 8) & 0xff}.${p1 & 0xff}.${(p2 >> 8) & 0xff}.${p2 & 0xff}`;
+  }
+  return null;
+}
+
+function isPrivateIpv4Octets(a, b) {
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+    || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+}
+
 function isLocalOrPrivateHost(hostname) {
-  const host = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
-  if (['localhost', 'localhost.localdomain'].includes(host) || /\.(?:localhost|local|internal|lan)$/.test(host)) return true;
+  const host = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase().replace(/\.+$/, '');
+  if (['localhost', 'localhost.localdomain', 'metadata.google.internal', 'instance-data'].includes(host)
+      || /\.(?:localhost|local|internal|lan)$/.test(host)) return true;
+
+  const mappedIpv4 = decodeIpv4Mapped(host);
+  if (mappedIpv4 && isIP(mappedIpv4) === 4) {
+    const [a, b] = mappedIpv4.split('.').map(Number);
+    return isPrivateIpv4Octets(a, b);
+  }
+
   if (isIP(host) === 4) {
     const [a, b] = host.split('.').map(Number);
-    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254)
-      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
-      || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+    return isPrivateIpv4Octets(a, b);
   }
   if (isIP(host) === 6) {
-    return host === '::' || host === '::1' || /^(?:fc|fd|fe8|fe9|fea|feb|ff)/.test(host)
-      || /^::ffff:(?:127\.|10\.|192\.168\.|169\.254\.)/.test(host);
+    return host === '::' || host === '::1' || /^(?:fc|fd|fe8|fe9|fea|feb|ff)/.test(host);
   }
   return false;
 }
@@ -34,33 +57,42 @@ function parseSocksProxy(value, label = 'MC_PROXY_URL') {
   if (username.length > 255 || password.length > 255 || /[\u0000-\u001f\u007f]/.test(username + password)) {
     throw new Error(`${label} credentials are invalid.`);
   }
-  return Object.freeze({ host: parsed.hostname.replace(/^\[|\]$/g, ''), port, username, password });
+  return Object.freeze({ host: parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, ''), port, username, password });
 }
 
 function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } = {}) {
   const { SocksClient } = require('socks');
+  const safeTimeoutMs = Math.max(1000, Number(timeoutMs) || 10000);
+
   return (client) => {
     let finished = false;
     let timer = null;
-    let activeSocket = null;
 
     const cleanup = () => {
       if (timer) clearTimeout(timer);
       timer = null;
+      client.removeListener('end', onClientClosed);
+      client.removeListener('close', onClientClosed);
     };
+
+    const onClientClosed = () => {
+      if (!finished) {
+        finished = true;
+        cleanup();
+      }
+    };
+    client.once('end', onClientClosed);
+    client.once('close', onClientClosed);
 
     timer = setTimeout(() => {
       if (!finished) {
         finished = true;
         cleanup();
-        if (activeSocket) {
-          try { activeSocket.destroy(); } catch (_) {}
-        }
-        const err = new Error(`SOCKS5 proxy connection timed out after ${timeoutMs}ms (${proxy.host}:${proxy.port})`);
+        const err = new Error(`SOCKS5 proxy connection timed out after ${safeTimeoutMs}ms (${proxy.host}:${proxy.port})`);
         err.code = 'ETIMEDOUT';
-        client.emit('error', err);
+        queueMicrotask(() => client.emit('error', err));
       }
-    }, timeoutMs);
+    }, safeTimeoutMs);
     timer.unref?.();
 
     const proxyOptions = {
@@ -72,7 +104,7 @@ function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } =
       },
       command: 'connect',
       destination: { host, port },
-      timeout: timeoutMs
+      timeout: safeTimeoutMs
     };
 
     try {
@@ -90,17 +122,17 @@ function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } =
           if (info?.socket) {
             try { info.socket.destroy(); } catch (_) {}
           }
-          client.emit('error', error);
+          queueMicrotask(() => client.emit('error', error));
           return;
         }
 
-        activeSocket = info.socket;
         client.setSocket(info.socket);
         client.emit('connect');
       });
     } catch (err) {
+      finished = true;
       cleanup();
-      client.emit('error', err);
+      queueMicrotask(() => client.emit('error', err));
     }
   };
 }

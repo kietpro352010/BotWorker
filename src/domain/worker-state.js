@@ -19,11 +19,12 @@ function normalizeState(state) {
 }
 
 function computeBotStateDigest(status = {}) {
+  if (!status || typeof status !== 'object') status = {};
   const stateStr = String(status.state || status.status || 'unknown');
   const health = Math.round(Number(status.health) || 0);
   const food = Math.round(Number(status.food) || 0);
   const totems = Number(status.totemCount || 0);
-  const loc = String(status.locationKind || 'unknown');
+  const loc = String(status.locationState || status.locationKind || 'unknown');
   const pingBucket = Math.round((Number(status.pingMs) || 0) / 25) * 25;
   const err = String(status.lastError || status.lastKickReason || '');
   const restriction = String(status.restriction || '');
@@ -34,7 +35,8 @@ function computeBotStateDigest(status = {}) {
 
 class CircularLogBuffer {
   constructor(capacity = 100) {
-    this.capacity = Math.max(1, Number(capacity) || 100);
+    const capNum = Number(capacity);
+    this.capacity = Number.isInteger(capNum) && capNum > 0 && Number.isFinite(capNum) ? capNum : 100;
     this.buffer = new Array(this.capacity);
     this.head = 0;
     this.size = 0;
@@ -43,9 +45,9 @@ class CircularLogBuffer {
 
   push(item) {
     this.logSeq++;
-    const entry = typeof item === 'object' && item !== null
+    const entry = typeof item === 'object' && item !== null && !Array.isArray(item)
       ? { ...item, seq: this.logSeq, loggedAt: item.loggedAt || new Date().toISOString() }
-      : { seq: this.logSeq, message: String(item), loggedAt: new Date().toISOString() };
+      : { seq: this.logSeq, message: Array.isArray(item) ? JSON.stringify(item) : String(item), loggedAt: new Date().toISOString() };
 
     this.buffer[this.head] = entry;
     this.head = (this.head + 1) % this.capacity;

@@ -18,7 +18,7 @@ const { TIME_ZONE, isMaintenanceWindow, nextMaintenanceBoundary } = require('../
 
 function classifyServerText(message) {
   const text = normalize(message);
-  if (/bao tri|maintenance|server restart|may chu dang khoi dong/.test(text)) return 'maintenance';
+  if (/bao tri|maintenance/.test(text)) return 'maintenance';
   if (/your ip is banned|ip bi cam|dia chi ip cua ban da bi|vuot qua gioi han toi da dang ky|gioi han.*dang ky/.test(text)) return 'ip_limited';
   if (/you (?:are|have been) banned|permanently banned|tai khoan.*bi cam|ban vinh vien|bi ban khoi server/.test(text)) return 'banned';
   return null;
@@ -61,13 +61,16 @@ class MinecraftSession extends EventEmitter {
     this.networkSampleAt = Date.now();
     this.resourceMetrics = { cpuPercent: 0, rssMb: 0, heapUsedMb: 0 };
     this.afk = new AfkController({ ...config.afk, logger });
-    this.auth = new ServerAuth({ password: this.password, enabled: config.authEnabled, logger });
+    this.auth = new ServerAuth({ password: this.password, enabled: Boolean(config.authEnabled ?? config.mc?.authEnabled ?? true), logger });
     this.navigator = new LobbyNavigator({
       joinCommand: config.joinCommand, joinDelayMs: config.joinDelayMs, logger,
       isAuthenticated: () => this.auth.isAuthenticated()
     });
     this.monitor = new ServerMonitor();
     this.isEquippingTotem = false;
+    this.inventoryRevision = 0;
+    this.isVerificationKickPending = false;
+    this.pendingReconnectDelayMs = null;
     this.scheduleMaintenanceBoundary();
   }
 
@@ -148,12 +151,17 @@ class MinecraftSession extends EventEmitter {
     }
     if (this.manualStop) return this.getStatus();
     if (this.bot && ['connecting', 'authenticating', 'entering', 'online'].includes(this.state)) return this.getStatus();
+    if (this.bot) {
+      this.cleanupSessionResources(this.bot);
+      this.bot = null;
+    }
+    this.isEquippingTotem = false;
     this.clearTimers();
     this.afk.stop();
     this.navigator.clear();
     this.lastLobbyAuthAt = 0;
     this.lastAuthSendAt = 0;
-    this.auth.authenticated = !this.config.authEnabled;
+    this.auth.authenticated = !Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
     this.state = 'connecting';
     this.lastStateAt = new Date().toISOString();
     const host = this.config.mc.hosts[this.hostIndex % this.config.mc.hosts.length];
@@ -198,6 +206,7 @@ class MinecraftSession extends EventEmitter {
       }
       this.bot = mineflayer.createBot(options);
       const bot = this.bot;
+      if (typeof bot.blockAt !== 'function') bot.blockAt = () => null;
       attachEarlyPacketDropFilter(bot);
       this.attachNetworkMetrics(bot);
       attachMinecraftConnectionDiagnostics(bot, { host, port: this.config.mc.port, logger: this.logger });
@@ -253,6 +262,10 @@ class MinecraftSession extends EventEmitter {
       return this.getStatus();
     } catch (error) {
       this._clearAbortListener();
+      if (this.bot) {
+        this.cleanupSessionResources(this.bot);
+        this.bot = null;
+      }
       if (generation !== this.generation || this.manualStop || signal?.aborted) {
         return this.getStatus();
       }
@@ -329,10 +342,15 @@ class MinecraftSession extends EventEmitter {
 
     try {
       this.isEquippingTotem = true;
-      await bot.equip(totem, 'off-hand');
-      this.logger.info('totem_equipped_offhand', { bot: this.username });
+      await Promise.race([
+        bot.equip(totem, 'off-hand'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Equip totem timeout')), 5000))
+      ]);
+      if (this.bot === bot) {
+        this.logger.info('totem_equipped_offhand', { bot: this.username });
+      }
     } catch (err) {
-      this.logger.warn('totem_equip_failed', { error: err.message });
+      this.logger.warn('totem_equip_failed', { error: err?.message || String(err) });
     } finally {
       this.isEquippingTotem = false;
     }
@@ -470,16 +488,19 @@ class MinecraftSession extends EventEmitter {
     } else if (isVerificationKick) {
       this.logger.info('kingmc_verification_kick_detected', { text: this.lastKickReason });
       this.setState('error', 'verification_kick');
-      this.reconnectAttempts = 0;
-      this.scheduleReconnect(2500);
+      this.isVerificationKickPending = true;
+      this.pendingReconnectDelayMs = 2500;
     } else {
       this.setState('error', 'kicked');
     }
+    try { bot.quit('kicked'); } catch (_) { try { bot.end('kicked'); } catch (_) {} }
+    this.onEnd(bot, generation);
   }
 
   cleanupSessionResources(bot = this.bot) {
     this._clearAbortListener();
     this.clearTimers();
+    this.isEquippingTotem = false;
     if (this.afk) this.afk.stop();
     if (this.monitor) this.monitor.detach();
     if (this.navigator) this.navigator.clear();
@@ -528,7 +549,13 @@ class MinecraftSession extends EventEmitter {
   }
 
   onEnd(bot, generation) {
+    if (bot && bot._kbotEnded) return;
+    if (bot) bot._kbotEnded = true;
     if (this.bot !== bot || generation !== this.generation) return;
+    const isVerification = this.isVerificationKickPending;
+    const pendingDelay = this.pendingReconnectDelayMs;
+    this.isVerificationKickPending = false;
+    this.pendingReconnectDelayMs = null;
     this.cleanupSessionResources(bot);
     if (this.manualStop || ['ip_limited', 'banned'].includes(this.state)) return;
     if (isMaintenanceWindow()) {
@@ -537,10 +564,16 @@ class MinecraftSession extends EventEmitter {
       return;
     }
     if (this.state !== 'maintenance') {
-      this.setState('error', 'disconnected');
-      this.hostIndex = (this.hostIndex + 1) % this.config.mc.hosts.length;
+      if (!isVerification) {
+        this.setState('error', 'disconnected');
+        this.hostIndex = (this.hostIndex + 1) % this.config.mc.hosts.length;
+      }
     }
-    this.scheduleReconnect(this.state === 'maintenance' ? this.config.maintenanceWaitMs : undefined);
+    if (isVerification) {
+      this.reconnectAttempts = 0;
+    }
+    const delay = isVerification ? (pendingDelay || 2500) : (this.state === 'maintenance' ? this.config.maintenanceWaitMs : undefined);
+    this.scheduleReconnect(delay);
   }
 
   pauseForRestriction(kind, message) {
@@ -561,14 +594,16 @@ class MinecraftSession extends EventEmitter {
       this.setState('maintenance', 'fixed_maintenance_window');
       return;
     }
-    if (this.reconnectAttempts >= (this.config.reconnectMaxAttempts || 25)) {
-      this.logger.warn('minecraft_reconnect_limit_reached', { attempts: this.reconnectAttempts });
-      this.manualStop = true;
-      this.setState('error', 'max_reconnects_reached');
-      return;
+    if (this.state !== 'maintenance') {
+      if (this.reconnectAttempts >= (this.config.reconnectMaxAttempts || 25)) {
+        this.logger.warn('minecraft_reconnect_limit_reached', { attempts: this.reconnectAttempts });
+        this.manualStop = true;
+        this.setState('error', 'max_reconnects_reached');
+        return;
+      }
+      this.reconnectAttempts += 1;
+      this.reconnectCount += 1;
     }
-    this.reconnectAttempts += 1;
-    this.reconnectCount += 1;
     const exponential = Math.min(this.config.reconnectMaxMs, this.config.reconnectBaseMs * (2 ** Math.min(this.reconnectAttempts - 1, 8)));
     const jitter = Math.floor(Math.random() * Math.min(5000, exponential * 0.2));
     const delay = delayOverride || exponential + jitter;
@@ -631,9 +666,13 @@ class MinecraftSession extends EventEmitter {
       this.abortPending(this._abortReasonFromSignal(signal));
       return { ok: false, error: 'reset_aborted', worker: this.getStatus() };
     }
-    this.generation += 1;
+    this.generation += 2;
+    this._clearAbortListener();
+    this.manualStop = true;
     this.clearTimers();
-    await this.stop('manager_reset_data', { emitEvent: false, signal });
+    const bot = this.bot;
+    this.bot = null;
+    this.cleanupSessionResources(bot);
     this.username = '';
     this.password = '';
     this.auth.setPassword('');
@@ -648,7 +687,8 @@ class MinecraftSession extends EventEmitter {
   }
 
   hasCredentials() {
-    return Boolean(this.username && (!this.config.authEnabled || this.password));
+    const isAuthRequired = Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
+    return Boolean(this.username && (!isAuthRequired || this.password));
   }
 
   applyManagerCredentials(credentials) {
@@ -661,7 +701,8 @@ class MinecraftSession extends EventEmitter {
     if (!credentials || typeof credentials !== 'object') return false;
     const username = String(credentials.username || '').trim();
     const password = String(credentials.password ?? '');
-    if (!username || username.length > 64 || (this.config.authEnabled && !password) || password.length > 256) {
+    const isAuthRequired = Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
+    if (!username || username.length > 64 || (isAuthRequired && !password) || password.length > 256) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
     this.username = username;
@@ -687,6 +728,11 @@ class MinecraftSession extends EventEmitter {
     if (!restricted && !recoveredRestriction) return false;
     this.restriction = recoveredRestriction || 'manager_hold';
     this.manualStop = true;
+    this.generation += 1;
+    this.clearTimers();
+    const bot = this.bot;
+    this.bot = null;
+    this.cleanupSessionResources(bot);
     this.state = ['ip_limited', 'banned'].includes(this.restriction) ? this.restriction : 'stopped';
     this.lastStateAt = new Date().toISOString();
     this.logger.warn('worker_hold_restored', { restriction: this.restriction });
@@ -702,6 +748,11 @@ class MinecraftSession extends EventEmitter {
   }
 
   requireManualResume(reason = 'manager_check_failed') {
+    this.generation += 1;
+    this.clearTimers();
+    const bot = this.bot;
+    this.bot = null;
+    this.cleanupSessionResources(bot);
     this.restriction = reason;
     this.manualStop = true;
     this.state = 'stopped';
@@ -740,6 +791,78 @@ class MinecraftSession extends EventEmitter {
     return { ok: true, sent: message };
   }
 
+  getInventorySnapshot(bot = this.bot) {
+    if (!bot || !bot.inventory) {
+      return {
+        slots: {},
+        armor: { head: null, torso: null, legs: null, feet: null },
+        offhand: null,
+        health: 20,
+        food: 20,
+        totemCount: 0,
+        goldenAppleCount: 0,
+        foodCount: 0,
+        selectedHotbar: 0,
+        revision: this.inventoryRevision,
+        items: []
+      };
+    }
+    const rawSlots = bot.inventory.slots || {};
+    const slots = {};
+    let totemCount = 0;
+    let goldenAppleCount = 0;
+    let foodCount = 0;
+    const items = [];
+
+    const FOOD_NAMES = new Set([
+      'apple', 'baked_potato', 'beetroot', 'beetroot_soup', 'bread', 'carrot',
+      'cooked_beef', 'cooked_chicken', 'cooked_cod', 'cooked_mutton', 'cooked_porkchop',
+      'cooked_salmon', 'cooked_rabbit', 'cookie', 'golden_apple', 'enchanted_golden_apple',
+      'golden_carrot', 'melon_slice', 'mushroom_stew', 'pumpkin_pie', 'rabbit_stew', 'sweet_berries'
+    ]);
+
+    for (let s = 0; s <= 45; s++) {
+      const it = rawSlots[s];
+      if (it && it.name) {
+        slots[String(s)] = {
+          slot: s,
+          name: it.name,
+          count: it.count,
+          displayName: it.displayName || it.name
+        };
+        if (s !== 45) {
+          if (it.name === 'totem_of_undying' || String(it.name).includes('totem')) totemCount += Number(it.count || 1);
+          else if (it.name === 'golden_apple' || it.name === 'enchanted_golden_apple') goldenAppleCount += Number(it.count || 1);
+          if (FOOD_NAMES.has(it.name)) foodCount += Number(it.count || 1);
+          if (items.length < 36) items.push({ name: it.name, count: it.count, slot: s });
+        }
+      }
+    }
+    const off = rawSlots[45];
+    if (off && (off.name === 'totem_of_undying' || String(off.name).includes('totem'))) {
+      totemCount += Number(off.count || 1);
+    }
+
+    return {
+      slots,
+      armor: {
+        head: slots['5'] || null,
+        torso: slots['6'] || null,
+        legs: slots['7'] || null,
+        feet: slots['8'] || null
+      },
+      offhand: slots['45'] ? slots['45'].name : null,
+      health: Number.isFinite(bot.health) ? Math.round(bot.health) : 20,
+      food: Number.isFinite(bot.food) ? Math.round(bot.food) : 20,
+      totemCount,
+      goldenAppleCount,
+      foodCount,
+      selectedHotbar: Number.isInteger(bot.quickBarSlot) ? bot.quickBarSlot : 0,
+      revision: this.inventoryRevision,
+      items
+    };
+  }
+
   setAfkMode(_value) {
     this.afkMode = 'still';
     this.afk.mode = 'still';
@@ -749,7 +872,7 @@ class MinecraftSession extends EventEmitter {
   async setProxy(value, { signal } = {}) {
     if (this.restriction) throw new Error('Proxy settings cannot be changed while the worker is on a server restriction hold.');
     const proxy = parseSocksProxy(value, 'proxy');
-    const shouldReconnect = Boolean(this.bot && ['online', 'entering'].includes(this.state));
+    const shouldReconnect = Boolean(this.bot && ['online', 'entering', 'connecting', 'authenticating'].includes(this.state));
     this.proxy = proxy;
     if (shouldReconnect && !signal?.aborted) await this.restart({ signal });
     return { ok: true, proxyEnabled: Boolean(proxy), reconnecting: shouldReconnect };
@@ -777,75 +900,148 @@ class MinecraftSession extends EventEmitter {
 
   async toss(payload = {}) {
     const bot = this.requireOnlineBot();
-    const slot = Number(payload.slot ?? payload.sourceSlot);
-    if (Number.isInteger(slot) && bot.inventory?.slots?.[slot]) {
+    const rawSlot = payload.slot ?? payload.sourceSlot;
+    const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
+    if (Number.isInteger(slot) && slot >= 0 && slot <= 45 && bot.inventory?.slots?.[slot]) {
       const item = bot.inventory.slots[slot];
       if (typeof bot.tossStack === 'function') {
         await bot.tossStack(item);
-        return { ok: true, tossedSlot: slot, item: item.name };
+        this.inventoryRevision += 1;
+        return { ok: true, tossedSlot: slot, item: item.name, inventory: this.getInventorySnapshot(bot) };
       }
     }
     if (typeof bot.toss === 'function' && payload.itemType) {
       await bot.toss(payload.itemType, payload.metadata || null, payload.count || 1);
-      return { ok: true, tossed: payload.itemType };
+      this.inventoryRevision += 1;
+      return { ok: true, tossed: payload.itemType, inventory: this.getInventorySnapshot(bot) };
     }
-    return { ok: true, note: 'toss_executed_or_empty_slot' };
+    return { ok: true, note: 'toss_executed_or_empty_slot', inventory: this.getInventorySnapshot(bot) };
   }
 
   async handleInventory(payload = {}) {
     const bot = this.requireOnlineBot();
     const action = String(payload.action || 'list').toLowerCase();
+
+    if (payload.revision !== undefined && payload.revision !== null && Number.isInteger(Number(payload.revision))) {
+      if (Number(payload.revision) !== this.inventoryRevision) {
+        return {
+          ok: false,
+          error: 'inventory_revision_mismatch',
+          status: 409,
+          inventory: this.getInventorySnapshot(bot)
+        };
+      }
+    }
+
     if (action === 'list') {
-      const items = bot.inventory?.items?.() || [];
+      const snapshot = this.getInventorySnapshot(bot);
       return {
         ok: true,
-        items: items.map(i => ({ slot: i.slot, name: i.name, count: i.count, displayName: i.displayName }))
+        items: snapshot.items,
+        inventory: snapshot
       };
     }
+
+    if (action === 'move') {
+      const rawSrc = payload.sourceSlot ?? payload.slot;
+      const rawDst = payload.destSlot ?? payload.targetSlot;
+      const src = rawSrc !== undefined && rawSrc !== null && String(rawSrc).trim() !== '' ? Number(rawSrc) : NaN;
+      const dst = rawDst !== undefined && rawDst !== null && String(rawDst).trim() !== '' ? Number(rawDst) : NaN;
+      if (!Number.isInteger(src) || !Number.isInteger(dst) || src < 0 || dst < 0) {
+        throw new Error('Valid sourceSlot and destSlot numbers required.');
+      }
+      if (src === dst) {
+        return { ok: true, action: 'move', moved: false, inventory: this.getInventorySnapshot(bot) };
+      }
+      if (typeof bot.moveSlotItem === 'function') {
+        await bot.moveSlotItem(src, dst);
+      } else if (typeof bot.clickWindow === 'function') {
+        await bot.clickWindow(src, 0, 0);
+        await bot.clickWindow(dst, 0, 0);
+      }
+      this.inventoryRevision += 1;
+      return {
+        ok: true,
+        action: 'move',
+        sourceSlot: src,
+        destSlot: dst,
+        inventory: this.getInventorySnapshot(bot)
+      };
+    }
+
     if (action === 'equip' || action === 'wear') {
-      const slot = Number(payload.slot ?? payload.sourceSlot);
+      const rawSlot = payload.slot ?? payload.sourceSlot;
+      const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
       const dest = String(payload.destination || 'hand');
-      const item = bot.inventory?.slots?.[slot] || bot.inventory?.items?.().find(i => i.name === payload.item);
+      const item = (Number.isInteger(slot) ? bot.inventory?.slots?.[slot] : null) ||
+        bot.inventory?.items?.().find(i => i.name === payload.item);
       if (item && typeof bot.equip === 'function') {
         await bot.equip(item, dest);
-        return { ok: true, equipped: item.name, destination: dest };
+        this.inventoryRevision += 1;
+        return { ok: true, equipped: item.name, destination: dest, inventory: this.getInventorySnapshot(bot) };
       }
-      return { ok: true, destination: dest, note: 'item_or_slot_empty' };
+      return { ok: true, destination: dest, note: 'item_or_slot_empty', inventory: this.getInventorySnapshot(bot) };
     }
+
     if (action === 'unequip') {
       const dest = String(payload.destination || 'hand');
+      const beforeSlots = new Set();
+      for (let s = 9; s <= 44; s++) {
+        if (bot.inventory?.slots?.[s]) beforeSlots.add(s);
+      }
       if (typeof bot.unequip === 'function') {
         await bot.unequip(dest);
       }
-      return { ok: true, unequipped: dest };
+      let unequippedToSlot = null;
+      for (let s = 9; s <= 44; s++) {
+        if (bot.inventory?.slots?.[s] && !beforeSlots.has(s)) {
+          unequippedToSlot = s;
+          break;
+        }
+      }
+      this.inventoryRevision += 1;
+      return {
+        ok: true,
+        action: 'unequip',
+        destination: dest,
+        unequippedToSlot,
+        inventory: this.getInventorySnapshot(bot)
+      };
     }
+
     if (action === 'drop') {
       return this.toss(payload);
     }
+
     if (action === 'select') {
-      const slot = Number(payload.slot);
+      const rawSlot = payload.slot;
+      const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
       if (Number.isInteger(slot) && slot >= 0 && slot <= 8 && typeof bot.setQuickBarSlot === 'function') {
         bot.setQuickBarSlot(slot);
-        return { ok: true, quickBarSlot: slot };
+        this.inventoryRevision += 1;
+        return { ok: true, quickBarSlot: slot, inventory: this.getInventorySnapshot(bot) };
       }
-      return { ok: true, selected: slot };
+      return { ok: true, selected: slot, inventory: this.getInventorySnapshot(bot) };
     }
-    return { ok: true, action };
+
+    return { ok: true, action, inventory: this.getInventorySnapshot(bot) };
   }
 
   async clickWindow(payload = {}) {
     const bot = this.requireOnlineBot();
     const window = bot.currentWindow;
     if (!window) return { ok: false, error: 'no_open_window' };
-    const slot = Number(payload.slot);
+    const rawSlot = payload.slot;
+    const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
     const mouseButton = Number(payload.mouseButton ?? 0);
     const mode = Number(payload.mode ?? 0);
     if (!Number.isInteger(slot)) throw new Error('Valid slot number required.');
     if (typeof bot.clickWindow === 'function') {
       await bot.clickWindow(slot, mouseButton, mode);
-      return { ok: true, clickedSlot: slot };
+      this.inventoryRevision += 1;
+      return { ok: true, clickedSlot: slot, inventory: this.getInventorySnapshot(bot) };
     }
-    return { ok: true, clickedSlot: slot, note: 'click_registered' };
+    return { ok: true, clickedSlot: slot, note: 'click_registered', inventory: this.getInventorySnapshot(bot) };
   }
 
   async closeWindow() {
@@ -891,7 +1087,7 @@ class MinecraftSession extends EventEmitter {
       sent += Math.max(0, bytesWritten - previous.bytesWritten);
       previous.bytesRead = bytesRead;
       previous.bytesWritten = bytesWritten;
-      if (socket.destroyed && bytesRead === previous.bytesRead && bytesWritten === previous.bytesWritten) this.networkSockets.delete(socket);
+      if (socket.destroyed) this.networkSockets.delete(socket);
     }
     const elapsedSeconds = Math.max(0.1, (now - this.networkSampleAt) / 1000);
     this.bandwidthRxBps = received / elapsedSeconds;
@@ -975,8 +1171,12 @@ class MinecraftSession extends EventEmitter {
   }
 
   getStatus() {
+    const invSnapshot = this.getInventorySnapshot(this.bot);
+    const monitorSnap = this.monitor.snapshot();
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
+      locationKind: this.lastLocationKind,
+      locationState: this.lastLocationKind,
       afkMode: this.afkMode, proxyEnabled: Boolean(this.proxy),
       username: this.username || 'N/A', credentialsConfigured: this.hasCredentials(),
       connected: Boolean(this.bot && this.bot.player), reconnectAttempts: this.reconnectAttempts,
@@ -987,7 +1187,9 @@ class MinecraftSession extends EventEmitter {
       maintenanceStart: '04:30', maintenanceEnd: '05:30',
       ...this.resourceMetrics, bandwidthRxBps: this.bandwidthRxBps, bandwidthTxBps: this.bandwidthTxBps,
       restriction: this.restriction,
-      ...this.monitor.snapshot(),
+      ...monitorSnap,
+      inventory: invSnapshot,
+      items: monitorSnap.inventory,
       lastError: this.lastError, lastKickReason: this.lastKickReason, lastStateAt: this.lastStateAt
     };
   }

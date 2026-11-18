@@ -7,17 +7,45 @@ class ServerMonitor {
     this.ticks = 0;
     this.tps = null;
     this.timer = null;
+    this.lastTimeAge = null;
+    this.lastTimeAt = 0;
     this.onPhysicsTick = () => { this.ticks += 1; };
+    this.onServerTime = () => {
+      if (!this.bot) return;
+      const now = Date.now();
+      const currentAge = this.bot.time?.age;
+      if (Number.isFinite(currentAge) && Number.isFinite(this.lastTimeAge)) {
+        const deltaTicks = currentAge - this.lastTimeAge;
+        const deltaSec = (now - this.lastTimeAt) / 1000;
+        if (deltaSec > 0.5 && deltaTicks >= 0) {
+          this.tps = Math.min(20, Math.max(0, Math.round((deltaTicks / deltaSec) * 10) / 10));
+          this.lastTimeAge = currentAge;
+          this.lastTimeAt = now;
+        }
+      } else if (Number.isFinite(currentAge)) {
+        this.lastTimeAge = currentAge;
+        this.lastTimeAt = now;
+      }
+    };
   }
 
   attach(bot) {
     this.detach();
     this.bot = bot;
     this.ticks = 0;
-    bot.on('physicsTick', this.onPhysicsTick);
+    this.lastTimeAge = bot?.time?.age ?? null;
+    this.lastTimeAt = Date.now();
+    if (typeof bot?.on === 'function') {
+      bot.on('physicsTick', this.onPhysicsTick);
+      bot.on('time', this.onServerTime);
+    }
     this.timer = setInterval(() => {
-      this.tps = Math.min(20, Math.round((this.ticks * 1000 / this.sampleMs) * 10) / 10);
-      this.ticks = 0;
+      if (this.ticks > 0) {
+        this.tps = Math.min(20, Math.round((this.ticks * 1000 / this.sampleMs) * 10) / 10);
+        this.ticks = 0;
+      } else if (this.tps === null) {
+        this.tps = 20;
+      }
     }, this.sampleMs);
     this.timer.unref?.();
   }
@@ -69,10 +97,15 @@ class ServerMonitor {
   detach() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    if (this.bot) this.bot.removeListener('physicsTick', this.onPhysicsTick);
+    if (this.bot && typeof this.bot.removeListener === 'function') {
+      if (this.onPhysicsTick) this.bot.removeListener('physicsTick', this.onPhysicsTick);
+      if (this.onServerTime) this.bot.removeListener('time', this.onServerTime);
+    }
     this.bot = null;
     this.ticks = 0;
     this.tps = null;
+    this.lastTimeAge = null;
+    this.lastTimeAt = 0;
   }
 }
 

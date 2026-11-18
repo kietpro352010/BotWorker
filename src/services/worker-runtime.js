@@ -5,8 +5,8 @@ const ACTIONS = new Set([
   'respawn', 'inventory', 'look', 'toss', 'window_click', 'window_close'
 ]);
 
-const LIFECYCLE_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset']);
-const CLEANUP_ON_ABORT_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset']);
+const LIFECYCLE_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset', 'set-proxy']);
+const CLEANUP_ON_ABORT_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset', 'set-proxy']);
 
 const DEFAULT_EXEC_TIMEOUT_MS = 10000;
 const DEFAULT_LIFECYCLE_TIMEOUT_MS = 15000;

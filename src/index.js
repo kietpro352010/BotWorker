@@ -65,20 +65,37 @@ async function main() {
   memorySweepInterval.unref();
 
   let shuttingDown = false;
-  const shutdown = async (signal) => {
+  const shutdown = async (signal, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
+    if (exitCode !== 0) {
+      setTimeout(() => process.exit(exitCode), 2000).unref();
+    }
     setTimeout(() => process.exit(0), 2000).unref();
     clearInterval(memorySweepInterval);
-    logger.info('worker_shutdown', { signal, botCount: config.botCount });
-    await fleet.stop();
-    await new Promise((resolve) => server.close(resolve));
-    process.exitCode = 0;
+    logger.info('worker_shutdown', { signal, botCount: config.botCount, exitCode });
+    try {
+      await fleet.stop();
+    } catch (err) {
+      logger.error('worker_shutdown_fleet_stop_error', { error: err?.message || String(err) });
+      exitCode = 1;
+    } finally {
+      try {
+        await new Promise((resolve) => server.close(resolve));
+      } catch (err) {
+        logger.error('worker_shutdown_server_close_error', { error: err?.message || String(err) });
+        exitCode = 1;
+      }
+    }
+    process.exitCode = exitCode;
+    process.exit(exitCode);
   };
-  process.once('SIGTERM', () => void shutdown('SIGTERM'));
-  process.once('SIGINT', () => void shutdown('SIGINT'));
+
+  process.once('SIGTERM', () => { shutdown('SIGTERM', 0).catch(() => process.exit(1)); });
+  process.once('SIGINT', () => { shutdown('SIGINT', 0).catch(() => process.exit(1)); });
   process.on('uncaughtException', (error) => {
     logger.error('worker_uncaught_exception', { error: error?.message || String(error), stack: error?.stack });
+    shutdown('uncaughtException', 1).catch(() => process.exit(1));
   });
   process.on('unhandledRejection', (reason) => {
     logger.error('worker_unhandled_rejection', { error: reason?.message || String(reason), stack: reason?.stack });
@@ -87,13 +104,15 @@ async function main() {
   try {
     await fleet.start();
   } catch (error) {
-    await fleet.stop();
-    await new Promise((resolve) => server.close(resolve));
+    clearInterval(memorySweepInterval);
+    try { await fleet.stop(); } catch (_) {}
+    try { await new Promise((resolve) => server.close(resolve)); } catch (_) {}
     throw error;
   }
 }
 
 main().catch((error) => {
-  logger.error('worker_startup_failed', { error: error.message });
+  logger.error('worker_startup_failed', { error: error?.message || String(error), stack: error?.stack });
   process.exitCode = 1;
+  process.exit(1);
 });

@@ -27,6 +27,7 @@ class WispbytePoller {
     this.loopPromise = null;
     this.failures = 0;
     this.activeController = null;
+    this.activeControllers = new Set();
     this.stopController = new AbortController();
     this.pendingResults = [];
     this.maxPendingResults = 100;
@@ -71,6 +72,10 @@ class WispbytePoller {
     const now = Date.now();
     const remaining = [];
     for (const item of batch) {
+      if (this.stopping) {
+        remaining.push(item);
+        break;
+      }
       if (now < item.nextRetryAt) {
         remaining.push(item);
         continue;
@@ -78,7 +83,33 @@ class WispbytePoller {
       try {
         await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, item.payload);
       } catch (err) {
+        if (this.stopping) {
+          remaining.push(item);
+          break;
+        }
+        if ([401, 404].includes(err.status)) {
+          this.logger.error('worker_registration_lost', { status: err.status });
+          this.stopping = true;
+          await this.runtime.execute('stop').catch(() => {});
+          break;
+        }
+        if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          this.logger?.warn?.('wispbyte_result_rejected_permanent', {
+            commandId: item.payload?.commandId,
+            status: err.status,
+            error: err.message
+          });
+          continue;
+        }
         item.attempts += 1;
+        if (item.attempts >= 10) {
+          this.logger?.warn?.('wispbyte_result_retries_exhausted', {
+            commandId: item.payload?.commandId,
+            attempts: item.attempts,
+            error: err.message
+          });
+          continue;
+        }
         const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 6)));
         item.nextRetryAt = Date.now() + backoffMs;
         remaining.push(item);
@@ -99,10 +130,12 @@ class WispbytePoller {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 35000);
     this.activeController = controller;
+    this.activeControllers.add(controller);
     try {
+      const combinedSignal = AbortSignal.any([controller.signal, this.stopController.signal]);
       const response = await this.fetch(url, {
         method: 'POST', headers: { 'content-type': 'application/json', 'x-worker-secret': this.config.secret },
-        body: JSON.stringify(payload), signal: controller.signal
+        body: JSON.stringify(payload), signal: combinedSignal
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok || !body.ok) {
@@ -113,6 +146,7 @@ class WispbytePoller {
       return body;
     } finally {
       clearTimeout(timeout);
+      this.activeControllers.delete(controller);
       if (this.activeController === controller) this.activeController = null;
     }
   }
@@ -132,7 +166,7 @@ class WispbytePoller {
           if (command.expiresAt && Date.parse(command.expiresAt) <= Date.now()) {
             result = { ok: false, error: 'command_expired' };
           } else {
-            try { result = await this.runtime.execute(command.action, command.payload || {}); }
+            try { result = await this.runtime.execute(command.action, command.payload || {}, { signal: this.stopController.signal }); }
             catch (error) { result = { ok: false, error: error.message, code: error.code || null, status: error.status || null }; }
           }
           const resultPayload = {
@@ -178,6 +212,10 @@ class WispbytePoller {
     this.stopping = true;
     this.stopController?.abort();
     this.activeController?.abort();
+    for (const c of this.activeControllers) {
+      try { c.abort(); } catch (_) {}
+    }
+    this.activeControllers.clear();
     await this.loopPromise?.catch(() => {});
   }
 }

@@ -7,12 +7,16 @@ function waitForGuiUpdate(bot, timeoutMs = 2500) {
     let isResolved = false;
     let debounceTimer = null;
     let timeoutTimer = null;
+    let targetWindow = bot.currentWindow || null;
 
     const cleanup = () => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (debounceTimer) clearTimeout(debounceTimer);
       try { bot.removeListener('windowOpen', onWindowOpen); } catch (_) {}
-      if (bot.currentWindow && typeof bot.currentWindow.removeListener === 'function') {
+      if (targetWindow && typeof targetWindow.removeListener === 'function') {
+        try { targetWindow.removeListener('updateSlot', onSlotUpdate); } catch (_) {}
+      }
+      if (bot.currentWindow && bot.currentWindow !== targetWindow && typeof bot.currentWindow.removeListener === 'function') {
         try { bot.currentWindow.removeListener('updateSlot', onSlotUpdate); } catch (_) {}
       }
     };
@@ -29,7 +33,11 @@ function waitForGuiUpdate(bot, timeoutMs = 2500) {
     }, timeoutMs);
     timeoutTimer.unref?.();
 
-    const onWindowOpen = () => {
+    const onWindowOpen = (win) => {
+      if (win && typeof win.on === 'function') {
+        targetWindow = win;
+        try { win.on('updateSlot', onSlotUpdate); } catch (_) {}
+      }
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(done, 150);
       debounceTimer.unref?.();
@@ -47,6 +55,7 @@ function waitForGuiUpdate(bot, timeoutMs = 2500) {
       bot.once('windowOpen', onWindowOpen);
     }
     if (bot.currentWindow && typeof bot.currentWindow.on === 'function') {
+      targetWindow = bot.currentWindow;
       bot.currentWindow.on('updateSlot', onSlotUpdate);
     }
   });
@@ -110,6 +119,7 @@ class LobbyNavigator {
     this.clickTimer = null;
     this.clickInProgress = false;
     this.lastWaitLogAt = 0;
+    this.lastExhaustedAt = 0;
   }
 
   transitionTo(newState, context = {}) {
@@ -157,6 +167,8 @@ class LobbyNavigator {
 
   tryJoin(bot) {
     if (!bot || this.serverJoinBusy) return;
+    if (this.serverJoinAttempts >= 3 && Date.now() - this.lastExhaustedAt < 30000) return;
+    if (Date.now() - this.lastExhaustedAt >= 30000) this.serverJoinAttempts = 0;
     this.bot = bot;
     if (!this.isReadyForNavigation(bot, 'try_join')) return;
 
@@ -182,6 +194,10 @@ class LobbyNavigator {
   }
 
   triggerServerJoin(bot, source = 'routine') {
+    if (!bot || this.serverJoinBusy) return;
+    if (this.serverJoinAttempts >= 3 && Date.now() - this.lastExhaustedAt < 30000) return;
+    if (!this.isReadyForNavigation(bot, source)) return;
+
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
@@ -191,9 +207,6 @@ class LobbyNavigator {
       this.chatTimer = null;
     }
     this.clearMenuListener(bot);
-
-    if (!bot || this.serverJoinBusy) return;
-    if (!this.isReadyForNavigation(bot, source)) return;
 
     this.serverJoinBusy = true;
     this.serverJoinAttempts += 1;
@@ -309,69 +322,71 @@ class LobbyNavigator {
         if (this.serverJoinAttempts < 3) {
           this.triggerServerJoin(bot, `retry_after_timeout_${this.serverJoinAttempts}`);
         } else {
+          this.lastExhaustedAt = Date.now();
           if (this.state === 'WAIT_MENU') {
             this.transitionTo('IDLE', { reason: 'menu_window_timeout' });
           }
         }
       }, 5000);
-    }
 
-    // 1. Right-click selector item in hotbar
-    this.transitionTo('SELECT_COMPASS');
-    try {
-      const selectorSlot = findMenuSelectorSlot(bot);
-      if (selectorSlot >= 0 && typeof bot.setQuickBarSlot === 'function') {
-        try { bot.setQuickBarSlot(selectorSlot); } catch (_) {}
-      }
-      this.transitionTo('USE_COMPASS');
-      if (typeof bot.activateItem === 'function') {
-        bot.activateItem();
-        this.logger.info('lobby_selector_item_activated');
-      }
-    } catch (actErr) {
-      this.logger.warn('lobby_selector_item_activate_failed', { error: actErr.message });
-    }
-
-    // 2. Chat fallback (/menu or /gui)
-    const menuCommands = ['/menu', '/gui'];
-    const cmd = menuCommands[this.menuCommandIndex % menuCommands.length];
-    this.menuCommandIndex = (this.menuCommandIndex + 1) % menuCommands.length;
-
-    this.chatTimer = setTimeout(() => {
-      this.chatTimer = null;
-      if (this.bot !== bot || clicked || !this.isReadyForNavigation(bot, 'fallback_command')) return;
+      // 1. Right-click selector item in hotbar
+      this.transitionTo('SELECT_COMPASS');
       try {
-        bot.chat(cmd);
-        this.logger.info('lobby_fallback_command_sent', { command: cmd });
-      } catch (_) {}
-    }, 400);
+        const selectorSlot = findMenuSelectorSlot(bot);
+        if (selectorSlot >= 0 && typeof bot.setQuickBarSlot === 'function') {
+          try { bot.setQuickBarSlot(selectorSlot); } catch (_) {}
+        }
+        this.transitionTo('USE_COMPASS');
+        if (typeof bot.activateItem === 'function') {
+          bot.activateItem();
+          this.logger.info('lobby_selector_item_activated');
+        }
+      } catch (actErr) {
+        this.logger.warn('lobby_selector_item_activate_failed', { error: actErr.message });
+      }
 
-    // 3. Retry loop (up to 3 attempts)
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      if (this.bot !== bot) return;
-      if (this.clickInProgress || this.postJoinTimer) return;
-      const currentKind = getLocationKind(bot);
-      if (currentKind === 'other') {
-        this.serverJoinAttempts = 0;
-        this.serverJoinBusy = false;
-        this.transitionTo('AFK_LOCKED', { verified: true });
-        return;
-      }
-      if (!this.isReadyForNavigation(bot, 'retry')) {
-        this.serverJoinBusy = false;
-        return;
-      }
-      if (this.serverJoinAttempts < 3) {
-        this.serverJoinBusy = false;
-        try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
-        this.triggerServerJoin(bot, `retry_${this.serverJoinAttempts}`);
-      } else {
-        this.logger.warn('lobby_server_join_exhausted', { attempts: this.serverJoinAttempts });
-        this.serverJoinBusy = false;
-        this.transitionTo('IDLE', { reason: 'exhausted' });
-      }
-    }, 3500);
+      // 2. Chat fallback (/menu or /gui)
+      const menuCommands = ['/menu', '/gui'];
+      const cmd = menuCommands[this.menuCommandIndex % menuCommands.length];
+      this.menuCommandIndex = (this.menuCommandIndex + 1) % menuCommands.length;
+
+      this.chatTimer = setTimeout(() => {
+        this.chatTimer = null;
+        if (this.bot !== bot || clicked || !this.isReadyForNavigation(bot, 'fallback_command')) return;
+        try {
+          bot.chat(cmd);
+          this.logger.info('lobby_fallback_command_sent', { command: cmd });
+        } catch (_) {}
+      }, 400);
+
+      // 3. Retry loop (up to 3 attempts)
+      this.retryTimer = setTimeout(() => {
+        this.retryTimer = null;
+        if (this.bot !== bot) return;
+        if (this.clickInProgress || this.postJoinTimer) return;
+        const currentKind = getLocationKind(bot);
+        if (currentKind === 'other') {
+          this.serverJoinAttempts = 0;
+          this.serverJoinBusy = false;
+          this.transitionTo('AFK_LOCKED', { verified: true });
+          return;
+        }
+        if (!this.isReadyForNavigation(bot, 'retry')) {
+          this.serverJoinBusy = false;
+          return;
+        }
+        if (this.serverJoinAttempts < 3) {
+          this.serverJoinBusy = false;
+          try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
+          this.triggerServerJoin(bot, `retry_${this.serverJoinAttempts}`);
+        } else {
+          this.lastExhaustedAt = Date.now();
+          this.logger.warn('lobby_server_join_exhausted', { attempts: this.serverJoinAttempts });
+          this.serverJoinBusy = false;
+          this.transitionTo('IDLE', { reason: 'exhausted' });
+        }
+      }, 3500);
+    }
   }
 
   clearMenuListener(bot = this.bot) {
@@ -398,6 +413,7 @@ class LobbyNavigator {
     this.clearMenuListener(this.bot);
     this.serverJoinBusy = false;
     this.serverJoinAttempts = 0;
+    this.lastExhaustedAt = 0;
     this.state = 'IDLE';
     this.bot = null;
   }

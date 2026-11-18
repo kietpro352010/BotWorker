@@ -32,6 +32,12 @@ function extractChatMessage(raw) {
       if (!node) return '';
       if (typeof node === 'string') return node;
       let text = node.text || '';
+      if (node.translate) {
+        text += node.translate;
+      }
+      if (Array.isArray(node.with)) {
+        text += node.with.map(walk).join('');
+      }
       if (Array.isArray(node.extra)) {
         text += node.extra.map(walk).join('');
       }
@@ -131,6 +137,10 @@ class ServerAuth {
 
   handleMessage(bot, message) {
     if (!bot || !this.enabled) return false;
+    if (this.authenticated) return false;
+    const loc = getLocationKind(bot);
+    if (loc === 'other') return false;
+
     const text = normalize(message);
     if (isAuthenticationFailureMessage(text)) {
       this.authenticated = false;
