@@ -266,6 +266,9 @@ class WorkerRuntime {
         if (execController.signal.aborted) {
           if (isLifecycle) {
             await this.cleanupAbortedLifecycle(action, err);
+          } else if (typeof this.session?.abortPending === 'function') {
+            const reason = err?.code === 'ETIMEDOUT' ? 'command_timeout' : 'command_aborted';
+            try { this.session.abortPending(reason); } catch (_) {}
           }
         }
         throw err;

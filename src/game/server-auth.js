@@ -163,11 +163,11 @@ class ServerAuth {
 
   sendDirectAuth(bot, kind = 'login') {
     if (!this.enabled || !this.password || !bot) return false;
+    if (this.authenticated) return false;
     const now = Date.now();
     if (now - this.lastActionAt < 2000) return false;
     this.lastActionAt = now;
     const command = kind === 'dn' ? `/dn ${this.password}` : `/login ${this.password}`;
-    this.authenticated = false;
     this.logger.info('minecraft_direct_auth_sent', { kind });
     try {
       bot.chat(command);

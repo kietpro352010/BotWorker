@@ -151,6 +151,9 @@ class MinecraftSession extends EventEmitter {
     this.clearTimers();
     this.afk.stop();
     this.navigator.clear();
+    this.lastLobbyAuthAt = 0;
+    this.lastAuthSendAt = 0;
+    this.auth.authenticated = !this.config.authEnabled;
     this.state = 'connecting';
     this.lastStateAt = new Date().toISOString();
     const host = this.config.mc.hosts[this.hostIndex % this.config.mc.hosts.length];
@@ -526,7 +529,6 @@ class MinecraftSession extends EventEmitter {
 
   onEnd(bot, generation) {
     if (this.bot !== bot || generation !== this.generation) return;
-    this.bot = null;
     this.cleanupSessionResources(bot);
     if (this.manualStop || ['ip_limited', 'banned'].includes(this.state)) return;
     if (isMaintenanceWindow()) {
