@@ -173,11 +173,15 @@ class WorkerFleet {
 
     this.heartbeatTimer = setInterval(() => {
       for (const instance of this.instances.values()) {
+        // Wispbyte poll transport already includes live status in every /poll request
+        if (instance.poller && !instance.poller.stopping && instance.poller.failures === 0) {
+          continue;
+        }
         void instance.reporter.heartbeat(instance.runtime.status()).catch((error) => {
           this.logger.warn('manager_heartbeat_failed', { workerId: instance.config.workerId, error: error.message });
         });
       }
-    }, 30000);
+    }, 45000);
     this.heartbeatTimer.unref?.();
 
     this.resourceTimer = setInterval(() => {

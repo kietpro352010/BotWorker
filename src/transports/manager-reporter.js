@@ -86,6 +86,8 @@ class ManagerReporter {
     const digest = computeBotStateDigest(status);
     const digestUnchanged = this.lastStateDigest === digest && (now - this.lastFullReportAt < 60000);
 
+    const positionMoved = Boolean(status.position && this.hasPositionMovedSignificantly(status.position));
+
     const sanitizedStatus = {
       ...status,
       managerLatencyMs: this.managerLatencyMs,
@@ -95,11 +97,14 @@ class ManagerReporter {
 
     if (digestUnchanged) {
       sanitizedStatus.isLightweight = true;
-    }
-
-    const positionMoved = status.position && this.hasPositionMovedSignificantly(status.position);
-    if (status.position) {
-      if (!positionMoved) sanitizedStatus.positionUnchanged = true;
+      delete sanitizedStatus.inventory;
+      delete sanitizedStatus.currentWindow;
+      if (!positionMoved) {
+        delete sanitizedStatus.position;
+        sanitizedStatus.positionUnchanged = true;
+      }
+    } else if (status.position && !positionMoved) {
+      sanitizedStatus.positionUnchanged = true;
     }
 
     const response = await this.post(path, {

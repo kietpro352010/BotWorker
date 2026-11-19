@@ -702,7 +702,7 @@ class MinecraftSession extends EventEmitter {
     const username = String(credentials.username || '').trim();
     const password = String(credentials.password ?? '');
     const isAuthRequired = Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
-    if (!username || username.length > 64 || (isAuthRequired && !password) || password.length > 256) {
+    if (!username || username.length > 64 || (isAuthRequired && !password)) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
     this.username = username;
