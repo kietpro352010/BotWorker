@@ -80,42 +80,54 @@ class ManagerReporter {
     }
   }
 
-  async sendHeartbeat(status, { signal } = {}) {
-    const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/heartbeat`;
+  prepareStatusPayload(status) {
     const now = Date.now();
-    const digest = computeBotStateDigest(status);
-    const digestUnchanged = this.lastStateDigest === digest && (now - this.lastFullReportAt < 60000);
+    const raw = status && typeof status === 'object' ? status : {};
+    const digest = computeBotStateDigest(raw);
+    const digestUnchanged = this.lastStateDigest === digest && (now - this.lastFullReportAt < 300000);
+    const positionMoved = Boolean(raw.position && this.hasPositionMovedSignificantly(raw.position));
 
-    const positionMoved = Boolean(status.position && this.hasPositionMovedSignificantly(status.position));
-
-    const sanitizedStatus = {
-      ...status,
+    const payload = {
+      ...raw,
       managerLatencyMs: this.managerLatencyMs,
       stateDigest: digest,
       digestUnchanged
     };
 
     if (digestUnchanged) {
-      sanitizedStatus.isLightweight = true;
-      delete sanitizedStatus.inventory;
-      delete sanitizedStatus.currentWindow;
+      payload.isLightweight = true;
+      delete payload.inventory;
+      delete payload.currentWindow;
       if (!positionMoved) {
-        delete sanitizedStatus.position;
-        sanitizedStatus.positionUnchanged = true;
+        delete payload.position;
+        payload.positionUnchanged = true;
       }
-    } else if (status.position && !positionMoved) {
-      sanitizedStatus.positionUnchanged = true;
+    } else if (raw.position && !positionMoved) {
+      payload.positionUnchanged = true;
     }
 
+    return { payload, digest, digestUnchanged, positionMoved, position: raw.position || null };
+  }
+
+  recordStatusSent(meta) {
+    if (!meta) return;
+    if (!meta.digestUnchanged) {
+      this.lastStateDigest = meta.digest;
+      this.lastFullReportAt = Date.now();
+    }
+    if (meta.positionMoved && meta.position) {
+      this.lastReportedPosition = { ...meta.position };
+    }
+  }
+
+  async sendHeartbeat(status, { signal } = {}) {
+    const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/heartbeat`;
+    const meta = this.prepareStatusPayload(status);
     const response = await this.post(path, {
-      status: sanitizedStatus,
+      status: meta.payload,
       sentAt: new Date().toISOString()
     }, { signal });
-    if (!digestUnchanged) {
-      this.lastStateDigest = digest;
-      this.lastFullReportAt = now;
-    }
-    if (positionMoved) this.lastReportedPosition = { ...status.position };
+    this.recordStatusSent(meta);
     return response;
   }
 

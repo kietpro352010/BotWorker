@@ -10,7 +10,7 @@ npm-debug.log*
 *.bat
 scratch/
 
-# Local internal notes, tests & archive (archived locally in D:\kbot_internal_archive)
+# Local internal notes, tests & scratch files
 CLAUDE.md
 FEATURES.md
 tests/

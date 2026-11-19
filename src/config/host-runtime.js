@@ -9,7 +9,7 @@ function validPort(value) {
 
 function detectHostRuntime(env = process.env) {
   const render = String(env.RENDER || '').toLowerCase() === 'true'
-    || Boolean(env.RENDER_SERVICE_ID || env.RENDER_INSTANCE_ID || env.RENDER_EXTERNAL_URL || env.RENDER_EXTERNAL_HOSTNAME);
+    || Boolean(env.RENDER_SERVICE_ID || env.RENDER_INSTANCE_ID || env.RENDER_SERVICE_NAME || env.RENDER_EXTERNAL_URL || env.RENDER_EXTERNAL_HOSTNAME);
   const wispbyte = Boolean(env.WISPBYTE || env.WISP || env.WISPBAY || env.DEPLEXO || env.PTERODACTYL || env.STARTUP
     || env.P_SERVER_UUID || env.P_SERVER_ALLOCATION_LIMIT || env.P_SERVER_PORT || env.SERVER_PORT || env.ALLOCATION_PORT);
   const platform = render ? 'render' : (wispbyte ? 'wispbyte' : 'generic-node');

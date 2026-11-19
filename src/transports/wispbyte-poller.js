@@ -134,7 +134,12 @@ class WispbytePoller {
     try {
       const combinedSignal = AbortSignal.any([controller.signal, this.stopController.signal]);
       const response = await this.fetch(url, {
-        method: 'POST', headers: { 'content-type': 'application/json', 'x-worker-secret': this.config.secret },
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-worker-secret': this.config.secret,
+          'x-manager-bot-id': String(this.config.workerId)
+        },
         body: JSON.stringify(payload), signal: combinedSignal
       });
       const body = await response.json().catch(() => ({}));
@@ -155,10 +160,14 @@ class WispbytePoller {
     while (!this.stopping) {
       try {
         await this.flushPendingResults();
-        const current = { ...this.runtime.status(), managerLatencyMs: this.reporter.managerLatencyMs };
+        const rawStatus = this.runtime.status();
+        const prepared = (this.reporter && typeof this.reporter.prepareStatusPayload === 'function')
+          ? this.reporter.prepareStatusPayload(rawStatus)
+          : { payload: { ...rawStatus, managerLatencyMs: this.reporter?.managerLatencyMs } };
         const response = await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/poll`, {
-          status: current, waitMs: 25000, sentAt: new Date().toISOString()
+          status: prepared.payload, waitMs: 25000, sentAt: new Date().toISOString()
         });
+        this.reporter?.recordStatusSent?.(prepared);
         this.failures = 0;
         if (response.command?.action) {
           const command = response.command;
@@ -187,7 +196,7 @@ class WispbytePoller {
           await cancellableSleep(500, this.stopController.signal);
         } else {
           // Adaptive polling interval: 1.5s when active/transitioning, 5s-8s when steady/idle
-          const stateStr = String(current.state || '').toLowerCase();
+          const stateStr = String(prepared.payload?.state || '').toLowerCase();
           const isIdle = ['idle', 'stopped', 'disconnected', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
           const adaptiveDelayMs = isIdle ? (5000 + Math.floor(Math.random() * 3000)) : 1500;
           await cancellableSleep(adaptiveDelayMs, this.stopController.signal);

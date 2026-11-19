@@ -27,14 +27,11 @@ function redact(value, key = '', visited = new WeakSet(), depth = 0) {
 function write(level, message, fields = {}) {
   const safeFields = typeof fields === 'object' && fields !== null && !Array.isArray(fields) ? redact(fields) : { data: redact(fields) };
   const record = {
+    ...safeFields,
     time: new Date().toISOString(),
     level,
-    message: String(message),
-    ...safeFields
+    message: String(message)
   };
-  record.time = new Date().toISOString();
-  record.level = level;
-  record.message = String(message);
 
   let line;
   try {

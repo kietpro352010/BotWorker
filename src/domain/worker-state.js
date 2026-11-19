@@ -28,8 +28,14 @@ function computeBotStateDigest(status = {}) {
   const pingBucket = Math.round((Number(status.pingMs) || 0) / 25) * 25;
   const err = String(status.lastError || status.lastKickReason || '');
   const restriction = String(status.restriction || '');
+  const username = String(status.username || '');
+  const manuallyStopped = status.manuallyStopped ? '1' : '0';
+  const invRev = status.inventory?.revision ?? 0;
+  const winSig = status.currentWindow
+    ? `${status.currentWindow.title || ''}:${Array.isArray(status.currentWindow.slots) ? status.currentWindow.slots.length : 0}:${status.currentWindow.revision || 0}`
+    : '';
 
-  const payload = `${stateStr}|${health}|${food}|${totems}|${loc}|${pingBucket}|${err}|${restriction}`;
+  const payload = `${stateStr}|${health}|${food}|${totems}|${loc}|${pingBucket}|${err}|${restriction}|${username}|${manuallyStopped}|${invRev}|${winSig}`;
   return crypto.createHash('md5').update(payload).digest('hex').slice(0, 16);
 }
 
