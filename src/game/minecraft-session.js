@@ -69,6 +69,7 @@ class MinecraftSession extends EventEmitter {
     this.monitor = new ServerMonitor();
     this.isEquippingTotem = false;
     this.inventoryRevision = 0;
+    this.windowRevision = 0;
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
     this.scheduleMaintenanceBoundary();
@@ -258,6 +259,22 @@ class MinecraftSession extends EventEmitter {
       bot.on('title', (json) => this.onMessage(bot, generation, json));
       bot.on('chat', (username, message) => this.recordChat(bot, username, message));
       bot.on('whisper', (username, message) => this.recordChat(bot, username, message));
+      bot.on('windowOpen', (win) => {
+        this.windowRevision = (this.windowRevision || 0) + 1;
+        const title = typeof win?.title === 'object' ? (win.title.text || win.title.value || '') : (win?.title || '');
+        this.logger.info('window_opened', { title, type: win?.type });
+        this.emit('event', { type: 'window_open', title, windowType: win?.type });
+        if (win && typeof win.on === 'function') {
+          win.on('updateSlot', () => {
+            this.windowRevision = (this.windowRevision || 0) + 1;
+          });
+        }
+      });
+      bot.on('windowClose', (win) => {
+        this.windowRevision = (this.windowRevision || 0) + 1;
+        this.logger.info('window_closed', { type: win?.type });
+        this.emit('event', { type: 'window_close' });
+      });
       bot.once('spawn', () => this.onSpawn(bot, generation, host));
       return this.getStatus();
     } catch (error) {
@@ -521,6 +538,7 @@ class MinecraftSession extends EventEmitter {
       try { bot.removeAllListeners?.(); bot.on?.('error', () => {}); } catch (_) {}
       try { bot._client?.removeAllListeners?.(); bot._client?.on?.('error', () => {}); } catch (_) {}
       try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
+      try { bot.currentWindow?.removeAllListeners?.(); } catch (_) {}
       try {
         if (bot._client?.socket && bot._client.socket.listenerCount?.('error') === 0) {
           bot._client.socket.on('error', () => {});
@@ -863,6 +881,37 @@ class MinecraftSession extends EventEmitter {
     };
   }
 
+  getWindowSnapshot(bot = this.bot) {
+    const win = bot?.currentWindow;
+    if (!win) return null;
+    const rawSlots = win.slots || [];
+    const slots = [];
+    const len = Array.isArray(rawSlots) ? rawSlots.length : 0;
+    for (let i = 0; i < len; i++) {
+      const it = rawSlots[i];
+      if (it && it.name) {
+        slots.push({
+          slot: i,
+          name: String(it.name),
+          count: Number(it.count) || 1,
+          displayName: it.displayName || it.name
+        });
+      }
+    }
+    let title = win.title;
+    if (typeof title === 'object' && title !== null) {
+      title = title.text || title.value || JSON.stringify(title);
+    }
+    return {
+      id: win.id,
+      type: String(win.type || 'minecraft:container'),
+      title: String(title || 'Container'),
+      slots,
+      totalSlots: len,
+      revision: this.windowRevision || 0
+    };
+  }
+
   setAfkMode(_value) {
     this.afkMode = 'still';
     this.afk.mode = 'still';
@@ -1039,9 +1088,10 @@ class MinecraftSession extends EventEmitter {
     if (typeof bot.clickWindow === 'function') {
       await bot.clickWindow(slot, mouseButton, mode);
       this.inventoryRevision += 1;
-      return { ok: true, clickedSlot: slot, inventory: this.getInventorySnapshot(bot) };
+      this.windowRevision = (this.windowRevision || 0) + 1;
+      return { ok: true, clickedSlot: slot, inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
     }
-    return { ok: true, clickedSlot: slot, note: 'click_registered', inventory: this.getInventorySnapshot(bot) };
+    return { ok: true, clickedSlot: slot, note: 'click_registered', inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
   }
 
   async closeWindow() {
@@ -1049,6 +1099,7 @@ class MinecraftSession extends EventEmitter {
     const window = bot.currentWindow;
     if (window && typeof bot.closeWindow === 'function') {
       bot.closeWindow(window);
+      this.windowRevision = (this.windowRevision || 0) + 1;
       return { ok: true, closed: true };
     }
     return { ok: true, closed: false, note: 'no_window_open' };
@@ -1172,6 +1223,7 @@ class MinecraftSession extends EventEmitter {
 
   getStatus() {
     const invSnapshot = this.getInventorySnapshot(this.bot);
+    const winSnapshot = this.getWindowSnapshot(this.bot);
     const monitorSnap = this.monitor.snapshot();
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
@@ -1189,6 +1241,7 @@ class MinecraftSession extends EventEmitter {
       restriction: this.restriction,
       ...monitorSnap,
       inventory: invSnapshot,
+      currentWindow: winSnapshot,
       items: monitorSnap.inventory,
       lastError: this.lastError, lastKickReason: this.lastKickReason, lastStateAt: this.lastStateAt
     };
