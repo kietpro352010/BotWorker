@@ -131,11 +131,14 @@ class MinecraftSession extends EventEmitter {
     this.autoChatTimer = null;
     this.autoChatDelayTimers = new Set();
     this.autoChatLastIntervalAt = new Map();
+    this.autoChatNextIntervalAt = new Map();
     this.autoChatLastFixedKey = new Map();
     this.botScheduleTimer = null;
     this.botScheduleLastFixedKey = new Map();
     this.botScheduleDailyJitter = new Map();
     this.botScheduleCycleState = null;
+    this._autoChatSchedulesSig = '';
+    this._botSchedulesSig = '';
     this.isInAfkState = false;
     this.wasAfkBeforeDisconnect = false;
     this.lastReconnectAttemptCount = 0;
@@ -601,12 +604,13 @@ class MinecraftSession extends EventEmitter {
           }
         } else {
           const baseIntervalMs = Math.max(10, Math.min(604800, Number(s.intervalSeconds) || 3600)) * 1000;
-          const intervalMs = applyCommandJitterMs(baseIntervalMs, 5000, 5000);
-          const lastAt = this.autoChatLastIntervalAt.get(schedId) || this.connectedAt || now;
-          if (!this.autoChatLastIntervalAt.has(schedId)) {
-            this.autoChatLastIntervalAt.set(schedId, lastAt);
-          } else if (now - lastAt >= intervalMs) {
+          if (!this.autoChatLastIntervalAt.has(schedId) || !this.autoChatNextIntervalAt.has(schedId)) {
+            const anchorAt = this.autoChatLastIntervalAt.get(schedId) || this.connectedAt || now;
+            this.autoChatLastIntervalAt.set(schedId, anchorAt);
+            this.autoChatNextIntervalAt.set(schedId, anchorAt + applyCommandJitterMs(baseIntervalMs, 5000, 5000));
+          } else if (now >= this.autoChatNextIntervalAt.get(schedId)) {
             this.autoChatLastIntervalAt.set(schedId, now);
+            this.autoChatNextIntervalAt.set(schedId, now + applyCommandJitterMs(baseIntervalMs, 5000, 5000));
             this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
           }
         }
@@ -646,15 +650,17 @@ class MinecraftSession extends EventEmitter {
     const cacheKey = `${dateStr}:${scheduleKey}:${baseHhmm}`;
     let cached = this.botScheduleDailyJitter.get(cacheKey);
     if (!cached) {
-      // ±15 minutes random anti-cheat offset around configured fixed schedule time
-      let minOffset = -15;
-      if (Number.isInteger(currentMinOfDay) && baseMin >= currentMinOfDay && baseMin - 15 < currentMinOfDay) {
+      // ±15 minutes random anti-cheat offset around configured fixed schedule time, clamped to same day [00:00, 23:59]
+      let minOffset = Math.max(-15, -baseMin);
+      const maxOffset = Math.min(15, 1439 - baseMin);
+      if (Number.isInteger(currentMinOfDay) && baseMin >= currentMinOfDay && baseMin + minOffset < currentMinOfDay) {
         // Clamp lower bound so newly created/booted schedule near target time still runs today
-        minOffset = Math.max(-15, currentMinOfDay - baseMin);
+        minOffset = Math.min(maxOffset, Math.max(minOffset, currentMinOfDay - baseMin));
       }
-      const span = 15 - minOffset + 1;
-      const offsetMin = minOffset + Math.floor(Math.random() * Math.max(1, span));
-      const effectiveHhmm = formatMinutesToHhmm(baseMin + offsetMin);
+      const span = Math.max(1, maxOffset - minOffset + 1);
+      const offsetMin = minOffset + Math.floor(Math.random() * span);
+      const effectiveMin = Math.max(0, Math.min(1439, baseMin + offsetMin));
+      const effectiveHhmm = formatMinutesToHhmm(effectiveMin);
       cached = { effectiveHhmm, offsetMin };
       if (this.botScheduleDailyJitter.size > 200) {
         this.botScheduleDailyJitter.clear();
@@ -729,8 +735,9 @@ class MinecraftSession extends EventEmitter {
                 ? item.time
                 : this.resolveDailyJitteredHhmm(key, item.time, dateStr, minuteOfDay);
               if (effectiveHhmm !== hhmm) continue;
-              const dayExecutionKey = `${dateStr}:${key}`;
+              const dayExecutionKey = `${dateStr}:${item.time}:${key}`;
               if (this.botScheduleLastFixedKey.get(key) !== dayExecutionKey) {
+                if (this.botScheduleLastFixedKey.size > 200) this.botScheduleLastFixedKey.clear();
                 this.botScheduleLastFixedKey.set(key, dayExecutionKey);
                 this.executeScheduledBotAction(item.action, item.command);
               }
@@ -744,8 +751,9 @@ class MinecraftSession extends EventEmitter {
             ? s.time
             : this.resolveDailyJitteredHhmm(key, s.time, dateStr, minuteOfDay);
           if (effectiveHhmm !== hhmm) continue;
-          const dayExecutionKey = `${dateStr}:${key}`;
+          const dayExecutionKey = `${dateStr}:${s.time}:${key}`;
           if (this.botScheduleLastFixedKey.get(key) !== dayExecutionKey) {
+            if (this.botScheduleLastFixedKey.size > 200) this.botScheduleLastFixedKey.clear();
             this.botScheduleLastFixedKey.set(key, dayExecutionKey);
             this.executeScheduledBotAction(s.action, s.command || s.message);
           }
@@ -1154,6 +1162,9 @@ class MinecraftSession extends EventEmitter {
     this.auth.setPassword('');
     this.reconnectAttempts = 0;
     this.reconnectCount = 0;
+    this.isInAfkState = false;
+    this.wasAfkBeforeDisconnect = false;
+    this.lastReconnectAttemptCount = 0;
     this.lastError = null;
     this.lastKickReason = null;
     this.state = ['ip_limited', 'banned'].includes(this.restriction) ? this.restriction : 'stopped';
@@ -1257,10 +1268,21 @@ class MinecraftSession extends EventEmitter {
       this.spawnCommands = String(settings.spawnCommands || '');
     }
     if (Object.hasOwn(settings, 'autoChatSchedules') && Array.isArray(settings.autoChatSchedules)) {
+      const nextSig = JSON.stringify(settings.autoChatSchedules);
       this.autoChatSchedules = settings.autoChatSchedules;
+      if (nextSig !== this._autoChatSchedulesSig) {
+        this._autoChatSchedulesSig = nextSig;
+        this.autoChatLastIntervalAt.clear();
+        this.autoChatNextIntervalAt.clear();
+      }
     }
     if (Object.hasOwn(settings, 'botSchedules') && Array.isArray(settings.botSchedules)) {
+      const nextSig = JSON.stringify(settings.botSchedules);
       this.botSchedules = settings.botSchedules;
+      if (nextSig !== this._botSchedulesSig) {
+        this._botSchedulesSig = nextSig;
+        this.botScheduleDailyJitter.clear();
+      }
       this.syncBotScheduleLoop();
     }
   }

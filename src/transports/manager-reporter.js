@@ -12,6 +12,7 @@ class ManagerReporter {
     this.logger = logger;
     this.onSettingsChanged = typeof onSettingsChanged === 'function' ? onSettingsChanged : null;
     this.lastSettingsRevision = null;
+    this.settingsRefreshInFlight = false;
     this.managerLatencyMs = null;
     this.lastReportedPosition = null;
     this.lastStateDigest = null;
@@ -24,6 +25,7 @@ class ManagerReporter {
     this.pendingHeartbeat = null;
     this.heartbeatPromise = null;
     this.stopping = false;
+    this.stopController = new AbortController();
   }
 
   hasPositionMovedSignificantly(newPos) {
@@ -40,7 +42,9 @@ class ManagerReporter {
     if (!this.baseUrl || !this.fetch || this.stopping) return;
     const startedAt = Date.now();
     const timeoutSignal = AbortSignal.timeout(8000);
-    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const signals = [timeoutSignal, this.stopController.signal];
+    if (signal) signals.push(signal);
+    const combinedSignal = AbortSignal.any(signals);
     const response = await this.fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
       headers: {
@@ -144,8 +148,9 @@ class ManagerReporter {
       status: meta.payload,
       sentAt: new Date().toISOString()
     }, { signal });
+    if (!response) return response;
     this.recordStatusSent(meta);
-    if (response && response.settingsRevision !== undefined) {
+    if (response.settingsRevision !== undefined) {
       this.noteSettingsRevision(response.settingsRevision);
     }
     return response;
@@ -154,17 +159,45 @@ class ManagerReporter {
   noteSettingsRevision(rev) {
     if (rev === undefined || rev === null) return;
     const prev = this.lastSettingsRevision;
-    this.lastSettingsRevision = rev;
-    if (prev !== null && prev !== rev && this.onSettingsChanged && !this.stopping) {
-      void Promise.resolve().then(() => this.onSettingsChanged(rev)).catch(() => {});
+    if (prev === null) {
+      this.lastSettingsRevision = rev;
+      return;
     }
+    if (prev === rev) return;
+    if (this.stopping) return;
+    if (!this.onSettingsChanged) {
+      this.lastSettingsRevision = rev;
+      return;
+    }
+    if (this.settingsRefreshInFlight) return;
+    this.settingsRefreshInFlight = true;
+    void Promise.resolve()
+      .then(() => this.onSettingsChanged(rev))
+      .then(() => {
+        if (this.lastSettingsRevision === prev) {
+          this.lastSettingsRevision = rev;
+        }
+      })
+      .catch((err) => {
+        this.logger?.debug?.('manager_settings_revision_refresh_retry_pending', {
+          workerId: this.workerId,
+          previousRevision: prev,
+          targetRevision: rev,
+          error: err?.message || 'refresh_failed'
+        });
+      })
+      .finally(() => {
+        this.settingsRefreshInFlight = false;
+      });
   }
 
   async bootstrap({ signal } = {}) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/bootstrap`;
     const startedAt = Date.now();
     const timeoutSignal = AbortSignal.timeout(8000);
-    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const signals = [timeoutSignal, this.stopController.signal];
+    if (signal) signals.push(signal);
+    const combinedSignal = AbortSignal.any(signals);
     const response = await this.fetch(`${this.baseUrl}${path}`, {
       headers: {
         'x-worker-secret': this.secret,
@@ -216,13 +249,16 @@ class ManagerReporter {
       nextRetryAt: 0
     });
 
-    this.scheduleFlush(0);
+    if (!this.stopping) {
+      this.scheduleFlush(0);
+    }
   }
 
   scheduleFlush(delayMs = 1000) {
-    if (this.eventFlushTimer) return;
+    if (this.stopping || this.eventFlushTimer) return;
     this.eventFlushTimer = setTimeout(() => {
       this.eventFlushTimer = null;
+      if (this.stopping) return;
       void this.flushEventQueue();
     }, delayMs);
     this.eventFlushTimer.unref?.();
@@ -230,10 +266,10 @@ class ManagerReporter {
 
   async flushEventQueue() {
     if (this.flushPromise) return this.flushPromise;
-    if (!this.eventQueue.length) return;
+    if (this.stopping || !this.eventQueue.length) return;
     this.flushPromise = this._flushEventQueue().finally(() => {
       this.flushPromise = null;
-      if (this.eventQueue.length) {
+      if (!this.stopping && this.eventQueue.length) {
         const delay = Math.max(100, Math.min(...this.eventQueue.map((item) => Math.max(0, item.nextRetryAt - Date.now()))));
         this.scheduleFlush(delay);
       }
@@ -248,8 +284,12 @@ class ManagerReporter {
     const remaining = [];
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
 
-    for (const item of batch) {
-      if (this.stopping) break;
+    for (let i = 0; i < batch.length; i++) {
+      const item = batch[i];
+      if (this.stopping) {
+        remaining.push(...batch.slice(i));
+        break;
+      }
       if (now < item.nextRetryAt) {
         remaining.push(item);
         continue;
@@ -258,6 +298,10 @@ class ManagerReporter {
       try {
         await this.post(path, item.event);
       } catch (err) {
+        if (this.stopping) {
+          remaining.push(...batch.slice(i));
+          break;
+        }
         // Discard permanent 4xx (except 429) errors without retrying forever
         if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
           this.logger?.warn?.('manager_event_delivery_rejected_permanent', {
@@ -298,6 +342,8 @@ class ManagerReporter {
 
   stop() {
     this.stopping = true;
+    this.pendingHeartbeat = null;
+    try { this.stopController.abort(); } catch (_) {}
     if (this.eventFlushTimer) {
       clearTimeout(this.eventFlushTimer);
       this.eventFlushTimer = null;

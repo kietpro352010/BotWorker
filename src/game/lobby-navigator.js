@@ -40,6 +40,9 @@ function waitForGuiUpdate(bot, timeoutMs = 2500) {
     timeoutTimer.unref?.();
 
     const onWindowOpen = (win) => {
+      if (targetWindow && targetWindow !== win && typeof targetWindow.removeListener === 'function') {
+        try { targetWindow.removeListener('updateSlot', onSlotUpdate); } catch (_) {}
+      }
       if (win && typeof win.on === 'function') {
         targetWindow = win;
         try { win.on('updateSlot', onSlotUpdate); } catch (_) {}
@@ -252,6 +255,8 @@ class LobbyNavigator {
             this.triggerServerJoin(bot, `retry_after_unconfirmed_${this.serverJoinAttempts}`);
           }, 1000);
           this.retryTimer.unref?.();
+        } else if (kind === 'lobby' && this.serverJoinAttempts >= 3) {
+          this.lastExhaustedAt = Date.now();
         }
       };
       if (this.postJoinTimer) clearTimeout(this.postJoinTimer);
@@ -378,12 +383,14 @@ class LobbyNavigator {
         if (this.clickInProgress || this.postJoinTimer) return;
         const currentKind = getLocationKind(bot);
         if (currentKind === 'other') {
+          this.clearMenuListener(bot);
           this.serverJoinAttempts = 0;
           this.serverJoinBusy = false;
           this.transitionTo('AFK_LOCKED', { verified: true });
           return;
         }
         if (!this.isReadyForNavigation(bot, 'retry')) {
+          this.clearMenuListener(bot);
           this.serverJoinBusy = false;
           return;
         }
@@ -392,6 +399,7 @@ class LobbyNavigator {
           try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
           this.triggerServerJoin(bot, `retry_${this.serverJoinAttempts}`);
         } else {
+          this.clearMenuListener(bot);
           this.lastExhaustedAt = Date.now();
           this.logger.warn('lobby_server_join_exhausted', { attempts: this.serverJoinAttempts });
           this.serverJoinBusy = false;

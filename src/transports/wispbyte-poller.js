@@ -100,9 +100,10 @@ class WispbytePoller {
     }
     const now = Date.now();
     const remaining = [];
-    for (const item of batch) {
+    for (let i = 0; i < batch.length; i++) {
+      const item = batch[i];
       if (this.stopping) {
-        remaining.push(item);
+        remaining.push(...batch.slice(i));
         break;
       }
       if (now < item.nextRetryAt) {
@@ -113,12 +114,12 @@ class WispbytePoller {
         await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, item.payload);
       } catch (err) {
         if (this.stopping) {
-          remaining.push(item);
+          remaining.push(...batch.slice(i));
           break;
         }
         if ([401, 404].includes(err.status)) {
           await this._handleAuthFailure(err.status);
-          remaining.push(item);
+          remaining.push(...batch.slice(i));
           break;
         }
         if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {

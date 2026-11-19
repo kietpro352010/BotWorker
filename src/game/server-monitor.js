@@ -21,6 +21,10 @@ class ServerMonitor {
           this.tps = Math.min(20, Math.max(0, Math.round((deltaTicks / deltaSec) * 10) / 10));
           this.lastTimeAge = currentAge;
           this.lastTimeAt = now;
+        } else if (deltaTicks < 0) {
+          // Server switch (e.g. lobby -> survival) or world restart reset world age
+          this.lastTimeAge = currentAge;
+          this.lastTimeAt = now;
         }
       } else if (Number.isFinite(currentAge)) {
         this.lastTimeAge = currentAge;
@@ -80,9 +84,10 @@ class ServerMonitor {
       const items = (this.bot.inventory.items() || []).filter((item) => item && item.slot !== 45);
       for (const item of items) {
         if (!item) continue;
-        if (item.name === 'totem_of_undying') {
+        const itemName = String(item.name || '').toLowerCase();
+        if (itemName.includes('totem')) {
           totemCount += Number(item.count || 1);
-        } else if (item.name === 'golden_apple' || item.name === 'enchanted_golden_apple') {
+        } else if (itemName === 'golden_apple' || itemName === 'enchanted_golden_apple') {
           goldenAppleCount += Number(item.count || 1);
         }
         if (itemsSummary.length < 10) {
@@ -92,9 +97,10 @@ class ServerMonitor {
       // Check off-hand slot (slot 45 in 1.9+)
       const offHand = this.bot.inventory.slots?.[45];
       if (offHand) {
-        if (offHand.name === 'totem_of_undying') {
+        const offHandName = String(offHand.name || '').toLowerCase();
+        if (offHandName.includes('totem')) {
           totemCount += Number(offHand.count || 1);
-        } else if (offHand.name === 'golden_apple' || offHand.name === 'enchanted_golden_apple') {
+        } else if (offHandName === 'golden_apple' || offHandName === 'enchanted_golden_apple') {
           goldenAppleCount += Number(offHand.count || 1);
         }
       }
