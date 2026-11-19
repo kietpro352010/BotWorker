@@ -158,6 +158,7 @@ class WispbytePoller {
     const url = `${baseUrl}${path}`;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 35000);
+    timeout.unref?.();
     this.activeController = controller;
     this.activeControllers.add(controller);
     try {
@@ -212,7 +213,13 @@ class WispbytePoller {
           if (command.expiresAt && Date.parse(command.expiresAt) <= Date.now()) {
             result = { ok: false, error: 'command_expired' };
           } else {
-            try { result = await this.runtime.execute(command.action, command.payload || {}, { signal: this.stopController.signal }); }
+            const rawPayload = (command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload))
+              ? { ...command.payload }
+              : {};
+            delete rawPayload.timeoutMs;
+            delete rawPayload.execTimeoutMs;
+            delete rawPayload.queueTimeoutMs;
+            try { result = await this.runtime.execute(command.action, rawPayload, { signal: this.stopController.signal }); }
             catch (error) { result = { ok: false, error: error.message, code: error.code || null, status: error.status || null }; }
           }
           const resultPayload = {
@@ -224,6 +231,9 @@ class WispbytePoller {
           try {
             await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, resultPayload);
           } catch (err) {
+            if ([401, 404].includes(err.status)) {
+              await this._handleAuthFailure(err.status);
+            }
             this.logger?.warn?.('wispbyte_result_send_failed_queueing', {
               commandId: command.commandId,
               error: err.message

@@ -197,6 +197,7 @@ class WorkerRuntime {
         err.code = 'ETIMEDOUT';
         cancelWhileQueued(err);
       }, queueTimeoutMs);
+      queueTimer.unref?.();
 
       if (externalSignal) {
         onQueueAbort = () => cancelWhileQueued(createAbortError(externalSignal.reason, action));
@@ -250,6 +251,7 @@ class WorkerRuntime {
           err.code = 'ETIMEDOUT';
           execController.abort(err);
         }, execTimeoutMs);
+        execTimer.unref?.();
       });
 
       execPromise = Promise.resolve().then(() =>
@@ -305,6 +307,7 @@ class WorkerRuntime {
     const prevExecution = this.execution;
     this.execution = Promise.allSettled([prevExecution, settleLock]).then(() => undefined);
     const task = prevExecution.then(() => runTask());
+    task.catch(() => {});
     try {
       return await Promise.race([task, queueWaitAbortPromise]);
     } finally {

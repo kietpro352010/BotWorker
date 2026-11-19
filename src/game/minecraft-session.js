@@ -309,7 +309,10 @@ class MinecraftSession extends EventEmitter {
       this.connectTimer = setTimeout(() => {
         if (this.bot === bot && generation === this.generation && !this.manualStop && this.state === 'connecting') {
           this.logger.warn('minecraft_connect_timeout', { host });
-          try { bot.end('Connection timeout'); } catch (_) { this.scheduleReconnect(); }
+          try { bot.end('Connection timeout'); } catch (_) {}
+          if (this.bot === bot && generation === this.generation && !bot._kbotEnded) {
+            this.onEnd(bot, generation);
+          }
         }
       }, this.config.connectTimeoutMs);
       this.connectTimer.unref?.();
@@ -452,7 +455,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   async fastEquipTotem(bot) {
-    if (!bot || !bot.inventory || this.isEquippingTotem || this.autoTotem === false) return;
+    if (!bot || !bot.inventory || bot.currentWindow || this.isEquippingTotem || this.isEatingFood || this.autoTotem === false) return;
     const offHand = bot.inventory.slots?.[45];
     if (offHand && (offHand.name === 'totem_of_undying' || String(offHand.name).includes('totem'))) return;
 
@@ -485,7 +488,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   async tryEatFood(bot) {
-    if (!bot || !bot.inventory || this.antiHungry === false || this.isEatingFood || this.isEquippingTotem) return;
+    if (!bot || !bot.inventory || bot.currentWindow || this.antiHungry === false || this.isEatingFood || this.isEquippingTotem) return;
     if (this.state !== 'online' || typeof bot.food !== 'number' || bot.food >= 16) return;
     if (typeof bot.equip !== 'function' || typeof bot.consume !== 'function') return;
 
@@ -954,16 +957,16 @@ class MinecraftSession extends EventEmitter {
       this.locationTimer = null;
     }
     if (bot) {
+      bot._kbotEnded = true;
+      bot.physicsEnabled = false;
       stopEntityPruner(bot);
-      try { bot.removeAllListeners?.(); bot.on?.('error', () => {}); } catch (_) {}
-      try { bot._client?.removeAllListeners?.(); bot._client?.on?.('error', () => {}); } catch (_) {}
-      try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
-      try { bot.currentWindow?.removeAllListeners?.(); } catch (_) {}
       try {
         if (bot._client?.socket && bot._client.socket.listenerCount?.('error') === 0) {
           bot._client.socket.on('error', () => {});
         }
       } catch (_) {}
+      // End/quit BEFORE stripping internal Mineflayer/protocol 'end' listeners so
+      // physics.js doPhysicsTimer and keepalive.js timers are cleared cleanly.
       let ended = false;
       if (typeof bot.quit === 'function') {
         try { bot.quit('cleanup'); ended = true; } catch (_) {}
@@ -974,12 +977,24 @@ class MinecraftSession extends EventEmitter {
       if (!ended && typeof bot._client?.end === 'function') {
         try { bot._client.end('cleanup'); } catch (_) {}
       }
+      try {
+        if (bot._client && !bot._client.ended) {
+          bot._client.ended = true;
+          bot._client.emit?.('end', 'cleanup');
+        }
+      } catch (_) {}
+      try { bot.emit?.('end', 'cleanup'); } catch (_) {}
+      try { bot.removeAllListeners?.(); bot.on?.('error', () => {}); } catch (_) {}
+      try { bot._client?.removeAllListeners?.(); bot._client?.on?.('error', () => {}); } catch (_) {}
+      try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
+      try { bot.currentWindow?.removeAllListeners?.(); } catch (_) {}
       try { bot._client?.socket?.destroy?.(); } catch (_) {}
       bot.entities = {};
       bot.players = {};
+      bot.uuidToUsername = {};
       bot.registry = null;
       bot.world = null;
-      bot.blockAt = null;
+      bot.blockAt = () => null;
     }
     this.networkSockets.clear();
     this.bot = null;
@@ -1095,6 +1110,10 @@ class MinecraftSession extends EventEmitter {
       clearTimeout(this.maintenanceTimer);
       this.maintenanceTimer = null;
     }
+    if ((reason === 'process_shutdown' || reason === 'fleet_stop') && this.botScheduleTimer) {
+      clearInterval(this.botScheduleTimer);
+      this.botScheduleTimer = null;
+    }
     const bot = this.bot;
     this.bot = null;
     this.cleanupSessionResources(bot);
@@ -1142,6 +1161,7 @@ class MinecraftSession extends EventEmitter {
     }
     this.manualStop = false;
     this.reconnectAttempts = 0;
+    if (!this.maintenanceTimer) this.scheduleMaintenanceBoundary();
     return this.connect({ signal });
   }
 
@@ -1154,6 +1174,21 @@ class MinecraftSession extends EventEmitter {
     this._clearAbortListener();
     this.manualStop = true;
     this.clearTimers();
+    if (this.botScheduleTimer) {
+      clearInterval(this.botScheduleTimer);
+      this.botScheduleTimer = null;
+    }
+    this.botSchedules = [];
+    this.autoChatSchedules = [];
+    this.spawnCommands = '';
+    this._botSchedulesSig = '';
+    this._autoChatSchedulesSig = '';
+    this.botScheduleCycleState = null;
+    this.botScheduleDailyJitter.clear();
+    this.botScheduleLastFixedKey.clear();
+    this.autoChatLastFixedKey.clear();
+    this.autoChatLastIntervalAt.clear();
+    this.autoChatNextIntervalAt.clear();
     const bot = this.bot;
     this.bot = null;
     this.cleanupSessionResources(bot);
@@ -1680,7 +1715,21 @@ class MinecraftSession extends EventEmitter {
       if (this.bot.players) {
         for (const p in this.bot.players) {
           if (p !== this.bot.username) {
+            const playerObj = this.bot.players[p];
+            if (playerObj?.uuid && this.bot.uuidToUsername) {
+              delete this.bot.uuidToUsername[playerObj.uuid];
+            }
             delete this.bot.players[p];
+          }
+        }
+      }
+      if (this.bot.uuidToUsername) {
+        const ownUuid = this.bot.player?.uuid;
+        for (const uuid in this.bot.uuidToUsername) {
+          if (ownUuid && uuid === ownUuid) continue;
+          const uname = this.bot.uuidToUsername[uuid];
+          if (uname !== this.bot.username && (!this.bot.players || !this.bot.players[uname])) {
+            delete this.bot.uuidToUsername[uuid];
           }
         }
       }
@@ -1701,11 +1750,12 @@ class MinecraftSession extends EventEmitter {
         void this.connect();
       }
       this.scheduleMaintenanceBoundary();
-    }, Math.max(50, boundary.getTime() - now.getTime()));
+    }, Math.max(50, boundary.getTime() - now.getTime() + 250));
     this.maintenanceTimer.unref?.();
   }
 
   enterMaintenanceWindow() {
+    this.generation += 1;
     this.clearTimers();
     if (this.manualStop || this.restriction) return;
     this.afk.stop();

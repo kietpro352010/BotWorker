@@ -180,7 +180,10 @@ class LobbyNavigator {
   tryJoin(bot) {
     if (!bot || this.serverJoinBusy) return;
     if (this.serverJoinAttempts >= 3 && Date.now() - this.lastExhaustedAt < 30000) return;
-    if (Date.now() - this.lastExhaustedAt >= 30000) this.serverJoinAttempts = 0;
+    if (this.lastExhaustedAt > 0 && Date.now() - this.lastExhaustedAt >= 30000) {
+      this.serverJoinAttempts = 0;
+      this.lastExhaustedAt = 0;
+    }
     this.bot = bot;
     if (!this.isReadyForNavigation(bot, 'try_join')) return;
 
@@ -208,7 +211,12 @@ class LobbyNavigator {
   triggerServerJoin(bot, source = 'routine') {
     if (!bot || this.serverJoinBusy) return;
     if (this.serverJoinAttempts >= 3 && Date.now() - this.lastExhaustedAt < 30000) return;
+    if (this.lastExhaustedAt > 0 && Date.now() - this.lastExhaustedAt >= 30000) {
+      this.serverJoinAttempts = 0;
+      this.lastExhaustedAt = 0;
+    }
     if (!this.isReadyForNavigation(bot, source)) return;
+    this.bot = bot;
 
     if (this.retryTimer) {
       clearTimeout(this.retryTimer);

@@ -119,11 +119,15 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false, config = nul
       } else if (code === 'INVALID_PAYLOAD' || code === 'UNSUPPORTED_ACTION' || /unsupported|payload/i.test(msg)) {
         status = 400;
       } else if (code === 'COMMAND_ABORTED' || /aborted/i.test(msg)) {
-        // Disconnected client; do not respond further
-        return;
+        // Only suppress response when the HTTP client itself actually disconnected;
+        // internal AbortSignal timeouts (e.g. fetch timeout) MUST still respond with 504.
+        if (abortController?.signal?.aborted || req.aborted || res.destroyed) {
+          return;
+        }
+        status = 504;
       }
 
-      return res.status(status).json({ ok: false, error: msg || 'command_failed', code });
+      return res.status(status).json({ ok: false, error: msg || 'command_failed', code: code || (status === 504 ? 'ETIMEDOUT' : null) });
     } finally {
       if (onClose) {
         res.removeListener('close', onClose);

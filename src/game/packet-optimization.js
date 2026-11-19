@@ -36,8 +36,13 @@ function attachEarlyPacketDropFilter(bot) {
       if (ENTITY_UPDATE_EVENTS.has(name)) {
         const packet = args[0];
         const botId = bot?.entity?.id;
-        if (botId && packet && packet.entityId !== undefined && packet.entityId === botId) {
-          return originalEmit.apply(this, [name, ...args]);
+        if (botId !== undefined && botId !== null && packet) {
+          if (packet.entityId !== undefined && packet.entityId === botId) {
+            return originalEmit.apply(this, [name, ...args]);
+          }
+          if (name === 'set_passengers' && Array.isArray(packet.passengers) && packet.passengers.includes(botId)) {
+            return originalEmit.apply(this, [name, ...args]);
+          }
         }
         return false;
       }
@@ -64,7 +69,7 @@ function enforceZeroFarmEntities(bot) {
       if (!bot.entities || typeof bot.entities !== 'object') return;
       const botId = bot.entity?.id;
       for (const id in bot.entities) {
-        if (botId && Number(id) === botId) continue;
+        if (botId !== undefined && botId !== null && Number(id) === botId) continue;
         const ent = bot.entities[id];
         if (ent && ent !== bot.entity) {
           if (ent.metadata) ent.metadata = [];
