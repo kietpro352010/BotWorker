@@ -23,6 +23,20 @@ const FOOD_ITEM_NAMES = new Set([
   'golden_carrot', 'melon_slice', 'mushroom_stew', 'pumpkin_pie', 'rabbit_stew', 'sweet_berries'
 ]);
 
+function getVietnamClockParts(date = new Date()) {
+  const vnDate = new Date(date.getTime() + 7 * 3600 * 1000);
+  const yyyy = vnDate.getUTCFullYear();
+  const mm = String(vnDate.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(vnDate.getUTCDate()).padStart(2, '0');
+  const hh = String(vnDate.getUTCHours()).padStart(2, '0');
+  const min = String(vnDate.getUTCMinutes()).padStart(2, '0');
+  return {
+    hhmm: `${hh}:${min}`,
+    dateMinKey: `${yyyy}-${mm}-${dd} ${hh}:${min}`,
+    dayOfWeek: vnDate.getUTCDay()
+  };
+}
+
 function classifyServerText(message) {
   const text = normalize(message);
   if (/bao tri|maintenance/.test(text)) return 'maintenance';
@@ -53,6 +67,14 @@ class MinecraftSession extends EventEmitter {
     this.username = String(config.mc.username || '').trim();
     this.password = String(config.mc.password || '');
     this.afkMode = 'still';
+    this.ecoMode = true;
+    this.autoTotem = true;
+    this.antiHungry = true;
+    this.autoReconnect = Boolean(config.autoReconnect ?? true);
+    this.antiAfkKick = true;
+    this.spawnCommands = '';
+    this.autoChatSchedules = [];
+    this.botSchedules = [];
     this.proxy = config.mc.proxy;
     this.manualStop = true;
     this.restriction = null;
@@ -75,6 +97,15 @@ class MinecraftSession extends EventEmitter {
     });
     this.monitor = new ServerMonitor();
     this.isEquippingTotem = false;
+    this.isEatingFood = false;
+    this.spawnCommandTimers = new Set();
+    this.autoChatTimer = null;
+    this.autoChatDelayTimers = new Set();
+    this.autoChatLastIntervalAt = new Map();
+    this.autoChatLastFixedKey = new Map();
+    this.botScheduleTimer = null;
+    this.botScheduleLastFixedKey = new Map();
+    this.botScheduleCycleState = null;
     this.inventoryRevision = 0;
     this.inventoryUpdateTimer = null;
     this.lastInventoryStateEmitAt = 0;
@@ -315,14 +346,18 @@ class MinecraftSession extends EventEmitter {
     this.lastError = null;
     this.setState('entering', 'minecraft_spawn');
     this.monitor.attach(bot);
-    applyEcoPhysics(bot);
-    if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
-    this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 30000, radius: 2 });
+    if (this.ecoMode !== false) {
+      applyEcoPhysics(bot);
+      if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
+      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 30000, radius: 2 });
+    }
     this.navigator.onSpawn(bot);
     this.afk.mode = this.afkMode;
-    this.afk.start(bot);
+    if (this.antiAfkKick !== false) {
+      this.afk.start(bot);
+    }
 
-    // Auto Totem & Health / Death monitoring
+    // Auto Totem & Health / Death / Anti-Hungry monitoring
     bot._client?.on?.('entity_status', (packet) => {
       if (packet && packet.entityId === bot.entity?.id && packet.entityStatus === 35) {
         this.logger.info('totem_popped', { bot: this.username });
@@ -333,6 +368,7 @@ class MinecraftSession extends EventEmitter {
 
     bot.on('health', () => {
       if (bot.health <= 10) void this.fastEquipTotem(bot);
+      if (typeof bot.food === 'number' && bot.food < 16) void this.tryEatFood(bot);
     });
 
     if (bot.inventory?.on) {
@@ -358,6 +394,7 @@ class MinecraftSession extends EventEmitter {
     void this.fastEquipTotem(bot);
 
     this.startLocationMonitor(bot, generation, host);
+    this.startAutoChatLoop(bot, generation);
   }
 
   scheduleInventoryRevisionBump(bot) {
@@ -377,7 +414,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   async fastEquipTotem(bot) {
-    if (!bot || !bot.inventory || this.isEquippingTotem) return;
+    if (!bot || !bot.inventory || this.isEquippingTotem || this.autoTotem === false) return;
     const offHand = bot.inventory.slots?.[45];
     if (offHand && (offHand.name === 'totem_of_undying' || String(offHand.name).includes('totem'))) return;
 
@@ -401,12 +438,230 @@ class MinecraftSession extends EventEmitter {
       }
     } catch (err) {
       this.logger.warn('totem_equip_failed', { error: err?.message || String(err) });
-    } finally {
+      } finally {
       if (equipTimer) clearTimeout(equipTimer);
       if (this.bot === bot || !this.bot) {
         this.isEquippingTotem = false;
       }
     }
+  }
+
+  async tryEatFood(bot) {
+    if (!bot || !bot.inventory || this.antiHungry === false || this.isEatingFood || this.isEquippingTotem) return;
+    if (this.state !== 'online' || typeof bot.food !== 'number' || bot.food >= 16) return;
+    if (typeof bot.equip !== 'function' || typeof bot.consume !== 'function') return;
+
+    const items = typeof bot.inventory.items === 'function' ? bot.inventory.items() : [];
+    const allowGap = typeof bot.health === 'number' && bot.health <= 12;
+    const food = items.find((i) => i && FOOD_ITEM_NAMES.has(i.name) && (allowGap || (i.name !== 'golden_apple' && i.name !== 'enchanted_golden_apple')))
+      || (allowGap ? items.find((i) => i && FOOD_ITEM_NAMES.has(i.name)) : null);
+    if (!food) return;
+
+    let eatTimer = null;
+    try {
+      this.isEatingFood = true;
+      const eatPromise = Promise.resolve().then(async () => {
+        await bot.equip(food, 'hand');
+        await bot.consume();
+      });
+      eatPromise.catch(() => {});
+      await Promise.race([
+        eatPromise,
+        new Promise((_, reject) => {
+          eatTimer = setTimeout(() => reject(new Error('Consume food timeout')), 4500);
+          eatTimer.unref?.();
+        })
+      ]);
+      if (this.bot === bot) {
+        this.logger.info('food_consumed', { bot: this.username, item: food.name });
+      }
+    } catch (err) {
+      this.logger.debug?.('food_consume_failed', { error: err?.message || String(err) });
+    } finally {
+      if (eatTimer) clearTimeout(eatTimer);
+      if (this.bot === bot || !this.bot) {
+        this.isEatingFood = false;
+      }
+    }
+  }
+
+  runSpawnCommands(bot, generation) {
+    for (const t of this.spawnCommandTimers) clearTimeout(t);
+    this.spawnCommandTimers.clear();
+    const raw = String(this.spawnCommands || '').trim();
+    if (!raw || !bot || typeof bot.chat !== 'function') return;
+    const cmds = raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && line.length <= 256 && !isRestrictedMinecraftCommand(line)).slice(0, 15);
+    cmds.forEach((cmd, idx) => {
+      const timer = setTimeout(() => {
+        this.spawnCommandTimers.delete(timer);
+        if (this.bot !== bot || generation !== this.generation || this.manualStop || this.state !== 'online') return;
+        try {
+          bot.chat(cmd);
+          this.emit('event', { type: 'chat', message: `[${bot.username || this.username}] ${cmd}` });
+        } catch (_) {}
+      }, (idx + 1) * 1500);
+      timer.unref?.();
+      this.spawnCommandTimers.add(timer);
+    });
+  }
+
+  dispatchScheduledMessages(bot, generation, messages, delaySeconds = 2) {
+    if (!Array.isArray(messages) || !messages.length || !bot || typeof bot.chat !== 'function') return;
+    const stepMs = Math.max(0, Math.min(3600, Number(delaySeconds) || 0)) * 1000;
+    messages.slice(0, 20).forEach((rawMsg, idx) => {
+      const msg = String(rawMsg || '').replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').trim();
+      if (!msg || msg.length > 256 || isRestrictedMinecraftCommand(msg)) return;
+      const sendNow = () => {
+        if (this.bot !== bot || generation !== this.generation || this.manualStop || this.state !== 'online') return;
+        try {
+          bot.chat(msg);
+          this.emit('event', { type: 'chat', message: `[${bot.username || this.username}] ${msg}` });
+        } catch (_) {}
+      };
+      if (idx === 0 || stepMs === 0) {
+        sendNow();
+      } else {
+        const timer = setTimeout(() => {
+          this.autoChatDelayTimers.delete(timer);
+          sendNow();
+        }, idx * stepMs);
+        timer.unref?.();
+        this.autoChatDelayTimers.add(timer);
+      }
+    });
+  }
+
+  startAutoChatLoop(bot, generation) {
+    if (this.autoChatTimer) clearInterval(this.autoChatTimer);
+    this.autoChatTimer = setInterval(() => {
+      if (this.bot !== bot || generation !== this.generation || this.manualStop) {
+        if (this.autoChatTimer) clearInterval(this.autoChatTimer);
+        this.autoChatTimer = null;
+        return;
+      }
+      if (this.state !== 'online' || !Array.isArray(this.autoChatSchedules) || !this.autoChatSchedules.length) return;
+      const now = Date.now();
+      const { hhmm, dateMinKey } = getVietnamClockParts(new Date(now));
+      for (const s of this.autoChatSchedules) {
+        if (!s || s.enabled === false) continue;
+        const msgs = Array.isArray(s.messages) && s.messages.length
+          ? s.messages
+          : (s.message ? [s.message] : []);
+        if (!msgs.length) continue;
+        const schedId = String(s.id || msgs[0]);
+        if (s.mode === 'fixed') {
+          const times = Array.isArray(s.times) && s.times.length ? s.times : (s.time ? [s.time] : []);
+          if (times.includes(hhmm) && this.autoChatLastFixedKey.get(schedId) !== dateMinKey) {
+            this.autoChatLastFixedKey.set(schedId, dateMinKey);
+            this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
+          }
+        } else {
+          const intervalMs = Math.max(10, Math.min(604800, Number(s.intervalSeconds) || 3600)) * 1000;
+          const lastAt = this.autoChatLastIntervalAt.get(schedId) || this.connectedAt || now;
+          if (!this.autoChatLastIntervalAt.has(schedId)) {
+            this.autoChatLastIntervalAt.set(schedId, lastAt);
+          } else if (now - lastAt >= intervalMs) {
+            this.autoChatLastIntervalAt.set(schedId, now);
+            this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
+          }
+        }
+      }
+    }, 2000);
+    this.autoChatTimer.unref?.();
+  }
+
+  executeScheduledBotAction(action, commandText = '') {
+    const act = String(action || '').toLowerCase();
+    if (act === 'stop') {
+      if (!this.manualStop) {
+        void this.stop('scheduled_stop');
+      }
+    } else if (act === 'start') {
+      if (this.manualStop && !this.restriction && this.hasCredentials()) {
+        void this.start();
+      }
+    } else if (act === 'restart' || act === 'reconnect') {
+      if (!this.restriction && this.hasCredentials()) {
+        void this.restart();
+      }
+    } else if (act === 'command' || act === 'chat') {
+      const cmd = String(commandText || '').replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').trim();
+      if (cmd && cmd.length <= 256 && !isRestrictedMinecraftCommand(cmd) && this.state === 'online' && this.bot) {
+        try {
+          this.bot.chat(cmd);
+          this.emit('event', { type: 'chat', message: `[${this.bot.username || this.username}] ${cmd}` });
+        } catch (_) {}
+      }
+    }
+  }
+
+  syncBotScheduleLoop() {
+    const schedules = Array.isArray(this.botSchedules) ? this.botSchedules : [];
+    const hasActive = schedules.some((s) => s && s.enabled !== false && (Array.isArray(s.items) ? s.items.length > 0 : Boolean(s.time)));
+    if (!hasActive) {
+      if (this.botScheduleTimer) {
+        clearInterval(this.botScheduleTimer);
+        this.botScheduleTimer = null;
+      }
+      this.botScheduleCycleState = null;
+      return;
+    }
+
+    const first = schedules[0];
+    if (first && first.mode === 'cycle' && Array.isArray(first.items) && first.items.length > 0) {
+      const sig = JSON.stringify(first.items);
+      if (!this.botScheduleCycleState || this.botScheduleCycleState.sig !== sig) {
+        this.botScheduleCycleState = {
+          sig,
+          index: 0,
+          stepStartedAt: Date.now()
+        };
+      }
+    } else {
+      this.botScheduleCycleState = null;
+    }
+
+    if (this.botScheduleTimer) return;
+    this.botScheduleTimer = setInterval(() => {
+      const list = Array.isArray(this.botSchedules) ? this.botSchedules : [];
+      if (!list.length) return;
+      const now = Date.now();
+      const { hhmm, dateMinKey, dayOfWeek } = getVietnamClockParts(new Date(now));
+
+      for (const s of list) {
+        if (!s || s.enabled === false) continue;
+        if (Array.isArray(s.items)) {
+          if (s.mode === 'cycle' && this.botScheduleCycleState && s.items.length > 0) {
+            const idx = this.botScheduleCycleState.index % s.items.length;
+            const item = s.items[idx];
+            const waitMs = Math.max(1, Math.min(43200, Number(item?.afterMinutes) || 120)) * 60 * 1000;
+            if (now - this.botScheduleCycleState.stepStartedAt >= waitMs) {
+              this.botScheduleCycleState.index = (idx + 1) % s.items.length;
+              this.botScheduleCycleState.stepStartedAt = now;
+              this.executeScheduledBotAction(item.action, item.command);
+            }
+          } else {
+            for (const item of s.items) {
+              if (!item || item.time !== hhmm) continue;
+              const key = `${s.id || 'sched'}:${item.id || item.time}:${item.action}`;
+              if (this.botScheduleLastFixedKey.get(key) !== dateMinKey) {
+                this.botScheduleLastFixedKey.set(key, dateMinKey);
+                this.executeScheduledBotAction(item.action, item.command);
+              }
+            }
+          }
+        } else if (s.time === hhmm) {
+          const allowedDays = Array.isArray(s.days) ? s.days : [0, 1, 2, 3, 4, 5, 6];
+          if (!allowedDays.includes(dayOfWeek)) continue;
+          const key = `flat:${s.id || s.time}:${s.action}`;
+          if (this.botScheduleLastFixedKey.get(key) !== dateMinKey) {
+            this.botScheduleLastFixedKey.set(key, dateMinKey);
+            this.executeScheduledBotAction(s.action, s.command || s.message);
+          }
+        }
+      }
+    }, 5000);
+    this.botScheduleTimer.unref?.();
   }
 
   startLocationMonitor(bot, generation, host) {
@@ -446,10 +701,12 @@ class MinecraftSession extends EventEmitter {
         this.navigator.tryJoin(bot);
       } else if (kind === 'other') {
         this.auth.markAuthenticated('kingmc_world');
-        setPhysicsEnabled(bot, false, this.logger, 'kingmc_world');
+        setPhysicsEnabled(bot, this.ecoMode === false, this.logger, 'kingmc_world');
         if (this.state !== 'online') {
           this.setState('online', 'kingmc_in_game');
           this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
+          this.runSpawnCommands(bot, generation);
+          if (typeof bot.food === 'number' && bot.food < 16) void this.tryEatFood(bot);
         }
       }
     };
@@ -642,7 +899,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   scheduleReconnect(delayOverride) {
-    if (this.manualStop || !this.config.autoReconnect || this.reconnectTimer) return;
+    if (this.manualStop || !this.config.autoReconnect || this.autoReconnect === false || this.reconnectTimer) return;
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
       this.setState('maintenance', 'fixed_maintenance_window');
@@ -811,6 +1068,50 @@ class MinecraftSession extends EventEmitter {
     this.afkMode = 'still';
     this.afk.mode = 'still';
     if (Object.hasOwn(settings, 'proxyUrl')) this.proxy = parseSocksProxy(settings.proxyUrl, 'manager proxy');
+    if (Object.hasOwn(settings, 'ecoMode') && settings.ecoMode !== undefined) {
+      const prevEco = this.ecoMode;
+      this.ecoMode = Boolean(settings.ecoMode);
+      if (this.bot && prevEco !== this.ecoMode && this.state === 'online') {
+        setPhysicsEnabled(this.bot, !this.ecoMode, this.logger, 'settings_eco_mode');
+      }
+    }
+    if (Object.hasOwn(settings, 'autoTotem') && settings.autoTotem !== undefined) {
+      this.autoTotem = Boolean(settings.autoTotem);
+      if (this.autoTotem && this.bot) void this.fastEquipTotem(this.bot);
+    }
+    if (Object.hasOwn(settings, 'antiHungry') && settings.antiHungry !== undefined) {
+      this.antiHungry = Boolean(settings.antiHungry);
+      if (this.antiHungry && this.bot && typeof this.bot.food === 'number' && this.bot.food < 16) {
+        void this.tryEatFood(this.bot);
+      }
+    }
+    if (Object.hasOwn(settings, 'autoReconnect') && settings.autoReconnect !== undefined) {
+      this.autoReconnect = Boolean(settings.autoReconnect);
+      if (!this.autoReconnect && this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+    }
+    if (Object.hasOwn(settings, 'antiAfkKick') && settings.antiAfkKick !== undefined) {
+      const nextAfk = Boolean(settings.antiAfkKick);
+      if (this.antiAfkKick !== nextAfk) {
+        this.antiAfkKick = nextAfk;
+        if (this.bot) {
+          if (this.antiAfkKick) this.afk.start(this.bot);
+          else this.afk.stop();
+        }
+      }
+    }
+    if (Object.hasOwn(settings, 'spawnCommands') && settings.spawnCommands !== undefined) {
+      this.spawnCommands = String(settings.spawnCommands || '');
+    }
+    if (Object.hasOwn(settings, 'autoChatSchedules') && Array.isArray(settings.autoChatSchedules)) {
+      this.autoChatSchedules = settings.autoChatSchedules;
+    }
+    if (Object.hasOwn(settings, 'botSchedules') && Array.isArray(settings.botSchedules)) {
+      this.botSchedules = settings.botSchedules;
+      this.syncBotScheduleLoop();
+    }
   }
 
   requireManualResume(reason = 'manager_check_failed') {
@@ -1263,12 +1564,19 @@ class MinecraftSession extends EventEmitter {
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
     if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
     if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
+    if (this.autoChatTimer) clearInterval(this.autoChatTimer);
+    for (const t of this.spawnCommandTimers) clearTimeout(t);
+    this.spawnCommandTimers.clear();
+    for (const t of this.autoChatDelayTimers) clearTimeout(t);
+    this.autoChatDelayTimers.clear();
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
     this.initialLocationTimer = null;
     this.lobbyRoutineTimer = null;
     this.inventoryUpdateTimer = null;
+    this.autoChatTimer = null;
+    this.isEatingFood = false;
   }
 
   getStatus() {

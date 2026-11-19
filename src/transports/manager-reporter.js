@@ -4,12 +4,14 @@ const { redactAuditValue } = require('../game/server-auth');
 const { computeBotStateDigest } = require('../domain/worker-state');
 
 class ManagerReporter {
-  constructor({ baseUrl, workerId, secret, fetchImpl = global.fetch, logger }) {
+  constructor({ baseUrl, workerId, secret, fetchImpl = global.fetch, logger, onSettingsChanged = null }) {
     this.baseUrl = baseUrl;
     this.workerId = workerId;
     this.secret = secret;
     this.fetch = fetchImpl;
     this.logger = logger;
+    this.onSettingsChanged = typeof onSettingsChanged === 'function' ? onSettingsChanged : null;
+    this.lastSettingsRevision = null;
     this.managerLatencyMs = null;
     this.lastReportedPosition = null;
     this.lastStateDigest = null;
@@ -143,7 +145,19 @@ class ManagerReporter {
       sentAt: new Date().toISOString()
     }, { signal });
     this.recordStatusSent(meta);
+    if (response && response.settingsRevision !== undefined) {
+      this.noteSettingsRevision(response.settingsRevision);
+    }
     return response;
+  }
+
+  noteSettingsRevision(rev) {
+    if (rev === undefined || rev === null) return;
+    const prev = this.lastSettingsRevision;
+    this.lastSettingsRevision = rev;
+    if (prev !== null && prev !== rev && this.onSettingsChanged && !this.stopping) {
+      void Promise.resolve().then(() => this.onSettingsChanged(rev)).catch(() => {});
+    }
   }
 
   async bootstrap({ signal } = {}) {
@@ -164,6 +178,9 @@ class ManagerReporter {
       const err = new Error(body?.error || `manager_http_${response.status}`);
       err.status = response.status;
       throw err;
+    }
+    if (body.settingsRevision !== undefined) {
+      this.lastSettingsRevision = body.settingsRevision;
     }
     return body;
   }

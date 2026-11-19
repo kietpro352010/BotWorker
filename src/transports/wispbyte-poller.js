@@ -196,6 +196,9 @@ class WispbytePoller {
           status: prepared.payload, waitMs: 25000, sentAt: new Date().toISOString()
         });
         this.reporter?.recordStatusSent?.(prepared);
+        if (response && response.settingsRevision !== undefined) {
+          this.reporter?.noteSettingsRevision?.(response.settingsRevision);
+        }
         this.failures = 0;
         if (this.consecutiveAuthFailures > 0 || this.authPaused) {
           this.logger?.info?.('worker_auth_recovered', { previousAuthFailures: this.consecutiveAuthFailures });

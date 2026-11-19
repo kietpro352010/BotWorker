@@ -78,6 +78,9 @@ class WorkerFleet {
         }
         return state;
       };
+      reporter.onSettingsChanged = () => refreshManagerConfig().catch((err) => {
+        botLogger.debug?.('worker_live_settings_refresh_failed', { error: err?.message });
+      });
       const runtime = new WorkerRuntime(session, botConfig, botLogger, { refreshManagerConfig });
       const poller = botConfig.transport === 'wispbyte-poll'
         ? new WispbytePoller({ config: botConfig, runtime, reporter, logger: botLogger, fetchImpl }) : null;
