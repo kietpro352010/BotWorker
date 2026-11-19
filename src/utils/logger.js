@@ -22,12 +22,20 @@ function redact(value, key = '', visited = new WeakSet(), depth = 0) {
   if (Array.isArray(value)) {
     if (visited.has(value)) return '[CIRCULAR]';
     visited.add(value);
-    return value.map((item) => redact(item, key, visited, depth + 1));
+    try {
+      return value.map((item) => redact(item, key, visited, depth + 1));
+    } finally {
+      visited.delete(value);
+    }
   }
   if (value && typeof value === 'object') {
     if (visited.has(value)) return '[CIRCULAR]';
     visited.add(value);
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redact(v, k, visited, depth + 1)]));
+    try {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redact(v, k, visited, depth + 1)]));
+    } finally {
+      visited.delete(value);
+    }
   }
   if (typeof value === 'string') {
     return redactStringUrls(value);

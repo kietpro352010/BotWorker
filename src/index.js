@@ -70,8 +70,9 @@ async function main() {
     shuttingDown = true;
     if (exitCode !== 0) {
       setTimeout(() => process.exit(exitCode), 2000).unref();
+    } else {
+      setTimeout(() => process.exit(0), 2000).unref();
     }
-    setTimeout(() => process.exit(0), 2000).unref();
     clearInterval(memorySweepInterval);
     logger.info('worker_shutdown', { signal, botCount: config.botCount, exitCode });
     try {

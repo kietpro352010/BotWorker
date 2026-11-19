@@ -170,6 +170,9 @@ class WorkerFleet {
     this.state = FleetState.STARTING;
     this.stopping = false;
     this.stopController = new AbortController();
+    for (const instance of this.instances.values()) {
+      instance.reporter?.reset?.();
+    }
     this.wispbyteKeepAlive.start();
 
     for (const instance of this.instances.values()) {

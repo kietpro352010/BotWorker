@@ -28,18 +28,18 @@ function extractChatMessage(raw) {
   }
   try {
     const obj = typeof raw === 'object' ? raw : JSON.parse(str);
-    const walk = (node) => {
-      if (!node) return '';
+    const walk = (node, depth = 0) => {
+      if (!node || depth > 32) return '';
       if (typeof node === 'string') return node;
-      let text = node.text || '';
-      if (node.translate) {
+      let text = typeof node.text === 'string' ? node.text : '';
+      if (typeof node.translate === 'string') {
         text += node.translate;
       }
       if (Array.isArray(node.with)) {
-        text += node.with.map(walk).join('');
+        text += node.with.slice(0, 32).map((child) => walk(child, depth + 1)).join('');
       }
       if (Array.isArray(node.extra)) {
-        text += node.extra.map(walk).join('');
+        text += node.extra.slice(0, 64).map((child) => walk(child, depth + 1)).join('');
       }
       return text;
     };
@@ -124,6 +124,12 @@ class ServerAuth {
   setPassword(password) {
     this.password = String(password || '');
     this.authenticated = !this.enabled;
+  }
+
+  reset() {
+    this.authenticated = !this.enabled;
+    this.lastActionAt = 0;
+    this.lastAuthDnActionAt = 0;
   }
 
   isAuthenticated() { return this.authenticated; }

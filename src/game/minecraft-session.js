@@ -241,7 +241,8 @@ class MinecraftSession extends EventEmitter {
     this.navigator.clear();
     this.lastLobbyAuthAt = 0;
     this.lastAuthSendAt = 0;
-    this.auth.authenticated = !Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
+    this.auth.enabled = Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
+    this.auth.reset();
     this.state = 'connecting';
     this.lastStateAt = new Date().toISOString();
     const host = this.config.mc.hosts[this.hostIndex % this.config.mc.hosts.length];
@@ -1083,12 +1084,14 @@ class MinecraftSession extends EventEmitter {
       this.lastReconnectAttemptCount = this.reconnectAttempts;
     }
     const baseMs = Number(this.config.reconnectBaseMs) || 5000;
-    const maxMs = Number(this.config.reconnectMaxMs) || 180000;
+    const maxMs = Math.max(baseMs, Number(this.config.reconnectMaxMs) || 180000);
     const exponential = Math.min(maxMs, baseMs * (2 ** Math.min(this.reconnectAttempts - 1, 8)));
-    // Anti-cheat random spread: ±5s command jitter + 0..35% proportional spread so timing is never robotic
+    // Anti-cheat random spread: bounded ±5s jitter (scaled proportionally for sub-10s base configs) + 0..35% spread
     const proportionalSpread = Math.floor(Math.random() * (exponential * 0.35));
-    const offsetJitter = Math.floor((Math.random() * 2 - 1) * 5000);
-    const computedDelay = Math.max(2000, exponential + proportionalSpread + offsetJitter);
+    const maxOffsetMs = Math.min(5000, Math.floor(exponential * 0.5));
+    const offsetJitter = Math.floor((Math.random() * 2 - 1) * maxOffsetMs);
+    const minFloorMs = Math.min(2000, Math.max(50, baseMs));
+    const computedDelay = Math.max(minFloorMs, Math.min(maxMs + maxOffsetMs, exponential + proportionalSpread + offsetJitter));
     const delay = delayOverride !== undefined ? delayOverride : computedDelay;
     this.setState(this.state === 'maintenance' ? 'maintenance' : 'error', 'reconnect_scheduled');
     this.logger.info('minecraft_reconnect_scheduled', { delayMs: delay, attempt: this.reconnectAttempts, maxAttempts });
@@ -1194,6 +1197,8 @@ class MinecraftSession extends EventEmitter {
     this.cleanupSessionResources(bot);
     this.username = '';
     this.password = '';
+    this.proxy = null;
+    this.connectedAt = null;
     this.auth.setPassword('');
     this.reconnectAttempts = 0;
     this.reconnectCount = 0;
@@ -1264,7 +1269,14 @@ class MinecraftSession extends EventEmitter {
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return;
     this.afkMode = 'still';
     this.afk.mode = 'still';
-    if (Object.hasOwn(settings, 'proxyUrl')) this.proxy = parseSocksProxy(settings.proxyUrl, 'manager proxy');
+    if (Object.hasOwn(settings, 'proxyUrl')) {
+      try {
+        this.proxy = parseSocksProxy(settings.proxyUrl, 'manager proxy');
+      } catch (err) {
+        this.proxy = null;
+        this.logger?.warn?.('worker_invalid_manager_proxy_ignored', { error: err?.message || String(err) });
+      }
+    }
     if (Object.hasOwn(settings, 'ecoMode') && settings.ecoMode !== undefined) {
       const prevEco = this.ecoMode;
       this.ecoMode = Boolean(settings.ecoMode);
@@ -1517,7 +1529,8 @@ class MinecraftSession extends EventEmitter {
       }
     }
     if (typeof bot.toss === 'function' && payload.itemType) {
-      await bot.toss(payload.itemType, payload.metadata || null, payload.count || 1);
+      const count = Math.max(1, Math.min(640, Math.floor(Number(payload.count) || 1)));
+      await bot.toss(payload.itemType, payload.metadata || null, count);
       this.inventoryRevision += 1;
       return { ok: true, tossed: payload.itemType, inventory: this.getInventorySnapshot(bot) };
     }
@@ -1527,6 +1540,7 @@ class MinecraftSession extends EventEmitter {
   async handleInventory(payload = {}) {
     const bot = this.requireOnlineBot();
     const action = String(payload.action || 'list').toLowerCase();
+    const VALID_EQUIP_DESTINATIONS = new Set(['hand', 'head', 'torso', 'legs', 'feet', 'off-hand']);
 
     if (payload.revision !== undefined && payload.revision !== null && Number.isInteger(Number(payload.revision))) {
       if (Number(payload.revision) !== this.inventoryRevision) {
@@ -1549,12 +1563,15 @@ class MinecraftSession extends EventEmitter {
     }
 
     if (action === 'move') {
+      if (bot.currentWindow) {
+        return { ok: false, error: 'window_open', status: 409, inventory: this.getInventorySnapshot(bot) };
+      }
       const rawSrc = payload.sourceSlot ?? payload.slot;
       const rawDst = payload.destSlot ?? payload.targetSlot;
       const src = rawSrc !== undefined && rawSrc !== null && String(rawSrc).trim() !== '' ? Number(rawSrc) : NaN;
       const dst = rawDst !== undefined && rawDst !== null && String(rawDst).trim() !== '' ? Number(rawDst) : NaN;
-      if (!Number.isInteger(src) || !Number.isInteger(dst) || src < 0 || dst < 0) {
-        throw new Error('Valid sourceSlot and destSlot numbers required.');
+      if (!Number.isInteger(src) || !Number.isInteger(dst) || src < 0 || dst < 0 || src > 45 || dst > 45) {
+        throw new Error('Valid sourceSlot and destSlot numbers (0-45) required.');
       }
       if (src === dst) {
         return { ok: true, action: 'move', moved: false, inventory: this.getInventorySnapshot(bot) };
@@ -1578,8 +1595,11 @@ class MinecraftSession extends EventEmitter {
     if (action === 'equip' || action === 'wear') {
       const rawSlot = payload.slot ?? payload.sourceSlot;
       const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
-      const dest = String(payload.destination || 'hand');
-      const item = (Number.isInteger(slot) ? bot.inventory?.slots?.[slot] : null) ||
+      const dest = String(payload.destination || 'hand').trim().toLowerCase();
+      if (!VALID_EQUIP_DESTINATIONS.has(dest)) {
+        throw new Error(`Invalid equip destination: ${dest}`);
+      }
+      const item = (Number.isInteger(slot) && slot >= 0 && slot <= 45 ? bot.inventory?.slots?.[slot] : null) ||
         bot.inventory?.items?.().find(i => i.name === payload.item);
       if (item && typeof bot.equip === 'function') {
         await bot.equip(item, dest);
@@ -1590,7 +1610,10 @@ class MinecraftSession extends EventEmitter {
     }
 
     if (action === 'unequip') {
-      const dest = String(payload.destination || 'hand');
+      const dest = String(payload.destination || 'hand').trim().toLowerCase();
+      if (!VALID_EQUIP_DESTINATIONS.has(dest)) {
+        throw new Error(`Invalid unequip destination: ${dest}`);
+      }
       const beforeSlots = new Set();
       for (let s = 9; s <= 44; s++) {
         if (bot.inventory?.slots?.[s]) beforeSlots.add(s);
@@ -1641,7 +1664,11 @@ class MinecraftSession extends EventEmitter {
     const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
     const mouseButton = Number(payload.mouseButton ?? 0);
     const mode = Number(payload.mode ?? 0);
-    if (!Number.isInteger(slot)) throw new Error('Valid slot number required.');
+    const maxSlots = Array.isArray(window.slots) ? window.slots.length : 0;
+    const isValidSlot = Number.isInteger(slot) && (slot === -999 || (slot >= 0 && (maxSlots === 0 || slot < maxSlots)));
+    if (!isValidSlot) throw new Error('Valid slot number required.');
+    if (mouseButton !== 0 && mouseButton !== 1) throw new Error('Invalid mouseButton (expected 0 or 1).');
+    if (!Number.isInteger(mode) || mode < 0 || mode > 6) throw new Error('Invalid click mode (expected 0-6).');
     if (typeof bot.clickWindow === 'function') {
       await bot.clickWindow(slot, mouseButton, mode);
       this.inventoryRevision += 1;
@@ -1756,6 +1783,8 @@ class MinecraftSession extends EventEmitter {
 
   enterMaintenanceWindow() {
     this.generation += 1;
+    this.isInAfkState = false;
+    this.wasAfkBeforeDisconnect = false;
     this.clearTimers();
     if (this.manualStop || this.restriction) return;
     this.afk.stop();
@@ -1788,6 +1817,7 @@ class MinecraftSession extends EventEmitter {
     if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
     if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
     if (this.autoChatTimer) clearInterval(this.autoChatTimer);
+    if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
     for (const t of this.spawnCommandTimers) clearTimeout(t);
     this.spawnCommandTimers.clear();
     for (const t of this.autoChatDelayTimers) clearTimeout(t);
@@ -1799,6 +1829,7 @@ class MinecraftSession extends EventEmitter {
     this.lobbyRoutineTimer = null;
     this.inventoryUpdateTimer = null;
     this.autoChatTimer = null;
+    this.chunkPruneTimer = null;
     this.isEatingFood = false;
   }
 

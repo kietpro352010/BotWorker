@@ -23,7 +23,7 @@ class AfkController {
   }
 
   performMicroLookAndSwing() {
-    if (!this.active || !this.bot) return;
+    if (!this.active || !this.bot || this.bot._kbotEnded || this.bot.currentWindow) return;
     try {
       if (this.bot.entity) {
         const yaw = Number(this.bot.entity.yaw) || 0;
@@ -31,7 +31,7 @@ class AfkController {
         // Micro-rotation (+/- 0.05 radians ~ 2.8 degrees) without triggering physics lag
         const deltaYaw = (Math.random() * 0.1 - 0.05);
         if (typeof this.bot.look === 'function') {
-          this.bot.look(yaw + deltaYaw, pitch, true).catch?.(() => {});
+          Promise.resolve(this.bot.look(yaw + deltaYaw, pitch, true)).catch(() => {});
         }
         if (typeof this.bot.swingArm === 'function') {
           this.bot.swingArm('right');

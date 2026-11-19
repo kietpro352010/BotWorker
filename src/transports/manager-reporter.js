@@ -225,13 +225,17 @@ class ManagerReporter {
       if (depth >= 4) return '[truncated]';
       if (seen.has(value)) return '[circular]';
       seen.add(value);
-      if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitize(item, depth + 1, seen));
-      const output = {};
-      for (const [key, item] of Object.entries(value)) {
-        if (/(?:password|token|authorization|credentials?|secret|api[_-]?key)/i.test(key)) continue;
-        output[key] = sanitize(item, depth + 1, seen);
+      try {
+        if (Array.isArray(value)) return value.slice(0, 100).map((item) => sanitize(item, depth + 1, seen));
+        const output = {};
+        for (const [key, item] of Object.entries(value)) {
+          if (/(?:password|token|authorization|credentials?|secret|api[_-]?key)/i.test(key)) continue;
+          output[key] = sanitize(item, depth + 1, seen);
+        }
+        return output;
+      } finally {
+        seen.delete(value);
       }
-      return output;
     };
     const cleaned = sanitize(event || {});
     const sanitized = cleaned && typeof cleaned === 'object' && !Array.isArray(cleaned)
@@ -338,6 +342,11 @@ class ManagerReporter {
   async sendEvent(event) {
     this.enqueueEvent(event);
     return this.flushEventQueue();
+  }
+
+  reset() {
+    this.stopping = false;
+    this.stopController = new AbortController();
   }
 
   stop() {

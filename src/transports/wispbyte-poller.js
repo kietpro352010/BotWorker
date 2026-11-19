@@ -12,6 +12,7 @@ function cancellableSleep(ms, signal) {
       if (signal) signal.removeEventListener('abort', onAbort);
       resolve();
     }, ms);
+    timer.unref?.();
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
 }
@@ -118,7 +119,8 @@ class WispbytePoller {
           break;
         }
         if ([401, 404].includes(err.status)) {
-          await this._handleAuthFailure(err.status);
+          const authDelayMs = await this._handleAuthFailure(err.status);
+          this._lastFlushAuthDelayMs = authDelayMs;
           remaining.push(...batch.slice(i));
           break;
         }
@@ -189,7 +191,14 @@ class WispbytePoller {
   async run() {
     while (!this.stopping) {
       try {
+        this._lastFlushAuthDelayMs = 0;
         await this.flushPendingResults();
+        if (this._lastFlushAuthDelayMs > 0) {
+          const authWaitMs = this._lastFlushAuthDelayMs;
+          this._lastFlushAuthDelayMs = 0;
+          await cancellableSleep(authWaitMs, this.stopController.signal);
+          continue;
+        }
         const rawStatus = this.runtime.status();
         const prepared = (this.reporter && typeof this.reporter.prepareStatusPayload === 'function')
           ? this.reporter.prepareStatusPayload(rawStatus)
@@ -244,7 +253,7 @@ class WispbytePoller {
         } else {
           // Adaptive polling interval: 1.5s when active/transitioning, 5s-8s when steady/idle
           const stateStr = String(prepared.payload?.state || '').toLowerCase();
-          const isIdle = ['idle', 'stopped', 'disconnected', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
+          const isIdle = ['idle', 'stopped', 'disconnected', 'afk', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
           const adaptiveDelayMs = isIdle ? (5000 + Math.floor(Math.random() * 3000)) : 1500;
           await cancellableSleep(adaptiveDelayMs, this.stopController.signal);
         }

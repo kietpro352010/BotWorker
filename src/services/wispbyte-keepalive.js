@@ -8,7 +8,9 @@ function isAllowedPanelUrl(urlStr) {
   try {
     const parsed = new URL(urlStr);
     if (parsed.protocol !== 'https:') return false;
-    return parsed.hostname === 'wispbyte.com' || parsed.hostname.endsWith('.wispbyte.com');
+    if (parsed.username || parsed.password) return false;
+    const host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+    return host === 'wispbyte.com' || host.endsWith('.wispbyte.com');
   } catch {
     return false;
   }

@@ -4,10 +4,15 @@ const crypto = require('node:crypto');
 
 const STATES = Object.freeze([
   'stopped',
+  'starting',
+  'stopping',
   'connecting',
+  'reconnecting',
   'authenticating',
   'entering',
   'online',
+  'afk',
+  'afk_locked',
   'maintenance',
   'ip_limited',
   'banned',
@@ -25,6 +30,7 @@ function computeBotStateDigest(status = {}) {
   const food = Math.round(Number(status.food) || 0);
   const totems = Number(status.totemCount || 0);
   const loc = String(status.locationState || status.locationKind || 'unknown');
+  const dim = String(status.dimension || '');
   const pingBucket = Math.round((Number(status.pingMs) || 0) / 25) * 25;
   const err = String(status.lastError || status.lastKickReason || '');
   const restriction = String(status.restriction || '');
@@ -35,7 +41,7 @@ function computeBotStateDigest(status = {}) {
     ? `${status.currentWindow.title || ''}:${Array.isArray(status.currentWindow.slots) ? status.currentWindow.slots.length : 0}:${status.currentWindow.revision || 0}`
     : '';
 
-  const payload = `${stateStr}|${health}|${food}|${totems}|${loc}|${pingBucket}|${err}|${restriction}|${username}|${manuallyStopped}|${invRev}|${winSig}`;
+  const payload = `${stateStr}|${health}|${food}|${totems}|${loc}|${dim}|${pingBucket}|${err}|${restriction}|${username}|${manuallyStopped}|${invRev}|${winSig}`;
   return crypto.createHash('md5').update(payload).digest('hex').slice(0, 16);
 }
 
