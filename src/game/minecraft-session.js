@@ -16,6 +16,13 @@ const { normalizeState } = require('../domain/worker-state');
 const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, setPhysicsEnabled, startChunkPruner, stopEntityPruner } = require('./packet-optimization');
 const { TIME_ZONE, isMaintenanceWindow, nextMaintenanceBoundary } = require('../services/maintenance-window');
 
+const FOOD_ITEM_NAMES = new Set([
+  'apple', 'baked_potato', 'beetroot', 'beetroot_soup', 'bread', 'carrot',
+  'cooked_beef', 'cooked_chicken', 'cooked_cod', 'cooked_mutton', 'cooked_porkchop',
+  'cooked_salmon', 'cooked_rabbit', 'cookie', 'golden_apple', 'enchanted_golden_apple',
+  'golden_carrot', 'melon_slice', 'mushroom_stew', 'pumpkin_pie', 'rabbit_stew', 'sweet_berries'
+]);
+
 function classifyServerText(message) {
   const text = normalize(message);
   if (/bao tri|maintenance/.test(text)) return 'maintenance';
@@ -69,6 +76,8 @@ class MinecraftSession extends EventEmitter {
     this.monitor = new ServerMonitor();
     this.isEquippingTotem = false;
     this.inventoryRevision = 0;
+    this.inventoryUpdateTimer = null;
+    this.lastInventoryStateEmitAt = 0;
     this.windowRevision = 0;
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
@@ -113,6 +122,7 @@ class MinecraftSession extends EventEmitter {
       return { ok: false, error: 'credentials_missing', code: 'CREDENTIALS_MISSING', status: 422, detail: this.lastError, worker };
     }
     this.manualStop = false;
+    if (!this.maintenanceTimer) this.scheduleMaintenanceBoundary();
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
       this.clearTimers();
@@ -328,6 +338,7 @@ class MinecraftSession extends EventEmitter {
     if (bot.inventory?.on) {
       bot.inventory.on('updateSlot', (slot) => {
         if (slot === 45 || slot === 40 || !slot) void this.fastEquipTotem(bot);
+        this.scheduleInventoryRevisionBump(bot);
       });
     }
 
@@ -349,6 +360,22 @@ class MinecraftSession extends EventEmitter {
     this.startLocationMonitor(bot, generation, host);
   }
 
+  scheduleInventoryRevisionBump(bot) {
+    if (this.bot !== bot || this.manualStop) return;
+    if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
+    this.inventoryUpdateTimer = setTimeout(() => {
+      this.inventoryUpdateTimer = null;
+      if (this.bot !== bot || this.manualStop) return;
+      this.inventoryRevision += 1;
+      const now = Date.now();
+      if (now - this.lastInventoryStateEmitAt >= 2000) {
+        this.lastInventoryStateEmitAt = now;
+        this.emit('state', this.getStatus());
+      }
+    }, 350);
+    this.inventoryUpdateTimer.unref?.();
+  }
+
   async fastEquipTotem(bot) {
     if (!bot || !bot.inventory || this.isEquippingTotem) return;
     const offHand = bot.inventory.slots?.[45];
@@ -357,11 +384,17 @@ class MinecraftSession extends EventEmitter {
     const totem = bot.inventory.items().find((i) => i && (i.name === 'totem_of_undying' || String(i.name).includes('totem')));
     if (!totem) return;
 
+    let equipTimer = null;
     try {
       this.isEquippingTotem = true;
+      const equipPromise = Promise.resolve().then(() => bot.equip(totem, 'off-hand'));
+      equipPromise.catch(() => {});
       await Promise.race([
-        bot.equip(totem, 'off-hand'),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Equip totem timeout')), 5000))
+        equipPromise,
+        new Promise((_, reject) => {
+          equipTimer = setTimeout(() => reject(new Error('Equip totem timeout')), 5000);
+          equipTimer.unref?.();
+        })
       ]);
       if (this.bot === bot) {
         this.logger.info('totem_equipped_offhand', { bot: this.username });
@@ -369,7 +402,10 @@ class MinecraftSession extends EventEmitter {
     } catch (err) {
       this.logger.warn('totem_equip_failed', { error: err?.message || String(err) });
     } finally {
-      this.isEquippingTotem = false;
+      if (equipTimer) clearTimeout(equipTimer);
+      if (this.bot === bot || !this.bot) {
+        this.isEquippingTotem = false;
+      }
     }
   }
 
@@ -639,11 +675,25 @@ class MinecraftSession extends EventEmitter {
     this.manualStop = true;
     this.generation += 1;
     this.clearTimers();
+    if (this.maintenanceTimer) {
+      clearTimeout(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
     const bot = this.bot;
     this.bot = null;
     this.cleanupSessionResources(bot);
     this.setState('stopped', reason);
     if (emitEvent) this.emit('event', { type: 'stopped', reason });
+    return this.getStatus();
+  }
+
+  cancelPendingOperations(reason = 'command_timeout') {
+    if (this.inventoryUpdateTimer) {
+      clearTimeout(this.inventoryUpdateTimer);
+      this.inventoryUpdateTimer = null;
+    }
+    this.isEquippingTotem = false;
+    this.logger?.debug?.('worker_pending_operation_cancelled', { reason });
     return this.getStatus();
   }
 
@@ -705,8 +755,7 @@ class MinecraftSession extends EventEmitter {
   }
 
   hasCredentials() {
-    const isAuthRequired = Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
-    return Boolean(this.username && (!isAuthRequired || this.password));
+    return Boolean(this.username);
   }
 
   applyManagerCredentials(credentials) {
@@ -719,8 +768,7 @@ class MinecraftSession extends EventEmitter {
     if (!credentials || typeof credentials !== 'object') return false;
     const username = String(credentials.username || '').trim();
     const password = String(credentials.password ?? '');
-    const isAuthRequired = Boolean(this.config.authEnabled ?? this.config.mc?.authEnabled ?? true);
-    if (!username || username.length > 64 || (isAuthRequired && !password)) {
+    if (!username || username.length > 64) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
     this.username = username;
@@ -832,13 +880,6 @@ class MinecraftSession extends EventEmitter {
     let foodCount = 0;
     const items = [];
 
-    const FOOD_NAMES = new Set([
-      'apple', 'baked_potato', 'beetroot', 'beetroot_soup', 'bread', 'carrot',
-      'cooked_beef', 'cooked_chicken', 'cooked_cod', 'cooked_mutton', 'cooked_porkchop',
-      'cooked_salmon', 'cooked_rabbit', 'cookie', 'golden_apple', 'enchanted_golden_apple',
-      'golden_carrot', 'melon_slice', 'mushroom_stew', 'pumpkin_pie', 'rabbit_stew', 'sweet_berries'
-    ]);
-
     for (let s = 0; s <= 45; s++) {
       const it = rawSlots[s];
       if (it && it.name) {
@@ -851,14 +892,21 @@ class MinecraftSession extends EventEmitter {
         if (s !== 45) {
           if (it.name === 'totem_of_undying' || String(it.name).includes('totem')) totemCount += Number(it.count || 1);
           else if (it.name === 'golden_apple' || it.name === 'enchanted_golden_apple') goldenAppleCount += Number(it.count || 1);
-          if (FOOD_NAMES.has(it.name)) foodCount += Number(it.count || 1);
+          if (FOOD_ITEM_NAMES.has(it.name)) foodCount += Number(it.count || 1);
           if (items.length < 36) items.push({ name: it.name, count: it.count, slot: s });
         }
       }
     }
     const off = rawSlots[45];
-    if (off && (off.name === 'totem_of_undying' || String(off.name).includes('totem'))) {
-      totemCount += Number(off.count || 1);
+    if (off && off.name) {
+      if (off.name === 'totem_of_undying' || String(off.name).includes('totem')) {
+        totemCount += Number(off.count || 1);
+      } else if (off.name === 'golden_apple' || off.name === 'enchanted_golden_apple') {
+        goldenAppleCount += Number(off.count || 1);
+      }
+      if (FOOD_ITEM_NAMES.has(off.name)) {
+        foodCount += Number(off.count || 1);
+      }
     }
 
     return {
@@ -1214,17 +1262,19 @@ class MinecraftSession extends EventEmitter {
     if (this.locationTimer) clearInterval(this.locationTimer);
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
     if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
+    if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
     this.initialLocationTimer = null;
     this.lobbyRoutineTimer = null;
+    this.inventoryUpdateTimer = null;
   }
 
   getStatus() {
     const invSnapshot = this.getInventorySnapshot(this.bot);
     const winSnapshot = this.getWindowSnapshot(this.bot);
-    const monitorSnap = this.monitor.snapshot();
+    const monitorSnap = this.monitor.snapshot({ skipInventory: true });
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
       locationKind: this.lastLocationKind,
@@ -1233,6 +1283,7 @@ class MinecraftSession extends EventEmitter {
       username: this.username || 'N/A', credentialsConfigured: this.hasCredentials(),
       connected: Boolean(this.bot && this.bot.player), reconnectAttempts: this.reconnectAttempts,
       reconnectCount: this.reconnectCount,
+      connectedAt: this.connectedAt ? new Date(this.connectedAt).toISOString() : null,
       uptimeSeconds: this.connectedAt ? Math.max(0, Math.floor((Date.now() - this.connectedAt) / 1000)) : 0,
       maintenanceWindow: this.maintenanceWindow,
       maintenanceTimeZone: TIME_ZONE,
@@ -1240,9 +1291,11 @@ class MinecraftSession extends EventEmitter {
       ...this.resourceMetrics, bandwidthRxBps: this.bandwidthRxBps, bandwidthTxBps: this.bandwidthTxBps,
       restriction: this.restriction,
       ...monitorSnap,
+      totemCount: invSnapshot.totemCount,
+      goldenAppleCount: invSnapshot.goldenAppleCount,
+      foodCount: invSnapshot.foodCount,
       inventory: invSnapshot,
       currentWindow: winSnapshot,
-      items: monitorSnap.inventory,
       lastError: this.lastError, lastKickReason: this.lastKickReason, lastStateAt: this.lastStateAt
     };
   }

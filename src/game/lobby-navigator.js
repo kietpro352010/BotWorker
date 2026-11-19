@@ -139,6 +139,7 @@ class LobbyNavigator {
       this.timer = null;
       this.tryJoin(bot);
     }, Math.max(1500, this.joinDelayMs));
+    this.timer.unref?.();
   }
 
   isReadyForNavigation(bot, source) {
@@ -316,6 +317,7 @@ class LobbyNavigator {
       this.pendingMenuListener = (win) => doClickSlot24(win);
       bot.once('windowOpen', this.pendingMenuListener);
       this.pendingMenuCleanup = setTimeout(() => {
+        if (this.bot !== bot) return;
         this.clearMenuListener(bot);
         this.serverJoinBusy = false;
         try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
@@ -328,6 +330,7 @@ class LobbyNavigator {
           }
         }
       }, 5000);
+      this.pendingMenuCleanup.unref?.();
 
       // 1. Right-click selector item in hotbar
       this.transitionTo('SELECT_COMPASS');
@@ -358,6 +361,7 @@ class LobbyNavigator {
           this.logger.info('lobby_fallback_command_sent', { command: cmd });
         } catch (_) {}
       }, 400);
+      this.chatTimer.unref?.();
 
       // 3. Retry loop (up to 3 attempts)
       this.retryTimer = setTimeout(() => {
@@ -386,6 +390,7 @@ class LobbyNavigator {
           this.transitionTo('IDLE', { reason: 'exhausted' });
         }
       }, 3500);
+      this.retryTimer.unref?.();
     }
   }
 

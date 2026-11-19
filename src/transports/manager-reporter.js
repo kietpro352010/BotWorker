@@ -14,6 +14,8 @@ class ManagerReporter {
     this.lastReportedPosition = null;
     this.lastStateDigest = null;
     this.lastFullReportAt = 0;
+    this.statusSeq = 0;
+    this.lastRecordedStatusSeq = 0;
     this.eventQueue = [];
     this.eventFlushTimer = null;
     this.flushPromise = null;
@@ -64,7 +66,8 @@ class ManagerReporter {
     this.heartbeatPromise = this.flushHeartbeats({ signal }).finally(() => {
       this.heartbeatPromise = null;
       if (this.pendingHeartbeat && !this.stopping) {
-        void this.heartbeat(this.pendingHeartbeat, { signal }).catch((error) => {
+        const nextStatus = this.pendingHeartbeat;
+        void this.heartbeat(nextStatus).catch((error) => {
           this.logger?.warn?.('manager_heartbeat_failed', { workerId: this.workerId, error: error.message });
         });
       }
@@ -83,6 +86,7 @@ class ManagerReporter {
   prepareStatusPayload(status) {
     const now = Date.now();
     const raw = status && typeof status === 'object' ? status : {};
+    const seq = ++this.statusSeq;
     const digest = computeBotStateDigest(raw);
     const digestUnchanged = this.lastStateDigest === digest && (now - this.lastFullReportAt < 300000);
     const positionMoved = Boolean(raw.position && this.hasPositionMovedSignificantly(raw.position));
@@ -98,6 +102,13 @@ class ManagerReporter {
       payload.isLightweight = true;
       delete payload.inventory;
       delete payload.currentWindow;
+      delete payload.items;
+      delete payload.bandwidthRxBps;
+      delete payload.bandwidthTxBps;
+      delete payload.processStartedAt;
+      delete payload.pendingCommands;
+      delete payload.activeLifecycle;
+      delete payload.locationKind;
       if (!positionMoved) {
         delete payload.position;
         payload.positionUnchanged = true;
@@ -106,11 +117,15 @@ class ManagerReporter {
       payload.positionUnchanged = true;
     }
 
-    return { payload, digest, digestUnchanged, positionMoved, position: raw.position || null };
+    return { seq, payload, digest, digestUnchanged, positionMoved, position: raw.position || null };
   }
 
   recordStatusSent(meta) {
     if (!meta) return;
+    if (Number.isInteger(meta.seq)) {
+      if (meta.seq < this.lastRecordedStatusSeq) return;
+      this.lastRecordedStatusSeq = meta.seq;
+    }
     if (!meta.digestUnchanged) {
       this.lastStateDigest = meta.digest;
       this.lastFullReportAt = Date.now();

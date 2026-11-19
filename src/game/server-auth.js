@@ -54,13 +54,13 @@ function normalize(input) {
 }
 
 function isRestrictedMinecraftCommand(value) {
-  return /^\/\s*(?:[a-z0-9_-]+:)?(?:register|login|dn|dk|changepassword|changepass|password|unregister|email)\b/i.test(String(value || '').trim());
+  return /^\/\s*(?:[a-z0-9_-]+:)?(?:register|reg|login|l|dn|dk|changepassword|changepass|password|unregister|email)\b/i.test(String(value || '').trim());
 }
 
 function redactAuditValue(text) {
   if (typeof text !== 'string') return text;
   return text
-    .replace(/(\/(?:login|register|dn|dk|changepassword|changepass)\s+)(\S+)(\s+\S+)?/gi, '$1*** REDACTED ***')
+    .replace(/(\/(?:[a-z0-9_-]+:)?(?:login|l|register|reg|dn|dk|changepassword|changepass)\s+).+$/gim, '$1*** REDACTED ***')
     .replace(/(password\s*[:=]\s*)(\S+)/gi, '$1*** REDACTED ***');
 }
 

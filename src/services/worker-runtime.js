@@ -264,10 +264,12 @@ class WorkerRuntime {
         return await Promise.race([execPromise, execTimeoutOrAbortPromise]);
       } catch (err) {
         if (execController.signal.aborted) {
+          const reason = err?.code === 'ETIMEDOUT' ? 'command_timeout' : 'command_aborted';
           if (isLifecycle) {
             await this.cleanupAbortedLifecycle(action, err);
+          } else if (typeof this.session?.cancelPendingOperations === 'function') {
+            try { this.session.cancelPendingOperations(reason); } catch (_) {}
           } else if (typeof this.session?.abortPending === 'function') {
-            const reason = err?.code === 'ETIMEDOUT' ? 'command_timeout' : 'command_aborted';
             try { this.session.abortPending(reason); } catch (_) {}
           }
         }
@@ -285,11 +287,15 @@ class WorkerRuntime {
         }
         if (!isLifecycle) {
           // For non-lifecycle tasks, retain execution lock until task terminates (or 10s safety timeout)
+          let settleTimer = null;
           const waitSettle = Promise.race([
             execPromise ? execPromise.catch(() => {}) : Promise.resolve(),
-            new Promise((r) => { const t = setTimeout(r, 10000); t.unref?.(); })
+            new Promise((r) => { settleTimer = setTimeout(r, 10000); settleTimer.unref?.(); })
           ]);
-          waitSettle.finally(() => releaseSettleLock());
+          waitSettle.finally(() => {
+            if (settleTimer) clearTimeout(settleTimer);
+            releaseSettleLock();
+          });
         } else {
           releaseSettleLock();
         }

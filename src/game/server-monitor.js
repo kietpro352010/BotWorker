@@ -40,19 +40,36 @@ class ServerMonitor {
       bot.on('time', this.onServerTime);
     }
     this.timer = setInterval(() => {
-      if (this.ticks > 0) {
-        this.tps = Math.min(20, Math.round((this.ticks * 1000 / this.sampleMs) * 10) / 10);
-        this.ticks = 0;
-      } else if (this.tps === null) {
-        this.tps = 20;
+      if (this.lastTimeAge === null) {
+        if (this.ticks > 0) {
+          this.tps = Math.min(20, Math.round((this.ticks * 1000 / this.sampleMs) * 10) / 10);
+        } else if (this.tps === null) {
+          this.tps = 20;
+        }
       }
+      this.ticks = 0;
     }, this.sampleMs);
     this.timer.unref?.();
   }
 
-  snapshot() {
+  snapshot({ skipInventory = false } = {}) {
     const position = this.bot?.entity?.position;
     const pingMs = Number(this.bot?.player?.ping);
+
+    const base = {
+      tps: this.tps,
+      pingMs: Number.isFinite(pingMs) && pingMs >= 0 ? Math.round(pingMs) : null,
+      health: Number.isFinite(this.bot?.health) ? Math.round(this.bot.health) : 20,
+      food: Number.isFinite(this.bot?.food) ? Math.round(this.bot.food) : 20,
+      position: position && [position.x, position.y, position.z].every(Number.isFinite)
+        ? { x: Math.round(position.x * 10) / 10, y: Math.round(position.y * 10) / 10, z: Math.round(position.z * 10) / 10 }
+        : null,
+      dimension: String(this.bot?.game?.dimension || '').slice(0, 40) || null
+    };
+
+    if (skipInventory) {
+      return base;
+    }
 
     // Count Totems & Golden Apples in inventory
     let totemCount = 0;
@@ -74,23 +91,20 @@ class ServerMonitor {
       }
       // Check off-hand slot (slot 45 in 1.9+)
       const offHand = this.bot.inventory.slots?.[45];
-      if (offHand && offHand.name === 'totem_of_undying') {
-        totemCount += Number(offHand.count || 1);
+      if (offHand) {
+        if (offHand.name === 'totem_of_undying') {
+          totemCount += Number(offHand.count || 1);
+        } else if (offHand.name === 'golden_apple' || offHand.name === 'enchanted_golden_apple') {
+          goldenAppleCount += Number(offHand.count || 1);
+        }
       }
     }
 
     return {
-      tps: this.tps,
-      pingMs: Number.isFinite(pingMs) && pingMs >= 0 ? Math.round(pingMs) : null,
-      health: Number.isFinite(this.bot?.health) ? Math.round(this.bot.health) : 20,
-      food: Number.isFinite(this.bot?.food) ? Math.round(this.bot.food) : 20,
+      ...base,
       totemCount,
       goldenAppleCount,
-      inventory: itemsSummary,
-      position: position && [position.x, position.y, position.z].every(Number.isFinite)
-        ? { x: Math.round(position.x * 10) / 10, y: Math.round(position.y * 10) / 10, z: Math.round(position.z * 10) / 10 }
-        : null,
-      dimension: String(this.bot?.game?.dimension || '').slice(0, 40) || null
+      inventory: itemsSummary
     };
   }
 

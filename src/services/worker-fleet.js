@@ -13,7 +13,20 @@ const FleetState = Object.freeze({
   STOPPING: 'STOPPING'
 });
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const delay = (ms, signal) => new Promise((resolve) => {
+  if (signal?.aborted) return resolve();
+  let timer = null;
+  const onAbort = () => {
+    if (timer) clearTimeout(timer);
+    resolve();
+  };
+  timer = setTimeout(() => {
+    if (signal) signal.removeEventListener('abort', onAbort);
+    resolve();
+  }, ms);
+  timer.unref?.();
+  if (signal) signal.addEventListener('abort', onAbort, { once: true });
+});
 
 function scopeLogger(logger, workerId) {
   const scoped = {};
@@ -29,6 +42,7 @@ class WorkerFleet {
     this.logger = logger;
     this.state = FleetState.STOPPED;
     this.stopping = false;
+    this.stopController = new AbortController();
     this.heartbeatTimer = null;
     this.resourceTimer = null;
     this.lastResourceWarningAt = 0;
@@ -151,6 +165,7 @@ class WorkerFleet {
     if (this.state === FleetState.STARTING || this.state === FleetState.RUNNING || this.heartbeatTimer) return;
     this.state = FleetState.STARTING;
     this.stopping = false;
+    this.stopController = new AbortController();
     this.wispbyteKeepAlive.start();
 
     for (const instance of this.instances.values()) {
@@ -173,8 +188,9 @@ class WorkerFleet {
 
     this.heartbeatTimer = setInterval(() => {
       for (const instance of this.instances.values()) {
-        // Wispbyte poll transport already includes live status in every /poll request
-        if (instance.poller && !instance.poller.stopping && instance.poller.failures === 0) {
+        // Wispbyte poll transport already includes live status in every /poll request;
+        // also do not spam /heartbeat while poller is stopping or auth-paused
+        if (instance.poller && (instance.poller.stopping || instance.poller.authPaused || instance.poller.failures === 0)) {
           continue;
         }
         void instance.reporter.heartbeat(instance.runtime.status()).catch((error) => {
@@ -215,9 +231,9 @@ class WorkerFleet {
         const mem = process.memoryUsage();
         if (mem.rss > 440 * 1024 * 1024) {
           this.logger.warn('bot_spawn_delayed_high_memory', { rssMb: Math.round(mem.rss / (1024 * 1024)) });
-          await delay(5000);
+          await delay(5000, this.stopController.signal);
         }
-        if (position > 0) await delay(8000);
+        if (position > 0) await delay(8000, this.stopController.signal);
         if (!this.stopping && !instance.session.isHeld()) {
           await instance.runtime.execute('start', {}, { skipManagerRefresh: true }).catch((error) => {
             this.logger.warn('worker_auto_start_failed', { workerId: instance.config.workerId, error: error.message });
@@ -232,6 +248,7 @@ class WorkerFleet {
     if (this.state === FleetState.STOPPING || this.state === FleetState.STOPPED) return;
     this.state = FleetState.STOPPING;
     this.stopping = true;
+    this.stopController?.abort();
     this.wispbyteKeepAlive.stop();
     for (const timer of this.bootstrapRetryTimers.values()) clearTimeout(timer);
     this.bootstrapRetryTimers.clear();

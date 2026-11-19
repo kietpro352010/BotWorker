@@ -4,6 +4,15 @@ const express = require('express');
 const { requireWorkerSecret, safeEqual, extractWorkerToken } = require('./auth');
 const { ACTIONS } = require('../services/worker-runtime');
 
+function matchesBotSecret(supplied, bot) {
+  if (!supplied || !bot) return false;
+  if (bot.secret && safeEqual(supplied, bot.secret)) return true;
+  if (bot.previousSecret && Date.now() < (Number(bot.graceUntil) || 0) && safeEqual(supplied, bot.previousSecret)) {
+    return true;
+  }
+  return false;
+}
+
 function attachBotRoutes(router, fleet, workerId, { legacy = false, config = null } = {}) {
   // RT-04: Secure instance resolution avoiding workerId enumeration
   const resolveInstance = (req, res, next) => {
@@ -20,10 +29,10 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false, config = nul
     const instance = typeof fleet?.get === 'function' ? fleet.get(targetId) : null;
 
     if (!instance) {
-      const knownSecrets = (config?.bots && Array.isArray(config.bots))
-        ? config.bots.map((b) => b?.secret).filter(Boolean)
-        : (typeof fleet?.list === 'function' ? fleet.list() : []).map((i) => i?.config?.secret).filter(Boolean);
-      const isKnownCaller = knownSecrets.some((s) => safeEqual(supplied, s));
+      const knownBots = (config?.bots && Array.isArray(config.bots))
+        ? config.bots
+        : (typeof fleet?.list === 'function' ? fleet.list() : []).map((i) => i?.config).filter(Boolean);
+      const isKnownCaller = knownBots.some((b) => matchesBotSecret(supplied, b));
 
       if (!isKnownCaller) {
         return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -167,7 +176,7 @@ function createRouter({ fleet, config }) {
 
   router.get('/api/v1/diagnostics', (req, res) => {
     const secret = extractWorkerToken(req);
-    const authed = Array.isArray(config?.bots) && config.bots.some((b) => safeEqual(secret, b.secret));
+    const authed = Array.isArray(config?.bots) && config.bots.some((b) => matchesBotSecret(secret, b));
     if (!authed) return res.status(401).json({ ok: false, error: 'unauthorized' });
     return res.json({
       ok: true,

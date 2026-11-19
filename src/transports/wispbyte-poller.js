@@ -17,7 +17,7 @@ function cancellableSleep(ms, signal) {
 }
 
 class WispbytePoller {
-  constructor({ config, runtime, reporter, logger, fetchImpl = global.fetch }) {
+  constructor({ config, runtime, reporter, logger, fetchImpl = global.fetch, authFailureThreshold = 5, authBackoffScheduleMs = [15000, 30000, 60000, 120000, 300000] }) {
     this.config = config;
     this.runtime = runtime;
     this.reporter = reporter;
@@ -26,6 +26,12 @@ class WispbytePoller {
     this.stopping = false;
     this.loopPromise = null;
     this.failures = 0;
+    this.consecutiveAuthFailures = 0;
+    this.authPaused = false;
+    this.authFailureThreshold = Math.max(1, Number(authFailureThreshold) || 5);
+    this.authBackoffScheduleMs = Array.isArray(authBackoffScheduleMs) && authBackoffScheduleMs.length
+      ? authBackoffScheduleMs
+      : [15000, 30000, 60000, 120000, 300000];
     this.activeController = null;
     this.activeControllers = new Set();
     this.stopController = new AbortController();
@@ -37,9 +43,32 @@ class WispbytePoller {
   start() {
     if (this.loopPromise) return this.loopPromise;
     this.stopping = false;
+    this.consecutiveAuthFailures = 0;
+    this.authPaused = false;
     this.stopController = new AbortController();
     this.loopPromise = this.run().finally(() => { this.loopPromise = null; });
     return this.loopPromise;
+  }
+
+  async _handleAuthFailure(status) {
+    this.consecutiveAuthFailures += 1;
+    const idx = Math.min(this.consecutiveAuthFailures - 1, this.authBackoffScheduleMs.length - 1);
+    const delayMs = this.authBackoffScheduleMs[idx] || 300000;
+    this.logger?.warn?.('worker_auth_check_failed', {
+      status,
+      consecutiveAuthFailures: this.consecutiveAuthFailures,
+      threshold: this.authFailureThreshold,
+      retryInMs: delayMs
+    });
+    if (this.consecutiveAuthFailures >= this.authFailureThreshold && !this.authPaused) {
+      this.authPaused = true;
+      this.logger?.error?.('worker_registration_lost', {
+        status,
+        consecutiveAuthFailures: this.consecutiveAuthFailures
+      });
+      await this.runtime?.execute?.('stop').catch(() => {});
+    }
+    return delayMs;
   }
 
   enqueueResult(resultPayload) {
@@ -88,9 +117,8 @@ class WispbytePoller {
           break;
         }
         if ([401, 404].includes(err.status)) {
-          this.logger.error('worker_registration_lost', { status: err.status });
-          this.stopping = true;
-          await this.runtime.execute('stop').catch(() => {});
+          await this._handleAuthFailure(err.status);
+          remaining.push(item);
           break;
         }
         if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
@@ -169,6 +197,11 @@ class WispbytePoller {
         });
         this.reporter?.recordStatusSent?.(prepared);
         this.failures = 0;
+        if (this.consecutiveAuthFailures > 0 || this.authPaused) {
+          this.logger?.info?.('worker_auth_recovered', { previousAuthFailures: this.consecutiveAuthFailures });
+          this.consecutiveAuthFailures = 0;
+          this.authPaused = false;
+        }
         if (response.command?.action) {
           const command = response.command;
           let result;
@@ -204,10 +237,9 @@ class WispbytePoller {
       } catch (error) {
         if (this.stopping) break;
         if ([401, 404].includes(error.status)) {
-          this.logger.error('worker_registration_lost', { status: error.status });
-          this.stopping = true;
-          await this.runtime.execute('stop').catch(() => {});
-          break;
+          const authDelayMs = await this._handleAuthFailure(error.status);
+          await cancellableSleep(authDelayMs, this.stopController.signal);
+          continue;
         }
         this.failures += 1;
         this.logger.warn('wispbyte_poll_failed', { failures: this.failures, error: error.message });

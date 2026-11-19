@@ -1,6 +1,7 @@
 'use strict';
 
 const { isIP } = require('node:net');
+const dns = require('node:dns').promises;
 
 function decodeIpv4Mapped(host) {
   const match = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
@@ -52,12 +53,43 @@ function parseSocksProxy(value, label = 'MC_PROXY_URL') {
     throw new Error(`${label} must use socks5://host:port with optional username and password.`);
   }
   if (isLocalOrPrivateHost(parsed.hostname)) throw new Error(`${label} cannot target a local or private network address.`);
-  const username = decodeURIComponent(parsed.username || '');
-  const password = decodeURIComponent(parsed.password || '');
+  let username = '';
+  let password = '';
+  try {
+    username = decodeURIComponent(parsed.username || '');
+    password = decodeURIComponent(parsed.password || '');
+  } catch {
+    throw new Error(`${label} credentials contain invalid percent-encoding.`);
+  }
   if (username.length > 255 || password.length > 255 || /[\u0000-\u001f\u007f]/.test(username + password)) {
     throw new Error(`${label} credentials are invalid.`);
   }
   return Object.freeze({ host: parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.+$/, ''), port, username, password });
+}
+
+async function assertPublicProxyHost(host, label = 'MC_PROXY_URL') {
+  const cleanHost = String(host || '').replace(/^\[|\]$/g, '').replace(/\.+$/, '');
+  if (!cleanHost || isLocalOrPrivateHost(cleanHost)) {
+    throw new Error(`${label} cannot target a local or private network address.`);
+  }
+  if (isIP(cleanHost)) return cleanHost;
+  let records;
+  try {
+    records = await dns.lookup(cleanHost, { all: true, verbatim: true });
+  } catch (err) {
+    const wrapped = new Error(`${label} hostname resolution failed: ${err?.code || err?.message || 'dns_error'}`);
+    wrapped.code = err?.code || 'ENOTFOUND';
+    throw wrapped;
+  }
+  if (!Array.isArray(records) || records.length === 0) {
+    throw new Error(`${label} hostname resolved to no addresses.`);
+  }
+  for (const rec of records) {
+    if (!rec?.address || isLocalOrPrivateHost(rec.address)) {
+      throw new Error(`${label} resolved to a local or private network address.`);
+    }
+  }
+  return records[0].address;
 }
 
 function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } = {}) {
@@ -95,46 +127,52 @@ function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } =
     }, safeTimeoutMs);
     timer.unref?.();
 
-    const proxyOptions = {
-      proxy: {
-        host: proxy.host,
-        port: proxy.port,
-        type: 5,
-        ...(proxy.username ? { userId: proxy.username, password: proxy.password } : {})
-      },
-      command: 'connect',
-      destination: { host, port },
-      timeout: safeTimeoutMs
-    };
+    void (async () => {
+      try {
+        const resolvedIp = await assertPublicProxyHost(proxy.host, 'SOCKS5 proxy');
+        if (finished) return;
+        const proxyOptions = {
+          proxy: {
+            host: resolvedIp,
+            port: proxy.port,
+            type: 5,
+            ...(proxy.username ? { userId: proxy.username, password: proxy.password } : {})
+          },
+          command: 'connect',
+          destination: { host, port },
+          timeout: safeTimeoutMs
+        };
 
-    try {
-      SocksClient.createConnection(proxyOptions, (error, info) => {
-        if (finished) {
-          if (info?.socket) {
-            try { info.socket.destroy(); } catch (_) {}
+        SocksClient.createConnection(proxyOptions, (error, info) => {
+          if (finished) {
+            if (info?.socket) {
+              try { info.socket.destroy(); } catch (_) {}
+            }
+            return;
           }
-          return;
-        }
+          finished = true;
+          cleanup();
+
+          if (error) {
+            if (info?.socket) {
+              try { info.socket.destroy(); } catch (_) {}
+            }
+            queueMicrotask(() => client.emit('error', error));
+            return;
+          }
+
+          client.setSocket(info.socket);
+          client.emit('connect');
+        });
+      } catch (err) {
+        if (finished) return;
         finished = true;
         cleanup();
-
-        if (error) {
-          if (info?.socket) {
-            try { info.socket.destroy(); } catch (_) {}
-          }
-          queueMicrotask(() => client.emit('error', error));
-          return;
-        }
-
-        client.setSocket(info.socket);
-        client.emit('connect');
-      });
-    } catch (err) {
-      finished = true;
-      cleanup();
-      queueMicrotask(() => client.emit('error', err));
-    }
+        logger?.warn?.('socks_proxy_rejected', { host: proxy.host, error: err?.message });
+        queueMicrotask(() => client.emit('error', err));
+      }
+    })();
   };
 }
 
-module.exports = { parseSocksProxy, isLocalOrPrivateHost, createSocksConnector };
+module.exports = { parseSocksProxy, isLocalOrPrivateHost, assertPublicProxyHost, createSocksConnector };
