@@ -30,11 +30,40 @@ function getVietnamClockParts(date = new Date()) {
   const dd = String(vnDate.getUTCDate()).padStart(2, '0');
   const hh = String(vnDate.getUTCHours()).padStart(2, '0');
   const min = String(vnDate.getUTCMinutes()).padStart(2, '0');
+  const dateStr = `${yyyy}-${mm}-${dd}`;
   return {
+    dateStr,
     hhmm: `${hh}:${min}`,
-    dateMinKey: `${yyyy}-${mm}-${dd} ${hh}:${min}`,
+    dateMinKey: `${dateStr} ${hh}:${min}`,
+    minuteOfDay: vnDate.getUTCHours() * 60 + vnDate.getUTCMinutes(),
     dayOfWeek: vnDate.getUTCDay()
   };
+}
+
+function applyCommandJitterMs(baseMs, maxOffsetMs = 5000, minFloorMs = 600) {
+  const base = Math.max(0, Number(baseMs) || 0);
+  const offset = Math.floor((Math.random() * 2 - 1) * maxOffsetMs);
+  return Math.max(minFloorMs, base + offset);
+}
+
+function applyScheduleJitterMs(baseMinutes, maxOffsetMinutes = 15, minFloorMs = 60000) {
+  const baseMs = Math.max(1, Math.min(43200, Number(baseMinutes) || 120)) * 60 * 1000;
+  const maxOffsetMs = Math.min(maxOffsetMinutes * 60 * 1000, Math.floor(baseMs * 0.75));
+  const offsetMs = Math.floor((Math.random() * 2 - 1) * maxOffsetMs);
+  return Math.max(minFloorMs, baseMs + offsetMs);
+}
+
+function parseHhmmToMinutes(hhmm) {
+  const m = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(String(hhmm || '').trim());
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+}
+
+function formatMinutesToHhmm(totalMinutes) {
+  const wrapped = ((Math.round(totalMinutes) % 1440) + 1440) % 1440;
+  const hh = String(Math.floor(wrapped / 60)).padStart(2, '0');
+  const mm = String(wrapped % 60).padStart(2, '0');
+  return `${hh}:${mm}`;
 }
 
 function classifyServerText(message) {
@@ -105,7 +134,13 @@ class MinecraftSession extends EventEmitter {
     this.autoChatLastFixedKey = new Map();
     this.botScheduleTimer = null;
     this.botScheduleLastFixedKey = new Map();
+    this.botScheduleDailyJitter = new Map();
     this.botScheduleCycleState = null;
+    this.isInAfkState = false;
+    this.wasAfkBeforeDisconnect = false;
+    this.lastReconnectAttemptCount = 0;
+    this.maxReconnectAttempts = Number(config.reconnectMaxAttempts) || 8;
+    this.nextAuthAllowedAt = 0;
     this.inventoryRevision = 0;
     this.inventoryUpdateTimer = null;
     this.lastInventoryStateEmitAt = 0;
@@ -490,8 +525,13 @@ class MinecraftSession extends EventEmitter {
     this.spawnCommandTimers.clear();
     const raw = String(this.spawnCommands || '').trim();
     if (!raw || !bot || typeof bot.chat !== 'function') return;
-    const cmds = raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0 && line.length <= 256 && !isRestrictedMinecraftCommand(line)).slice(0, 15);
+    const cmds = raw.split(/[\r\n;]+/).map((line) => line.trim()).filter((line) => line.length > 0 && line.length <= 256 && !isRestrictedMinecraftCommand(line)).slice(0, 15);
+    let prevDelayMs = 0;
     cmds.forEach((cmd, idx) => {
+      // Base milestone: (idx + 1) * 5000ms with ±5000ms anti-cheat jitter, strictly ordered
+      const jittered = applyCommandJitterMs((idx + 1) * 5000, 5000, 800);
+      const delayMs = Math.max(prevDelayMs + 800, jittered);
+      prevDelayMs = delayMs;
       const timer = setTimeout(() => {
         this.spawnCommandTimers.delete(timer);
         if (this.bot !== bot || generation !== this.generation || this.manualStop || this.state !== 'online') return;
@@ -499,7 +539,7 @@ class MinecraftSession extends EventEmitter {
           bot.chat(cmd);
           this.emit('event', { type: 'chat', message: `[${bot.username || this.username}] ${cmd}` });
         } catch (_) {}
-      }, (idx + 1) * 1500);
+      }, delayMs);
       timer.unref?.();
       this.spawnCommandTimers.add(timer);
     });
@@ -508,6 +548,7 @@ class MinecraftSession extends EventEmitter {
   dispatchScheduledMessages(bot, generation, messages, delaySeconds = 2) {
     if (!Array.isArray(messages) || !messages.length || !bot || typeof bot.chat !== 'function') return;
     const stepMs = Math.max(0, Math.min(3600, Number(delaySeconds) || 0)) * 1000;
+    let prevDelayMs = 0;
     messages.slice(0, 20).forEach((rawMsg, idx) => {
       const msg = String(rawMsg || '').replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').trim();
       if (!msg || msg.length > 256 || isRestrictedMinecraftCommand(msg)) return;
@@ -521,10 +562,13 @@ class MinecraftSession extends EventEmitter {
       if (idx === 0 || stepMs === 0) {
         sendNow();
       } else {
+        const jittered = applyCommandJitterMs(idx * stepMs, 5000, 500);
+        const delayMs = Math.max(prevDelayMs + 500, jittered);
+        prevDelayMs = delayMs;
         const timer = setTimeout(() => {
           this.autoChatDelayTimers.delete(timer);
           sendNow();
-        }, idx * stepMs);
+        }, delayMs);
         timer.unref?.();
         this.autoChatDelayTimers.add(timer);
       }
@@ -556,7 +600,8 @@ class MinecraftSession extends EventEmitter {
             this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
           }
         } else {
-          const intervalMs = Math.max(10, Math.min(604800, Number(s.intervalSeconds) || 3600)) * 1000;
+          const baseIntervalMs = Math.max(10, Math.min(604800, Number(s.intervalSeconds) || 3600)) * 1000;
+          const intervalMs = applyCommandJitterMs(baseIntervalMs, 5000, 5000);
           const lastAt = this.autoChatLastIntervalAt.get(schedId) || this.connectedAt || now;
           if (!this.autoChatLastIntervalAt.has(schedId)) {
             this.autoChatLastIntervalAt.set(schedId, lastAt);
@@ -595,6 +640,36 @@ class MinecraftSession extends EventEmitter {
     }
   }
 
+  resolveDailyJitteredHhmm(scheduleKey, baseHhmm, dateStr, currentMinOfDay) {
+    const baseMin = parseHhmmToMinutes(baseHhmm);
+    if (baseMin === null) return baseHhmm;
+    const cacheKey = `${dateStr}:${scheduleKey}:${baseHhmm}`;
+    let cached = this.botScheduleDailyJitter.get(cacheKey);
+    if (!cached) {
+      // ±15 minutes random anti-cheat offset around configured fixed schedule time
+      let minOffset = -15;
+      if (Number.isInteger(currentMinOfDay) && baseMin >= currentMinOfDay && baseMin - 15 < currentMinOfDay) {
+        // Clamp lower bound so newly created/booted schedule near target time still runs today
+        minOffset = Math.max(-15, currentMinOfDay - baseMin);
+      }
+      const span = 15 - minOffset + 1;
+      const offsetMin = minOffset + Math.floor(Math.random() * Math.max(1, span));
+      const effectiveHhmm = formatMinutesToHhmm(baseMin + offsetMin);
+      cached = { effectiveHhmm, offsetMin };
+      if (this.botScheduleDailyJitter.size > 200) {
+        this.botScheduleDailyJitter.clear();
+      }
+      this.botScheduleDailyJitter.set(cacheKey, cached);
+      this.logger?.info?.('bot_schedule_daily_jitter_assigned', {
+        scheduleKey,
+        baseTime: baseHhmm,
+        effectiveTime: effectiveHhmm,
+        offsetMinutes: offsetMin
+      });
+    }
+    return cached.effectiveHhmm;
+  }
+
   syncBotScheduleLoop() {
     const schedules = Array.isArray(this.botSchedules) ? this.botSchedules : [];
     const hasActive = schedules.some((s) => s && s.enabled !== false && (Array.isArray(s.items) ? s.items.length > 0 : Boolean(s.time)));
@@ -611,10 +686,12 @@ class MinecraftSession extends EventEmitter {
     if (first && first.mode === 'cycle' && Array.isArray(first.items) && first.items.length > 0) {
       const sig = JSON.stringify(first.items);
       if (!this.botScheduleCycleState || this.botScheduleCycleState.sig !== sig) {
+        const firstWaitMs = applyScheduleJitterMs(first.items[0]?.afterMinutes || 120, 15, 60000);
         this.botScheduleCycleState = {
           sig,
           index: 0,
-          stepStartedAt: Date.now()
+          stepStartedAt: Date.now(),
+          targetWaitMs: firstWaitMs
         };
       }
     } else {
@@ -626,7 +703,7 @@ class MinecraftSession extends EventEmitter {
       const list = Array.isArray(this.botSchedules) ? this.botSchedules : [];
       if (!list.length) return;
       const now = Date.now();
-      const { hhmm, dateMinKey, dayOfWeek } = getVietnamClockParts(new Date(now));
+      const { dateStr, hhmm, dateMinKey, minuteOfDay, dayOfWeek } = getVietnamClockParts(new Date(now));
 
       for (const s of list) {
         if (!s || s.enabled === false) continue;
@@ -634,28 +711,42 @@ class MinecraftSession extends EventEmitter {
           if (s.mode === 'cycle' && this.botScheduleCycleState && s.items.length > 0) {
             const idx = this.botScheduleCycleState.index % s.items.length;
             const item = s.items[idx];
-            const waitMs = Math.max(1, Math.min(43200, Number(item?.afterMinutes) || 120)) * 60 * 1000;
+            const waitMs = Number(this.botScheduleCycleState.targetWaitMs)
+              || applyScheduleJitterMs(item?.afterMinutes || 120, 15, 60000);
             if (now - this.botScheduleCycleState.stepStartedAt >= waitMs) {
-              this.botScheduleCycleState.index = (idx + 1) % s.items.length;
+              const nextIdx = (idx + 1) % s.items.length;
+              const nextItem = s.items[nextIdx];
+              this.botScheduleCycleState.index = nextIdx;
               this.botScheduleCycleState.stepStartedAt = now;
+              this.botScheduleCycleState.targetWaitMs = applyScheduleJitterMs(nextItem?.afterMinutes || 120, 15, 60000);
               this.executeScheduledBotAction(item.action, item.command);
             }
           } else {
             for (const item of s.items) {
-              if (!item || item.time !== hhmm) continue;
+              if (!item || !item.time) continue;
               const key = `${s.id || 'sched'}:${item.id || item.time}:${item.action}`;
-              if (this.botScheduleLastFixedKey.get(key) !== dateMinKey) {
-                this.botScheduleLastFixedKey.set(key, dateMinKey);
+              const effectiveHhmm = s.disableJitter
+                ? item.time
+                : this.resolveDailyJitteredHhmm(key, item.time, dateStr, minuteOfDay);
+              if (effectiveHhmm !== hhmm) continue;
+              const dayExecutionKey = `${dateStr}:${key}`;
+              if (this.botScheduleLastFixedKey.get(key) !== dayExecutionKey) {
+                this.botScheduleLastFixedKey.set(key, dayExecutionKey);
                 this.executeScheduledBotAction(item.action, item.command);
               }
             }
           }
-        } else if (s.time === hhmm) {
+        } else if (s.time) {
           const allowedDays = Array.isArray(s.days) ? s.days : [0, 1, 2, 3, 4, 5, 6];
           if (!allowedDays.includes(dayOfWeek)) continue;
           const key = `flat:${s.id || s.time}:${s.action}`;
-          if (this.botScheduleLastFixedKey.get(key) !== dateMinKey) {
-            this.botScheduleLastFixedKey.set(key, dateMinKey);
+          const effectiveHhmm = s.disableJitter
+            ? s.time
+            : this.resolveDailyJitteredHhmm(key, s.time, dateStr, minuteOfDay);
+          if (effectiveHhmm !== hhmm) continue;
+          const dayExecutionKey = `${dateStr}:${key}`;
+          if (this.botScheduleLastFixedKey.get(key) !== dayExecutionKey) {
+            this.botScheduleLastFixedKey.set(key, dayExecutionKey);
             this.executeScheduledBotAction(s.action, s.command || s.message);
           }
         }
@@ -667,6 +758,7 @@ class MinecraftSession extends EventEmitter {
   startLocationMonitor(bot, generation, host) {
     if (this.locationTimer) clearInterval(this.locationTimer);
     this.lastLocationKind = 'unknown';
+    this.nextAuthAllowedAt = Date.now() + applyCommandJitterMs(3000, 5000, 800);
 
     const check = () => {
       if (this.bot !== bot || generation !== this.generation || this.manualStop) {
@@ -681,8 +773,9 @@ class MinecraftSession extends EventEmitter {
       if (kind === 'login') {
         if (this.state !== 'authenticating') this.setState('authenticating', 'auth_lobby');
         const now = Date.now();
-        if (!this.auth.isAuthenticated() && now - this.lastAuthSendAt >= 1500) {
+        if (!this.auth.isAuthenticated() && now >= this.nextAuthAllowedAt && now - this.lastAuthSendAt >= 1500) {
           this.lastAuthSendAt = now;
+          this.nextAuthAllowedAt = now + applyCommandJitterMs(5000, 5000, 1500);
           if (prevKind === 'login') {
             this.auth.sendDirectAuth(bot, 'dn');
           } else {
@@ -694,8 +787,9 @@ class MinecraftSession extends EventEmitter {
         if (this.state !== 'entering') this.setState('entering', 'server_lobby');
         setPhysicsEnabled(bot, true, this.logger, 'kingmc_lobby');
         const now = Date.now();
-        if (!this.auth.isAuthenticated() && now - this.lastAuthSendAt >= 3000) {
+        if (!this.auth.isAuthenticated() && now >= this.nextAuthAllowedAt && now - this.lastAuthSendAt >= 3000) {
           this.lastAuthSendAt = now;
+          this.nextAuthAllowedAt = now + applyCommandJitterMs(5500, 5000, 2000);
           this.auth.sendDirectAuth(bot, 'dn');
         }
         this.navigator.tryJoin(bot);
@@ -703,8 +797,21 @@ class MinecraftSession extends EventEmitter {
         this.auth.markAuthenticated('kingmc_world');
         setPhysicsEnabled(bot, this.ecoMode === false, this.logger, 'kingmc_world');
         if (this.state !== 'online') {
+          const recoveredFromAfkDrop = this.wasAfkBeforeDisconnect;
+          const attemptsTaken = Math.max(1, this.lastReconnectAttemptCount || 1);
+          this.isInAfkState = true;
+          this.wasAfkBeforeDisconnect = false;
+          this.lastReconnectAttemptCount = 0;
           this.setState('online', 'kingmc_in_game');
           this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
+          if (recoveredFromAfkDrop) {
+            this.emit('event', {
+              type: 'afk_recovered',
+              host,
+              attempts: attemptsTaken,
+              message: `Bot đã tự kết nối lại và vào lại khu vực AFK thành công (sau ${attemptsTaken} lần thử).`
+            });
+          }
           this.runSpawnCommands(bot, generation);
           if (typeof bot.food === 'number' && bot.food < 16) void this.tryEatFood(bot);
         }
@@ -763,12 +870,13 @@ class MinecraftSession extends EventEmitter {
             this.lastLobbyAuthAt = now;
             this.auth.sendDirectAuth(bot, 'dn');
             if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
+            const menuDelayMs = applyCommandJitterMs(5000, 5000, 1200);
             this.lobbyRoutineTimer = setTimeout(() => {
               this.lobbyRoutineTimer = null;
               if (this.bot === bot) {
                 this.navigator.triggerServerJoin(bot, 'lobby_chat_confirmed');
               }
-            }, 2500);
+            }, menuDelayMs);
             this.lobbyRoutineTimer.unref?.();
           }
           return;
@@ -784,12 +892,23 @@ class MinecraftSession extends EventEmitter {
     this.lastKickReason = safeText.slice(0, 300);
     const isVerificationKick = isVerificationSuccessNotice(text);
     const classification = classifyServerText(text);
+    const wasInAfk = this.isInAfkState === true && !this.manualStop && !isVerificationKick;
 
     this.emit('event', {
       type: 'kicked',
       reason: this.lastKickReason,
       message: this.lastKickReason
     });
+
+    if (wasInAfk) {
+      this.isInAfkState = false;
+      this.wasAfkBeforeDisconnect = true;
+      this.emit('event', {
+        type: 'afk_kicked',
+        reason: this.lastKickReason || 'Bị kick khi đang treo AFK',
+        message: `Bot đang treo AFK thì bị kick khỏi máy chủ: ${this.lastKickReason || 'Không rõ lý do'}`
+      });
+    }
 
     if (classification === 'ip_limited' || classification === 'banned') {
       this.pauseForRestriction(classification, safeText);
@@ -799,7 +918,7 @@ class MinecraftSession extends EventEmitter {
       this.logger.info('kingmc_verification_kick_detected', { text: this.lastKickReason });
       this.setState('error', 'verification_kick');
       this.isVerificationKickPending = true;
-      this.pendingReconnectDelayMs = 2500;
+      this.pendingReconnectDelayMs = applyCommandJitterMs(4500, 5000, 1500);
     } else {
       this.setState('error', 'kicked');
     }
@@ -867,6 +986,16 @@ class MinecraftSession extends EventEmitter {
     const pendingDelay = this.pendingReconnectDelayMs;
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
+    const wasInAfk = this.isInAfkState === true && !this.manualStop && !isVerification;
+    if (wasInAfk) {
+      this.isInAfkState = false;
+      this.wasAfkBeforeDisconnect = true;
+      this.emit('event', {
+        type: 'afk_kicked',
+        reason: this.lastKickReason || this.lastError || 'Mất kết nối máy chủ khi đang AFK',
+        message: `Bot đang treo AFK thì bị văng / mất kết nối khỏi máy chủ: ${this.lastKickReason || this.lastError || 'Mất kết nối'}`
+      });
+    }
     this.cleanupSessionResources(bot);
     if (this.manualStop || ['ip_limited', 'banned'].includes(this.state)) return;
     if (isMaintenanceWindow()) {
@@ -893,6 +1022,8 @@ class MinecraftSession extends EventEmitter {
     this.setState(kind, kind === 'ip_limited' ? 'server_ip_limit' : 'server_ban');
     this.emit('event', { type: kind, message: this.lastKickReason });
     this.manualStop = true;
+    this.isInAfkState = false;
+    this.wasAfkBeforeDisconnect = false;
     const bot = this.bot;
     this.bot = null;
     this.cleanupSessionResources(bot);
@@ -905,21 +1036,39 @@ class MinecraftSession extends EventEmitter {
       this.setState('maintenance', 'fixed_maintenance_window');
       return;
     }
+    const maxAttempts = Math.max(1, Number(this.maxReconnectAttempts || this.config.reconnectMaxAttempts) || 8);
     if (this.state !== 'maintenance') {
-      if (this.reconnectAttempts >= (this.config.reconnectMaxAttempts || 25)) {
-        this.logger.warn('minecraft_reconnect_limit_reached', { attempts: this.reconnectAttempts });
+      if (this.reconnectAttempts >= maxAttempts) {
+        const exhaustedAttempts = this.reconnectAttempts;
+        const wasAfk = this.wasAfkBeforeDisconnect;
+        this.logger.warn('minecraft_reconnect_limit_reached', { attempts: exhaustedAttempts, maxAttempts });
         this.manualStop = true;
+        this.isInAfkState = false;
+        this.wasAfkBeforeDisconnect = false;
         this.setState('error', 'max_reconnects_reached');
+        this.emit('event', {
+          type: 'reconnect_exhausted',
+          attempts: exhaustedAttempts,
+          wasAfk,
+          reason: this.lastKickReason || this.lastError || 'Kết nối thất bại liên tiếp',
+          message: `Bot đã thử kết nối lại ${exhaustedAttempts} lần liên tiếp không thành công (thời gian chờ tăng dần) nên đã tự động dừng.`
+        });
         return;
       }
       this.reconnectAttempts += 1;
       this.reconnectCount += 1;
+      this.lastReconnectAttemptCount = this.reconnectAttempts;
     }
-    const exponential = Math.min(this.config.reconnectMaxMs, this.config.reconnectBaseMs * (2 ** Math.min(this.reconnectAttempts - 1, 8)));
-    const jitter = Math.floor(Math.random() * Math.min(5000, exponential * 0.2));
-    const delay = delayOverride || exponential + jitter;
+    const baseMs = Number(this.config.reconnectBaseMs) || 5000;
+    const maxMs = Number(this.config.reconnectMaxMs) || 180000;
+    const exponential = Math.min(maxMs, baseMs * (2 ** Math.min(this.reconnectAttempts - 1, 8)));
+    // Anti-cheat random spread: ±5s command jitter + 0..35% proportional spread so timing is never robotic
+    const proportionalSpread = Math.floor(Math.random() * (exponential * 0.35));
+    const offsetJitter = Math.floor((Math.random() * 2 - 1) * 5000);
+    const computedDelay = Math.max(2000, exponential + proportionalSpread + offsetJitter);
+    const delay = delayOverride !== undefined ? delayOverride : computedDelay;
     this.setState(this.state === 'maintenance' ? 'maintenance' : 'error', 'reconnect_scheduled');
-    this.logger.info('minecraft_reconnect_scheduled', { delayMs: delay, attempt: this.reconnectAttempts });
+    this.logger.info('minecraft_reconnect_scheduled', { delayMs: delay, attempt: this.reconnectAttempts, maxAttempts });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       void this.connect();
@@ -930,6 +1079,8 @@ class MinecraftSession extends EventEmitter {
   _haltSession(reason = 'manager_stop', { emitEvent = false } = {}) {
     this._clearAbortListener();
     this.manualStop = true;
+    this.isInAfkState = false;
+    this.wasAfkBeforeDisconnect = false;
     this.generation += 1;
     this.clearTimers();
     if (this.maintenanceTimer) {
@@ -1609,5 +1760,12 @@ class MinecraftSession extends EventEmitter {
   }
 }
 
-module.exports = { MinecraftSession, classifyServerText };
+module.exports = {
+  MinecraftSession,
+  classifyServerText,
+  applyCommandJitterMs,
+  applyScheduleJitterMs,
+  parseHhmmToMinutes,
+  formatMinutesToHhmm
+};
 

@@ -2,6 +2,12 @@
 
 const { isRestrictedMinecraftCommand, getLocationKind, redactAuditValue } = require('./server-auth');
 
+function applyCommandJitterMs(baseMs, maxOffsetMs = 5000, minFloorMs = 800) {
+  const base = Math.max(0, Number(baseMs) || 0);
+  const offset = Math.floor((Math.random() * 2 - 1) * maxOffsetMs);
+  return Math.max(minFloorMs, base + offset);
+}
+
 function waitForGuiUpdate(bot, timeoutMs = 2500) {
   return new Promise((resolve) => {
     let isResolved = false;
@@ -134,11 +140,13 @@ class LobbyNavigator {
     this.clear();
     this.bot = bot;
     this.transitionTo('IDLE');
-    // Schedule initial check/join after spawn
+    // Schedule initial check/join after spawn with ±5s anti-cheat jitter around joinDelayMs
+    const baseDelayMs = Math.max(1500, Number(this.joinDelayMs) || 5000);
+    const delayMs = applyCommandJitterMs(baseDelayMs, 5000, 1000);
     this.timer = setTimeout(() => {
       this.timer = null;
       this.tryJoin(bot);
-    }, Math.max(1500, this.joinDelayMs));
+    }, delayMs);
     this.timer.unref?.();
   }
 
@@ -426,3 +434,4 @@ class LobbyNavigator {
 
 module.exports = LobbyNavigator;
 module.exports.waitForGuiUpdate = waitForGuiUpdate;
+module.exports.applyCommandJitterMs = applyCommandJitterMs;
