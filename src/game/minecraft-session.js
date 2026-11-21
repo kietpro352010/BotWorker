@@ -152,6 +152,8 @@ class MinecraftSession extends EventEmitter {
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
     this.recentChatSignatures = new Set();
+    this.hostPublicIp = null;
+    void this.resolvePublicIp();
     this.scheduleMaintenanceBoundary();
   }
 
@@ -1505,23 +1507,60 @@ class MinecraftSession extends EventEmitter {
     };
   }
 
+  async resolvePublicIp() {
+    if (this.hostPublicIp) return this.hostPublicIp;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      timer.unref?.();
+      const res = await fetch('https://api.ipify.org', { signal: controller.signal });
+      clearTimeout(timer);
+      if (res.ok) {
+        const ip = (await res.text()).trim();
+        if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+          this.hostPublicIp = ip;
+        }
+      }
+    } catch (_) {}
+    return this.hostPublicIp;
+  }
+
   getWindowSnapshot(bot = this.bot) {
     const win = bot?.currentWindow;
     if (!win) return null;
     const rawSlots = win.slots || [];
-    const slots = [];
     const len = Array.isArray(rawSlots) ? rawSlots.length : 0;
-    for (let i = 0; i < len; i++) {
+
+    // Xác định chính xác số ô của container (loại trừ 36 ô inventory & hotbar của người chơi)
+    let containerSlots = 54;
+    if (typeof win.inventoryStart === 'number' && win.inventoryStart > 0) {
+      containerSlots = win.inventoryStart;
+    } else if (win.type && /generic_9x([1-6])/.test(win.type)) {
+      const match = win.type.match(/generic_9x([1-6])/);
+      containerSlots = Number(match[1]) * 9;
+    } else if (len > 36) {
+      containerSlots = len - 36;
+    } else if (len > 0) {
+      containerSlots = len;
+    }
+    containerSlots = Math.max(9, Math.min(54, containerSlots));
+
+    // Mảng cố định đúng vị trí ô, ô trống trả về null
+    const slots = new Array(containerSlots);
+    for (let i = 0; i < containerSlots; i++) {
       const it = rawSlots[i];
       if (it && it.name) {
-        slots.push({
+        slots[i] = {
           slot: i,
           name: String(it.name),
           count: Number(it.count) || 1,
           displayName: it.displayName || it.name
-        });
+        };
+      } else {
+        slots[i] = null;
       }
     }
+
     let title = win.title;
     if (typeof title === 'object' && title !== null) {
       title = title.text || title.value || JSON.stringify(title);
@@ -1531,7 +1570,7 @@ class MinecraftSession extends EventEmitter {
       type: String(win.type || 'minecraft:container'),
       title: String(title || 'Container'),
       slots,
-      totalSlots: len,
+      totalSlots: containerSlots,
       revision: this.windowRevision || 0
     };
   }
@@ -1927,6 +1966,7 @@ class MinecraftSession extends EventEmitter {
       locationKind: this.lastLocationKind,
       locationState: this.lastLocationKind,
       afkMode: this.afkMode, proxyEnabled: Boolean(this.proxy),
+      hostIp: this.hostPublicIp, ip: this.hostPublicIp,
       username: this.username || 'N/A', credentialsConfigured: this.hasCredentials(),
       connected: Boolean(this.bot && this.bot.player), reconnectAttempts: this.reconnectAttempts,
       reconnectCount: this.reconnectCount,

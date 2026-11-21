@@ -22,12 +22,7 @@ function extractChatMessage(raw) {
   if (typeof raw === 'object' && typeof raw.toPlainText === 'function') {
     return cleanText(raw.toPlainText());
   }
-  let str = typeof raw === 'string' ? raw : '';
-  if (!str && typeof raw === 'object') {
-    try { str = JSON.stringify(raw); } catch (_) { str = String(raw); }
-  }
-  try {
-    const obj = typeof raw === 'object' ? raw : JSON.parse(str);
+  if (typeof raw === 'object') {
     const walk = (node, depth = 0) => {
       if (!node || depth > 32) return '';
       if (typeof node === 'string') return node;
@@ -43,9 +38,24 @@ function extractChatMessage(raw) {
       }
       return text;
     };
-    const res = walk(obj);
-    if (res) return cleanText(res);
-  } catch (_) {}
+    return cleanText(walk(raw));
+  }
+  let str = typeof raw === 'string' ? raw : String(raw);
+  if (typeof str === 'string' && (str.startsWith('{') || str.startsWith('['))) {
+    try {
+      const obj = JSON.parse(str);
+      const walk = (node, depth = 0) => {
+        if (!node || depth > 32) return '';
+        if (typeof node === 'string') return node;
+        let text = typeof node.text === 'string' ? node.text : '';
+        if (typeof node.translate === 'string') text += node.translate;
+        if (Array.isArray(node.with)) text += node.with.slice(0, 32).map((child) => walk(child, depth + 1)).join('');
+        if (Array.isArray(node.extra)) text += node.extra.slice(0, 64).map((child) => walk(child, depth + 1)).join('');
+        return text;
+      };
+      return cleanText(walk(obj));
+    } catch (_) {}
+  }
   return cleanText(str);
 }
 
