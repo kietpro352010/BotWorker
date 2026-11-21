@@ -1877,6 +1877,7 @@ class MinecraftSession extends EventEmitter {
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
       serverHost: this._getCurrentHost(),
+      server: this._getCurrentHost(),
       locationKind: this.lastLocationKind,
       locationState: this.lastLocationKind,
       afkMode: this.afkMode, proxyEnabled: Boolean(this.proxy),
