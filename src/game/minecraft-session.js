@@ -82,6 +82,7 @@ class MinecraftSession extends EventEmitter {
     this.state = 'stopped';
     this.bot = null;
     this.hostIndex = 0;
+    this.consecutiveHostFailures = 0;
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
@@ -205,6 +206,39 @@ class MinecraftSession extends EventEmitter {
     return this.connect({ signal });
   }
 
+  _getHosts() {
+    const configured = this.config?.mc?.hosts;
+    if (Array.isArray(configured) && configured.length > 0) return configured;
+    if (this.config?.mc?.host) return [this.config.mc.host];
+    return ['kingmc.vn', 'sgp.kingmc.vn'];
+  }
+
+  _getCurrentHost() {
+    const hosts = this._getHosts();
+    return hosts[this.hostIndex % hosts.length] || 'kingmc.vn';
+  }
+
+  _recordHostFailure(currentHost) {
+    this.consecutiveHostFailures = (this.consecutiveHostFailures || 0) + 1;
+    const hosts = this._getHosts();
+    if (hosts.length > 1 && this.consecutiveHostFailures >= 3) {
+      const prevHost = hosts[this.hostIndex % hosts.length];
+      this.hostIndex = (this.hostIndex + 1) % hosts.length;
+      const nextHost = hosts[this.hostIndex % hosts.length];
+      this.consecutiveHostFailures = 0;
+      this.logger.info('minecraft_host_switched_after_3_failures', { fromHost: prevHost, toHost: nextHost });
+      this.emit('event', {
+        type: 'host_switch',
+        message: `Máy chủ ${prevHost} không phản hồi sau 3 lần kết nối liên tục. Tự động chuyển sang ${nextHost}.`
+      });
+    } else {
+      this.logger.info('minecraft_host_failure_recorded', {
+        host: currentHost,
+        consecutiveHostFailures: this.consecutiveHostFailures
+      });
+    }
+  }
+
   async connect({ signal } = {}) {
     if (signal?.aborted) {
       this.abortPending(this._abortReasonFromSignal(signal));
@@ -245,7 +279,7 @@ class MinecraftSession extends EventEmitter {
     this.auth.reset();
     this.state = 'connecting';
     this.lastStateAt = new Date().toISOString();
-    const host = this.config.mc.hosts[this.hostIndex % this.config.mc.hosts.length];
+    const host = this._getCurrentHost();
     const generation = ++this.generation;
     this._clearAbortListener();
     if (signal) {
@@ -273,13 +307,13 @@ class MinecraftSession extends EventEmitter {
         physicsEnabled: true,
         hideErrors: true,
         logErrors: false,
-        fakeHost: 'kingmc.vn',
+        fakeHost: host || 'kingmc.vn',
         auth: this.config.mc.authType === 'microsoft' ? 'microsoft' : 'offline',
         plugins: DISABLED_PLUGINS
       };
       if (this.proxy) {
         delete options.host;
-        options.fakeHost = 'kingmc.vn';
+        options.fakeHost = host || 'kingmc.vn';
         options.connect = createSocksConnector(this.proxy, host, this.config.mc.port, {
           timeoutMs: this.config.connectTimeoutMs || 10000,
           logger: this.logger
@@ -369,6 +403,7 @@ class MinecraftSession extends EventEmitter {
       if (generation !== this.generation || this.manualStop || signal?.aborted) {
         return this.getStatus();
       }
+      this._recordHostFailure(host);
       const code = String(error?.code || '').replace(/[^a-z0-9_-]/gi, '').slice(0, 48);
       this.lastError = code ? `Minecraft connection error (${code})` : 'Minecraft connection error';
       this.setState('error', 'connect_failed');
@@ -384,6 +419,7 @@ class MinecraftSession extends EventEmitter {
     if (this.connectTimer) clearTimeout(this.connectTimer);
     this.connectTimer = null;
     this.reconnectAttempts = 0;
+    this.consecutiveHostFailures = 0;
     this.connectedAt = Date.now();
     this.lastError = null;
     this.setState('entering', 'minecraft_spawn');
@@ -1030,7 +1066,8 @@ class MinecraftSession extends EventEmitter {
     if (this.state !== 'maintenance') {
       if (!isVerification) {
         this.setState('error', 'disconnected');
-        this.hostIndex = (this.hostIndex + 1) % this.config.mc.hosts.length;
+        const currentHost = this._getCurrentHost();
+        this._recordHostFailure(currentHost);
       }
     }
     if (isVerification) {
@@ -1839,6 +1876,7 @@ class MinecraftSession extends EventEmitter {
     const monitorSnap = this.monitor.snapshot({ skipInventory: true });
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
+      serverHost: this._getCurrentHost(),
       locationKind: this.lastLocationKind,
       locationState: this.lastLocationKind,
       afkMode: this.afkMode, proxyEnabled: Boolean(this.proxy),

@@ -60,6 +60,12 @@ class ServerMonitor {
     const position = this.bot?.entity?.position;
     const pingMs = Number(this.bot?.player?.ping);
 
+    let rawDim = this.bot?.game?.dimension;
+    if (typeof rawDim === 'object' && rawDim !== null) {
+      rawDim = rawDim.name || rawDim.effects || rawDim.id || '';
+    }
+    const cleanDim = String(rawDim || '').trim().replace(/^minecraft:/i, '').slice(0, 40) || null;
+
     const base = {
       tps: this.tps,
       pingMs: Number.isFinite(pingMs) && pingMs >= 0 ? Math.round(pingMs) : null,
@@ -68,7 +74,7 @@ class ServerMonitor {
       position: position && [position.x, position.y, position.z].every(Number.isFinite)
         ? { x: Math.round(position.x * 10) / 10, y: Math.round(position.y * 10) / 10, z: Math.round(position.z * 10) / 10 }
         : null,
-      dimension: String(this.bot?.game?.dimension || '').slice(0, 40) || null
+      dimension: cleanDim
     };
 
     if (skipInventory) {

@@ -62,12 +62,13 @@ function loadConfig(env = process.env) {
     throw new Error('MANAGER_URL must use HTTPS.');
   }
 
-  const hosts = String(env.MC_SERVER_HOSTS || 'kingmc.vn,sgp.kingmc.vn')
+  const ALLOWED_MC_HOSTS = Object.freeze(['kingmc.vn', 'sgp.kingmc.vn']);
+  const configuredHosts = String(env.MC_SERVER_HOSTS || 'kingmc.vn,sgp.kingmc.vn')
     .split(',').map((host) => host.trim().toLowerCase()).filter(Boolean);
-  const validHost = (host) => isIP(host) !== 0 || /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(host);
-  if (!hosts.length || hosts.some((host) => !validHost(host))) {
-    throw new Error('MC_SERVER_HOSTS must contain valid hostnames or IPv4 addresses.');
+  if (configuredHosts.some((host) => !ALLOWED_MC_HOSTS.includes(host))) {
+    throw new Error('MC_SERVER_HOSTS can only contain kingmc.vn and sgp.kingmc.vn.');
   }
+  const hosts = configuredHosts.length ? configuredHosts : ALLOWED_MC_HOSTS;
 
   const hostRuntime = detectHostRuntime(env);
   const transport = String(env.WORKER_TRANSPORT || hostRuntime.transport).trim().toLowerCase();
