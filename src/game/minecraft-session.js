@@ -1636,14 +1636,22 @@ class MinecraftSession extends EventEmitter {
     const action = String(payload.action || 'list').toLowerCase();
     const VALID_EQUIP_DESTINATIONS = new Set(['hand', 'head', 'torso', 'legs', 'feet', 'off-hand']);
 
-    if (payload.revision !== undefined && payload.revision !== null && Number.isInteger(Number(payload.revision))) {
-      if (Number(payload.revision) !== this.inventoryRevision) {
-        return {
-          ok: false,
-          error: 'inventory_revision_mismatch',
-          status: 409,
-          inventory: this.getInventorySnapshot(bot)
-        };
+    if (action !== 'select' && action !== 'list' && payload.revision !== undefined && payload.revision !== null && Number.isInteger(Number(payload.revision))) {
+      const incomingRev = Number(payload.revision);
+      if (incomingRev !== this.inventoryRevision) {
+        const rawSrc = payload.sourceSlot ?? payload.slot;
+        const srcSlotNum = (rawSrc !== undefined && rawSrc !== null && String(rawSrc).trim() !== '') ? Number(rawSrc) : null;
+        const currentItemAtSrc = (srcSlotNum !== null && bot.inventory?.slots) ? bot.inventory.slots[srcSlotNum] : null;
+
+        // Chỉ trả về 409 nếu ô nguồn chỉ định bị mất item hoặc không còn tồn tại
+        if (srcSlotNum !== null && !currentItemAtSrc) {
+          return {
+            ok: false,
+            error: 'inventory_revision_mismatch',
+            status: 409,
+            inventory: this.getInventorySnapshot(bot)
+          };
+        }
       }
     }
 
