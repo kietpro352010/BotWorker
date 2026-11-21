@@ -151,6 +151,7 @@ class MinecraftSession extends EventEmitter {
     this.windowRevision = 0;
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
+    this.recentChatSignatures = new Set();
     this.scheduleMaintenanceBoundary();
   }
 
@@ -296,6 +297,10 @@ class MinecraftSession extends EventEmitter {
       this._abortListenerCleanup = () => signal.removeEventListener('abort', onAbort);
     }
     this.emit('state', this.getStatus());
+    this.emit('event', {
+      type: 'connecting',
+      message: `Đang kết nối đến máy chủ ${host}:${this.config.mc.port}...`
+    });
     this.logger.info('minecraft_connecting', { host, port: this.config.mc.port });
     logMinecraftHostResolution(host, this.config.mc.port, this.logger, this.proxy ? 'socks5' : 'direct');
 
@@ -423,6 +428,10 @@ class MinecraftSession extends EventEmitter {
     this.connectedAt = Date.now();
     this.lastError = null;
     this.setState('entering', 'minecraft_spawn');
+    this.emit('event', {
+      type: 'spawn',
+      message: `Bot đã kết nối thành công và xuất hiện tại máy chủ ${host || this._getCurrentHost()}.`
+    });
     this.monitor.attach(bot);
     if (this.ecoMode !== false) {
       applyEcoPhysics(bot);
@@ -466,6 +475,11 @@ class MinecraftSession extends EventEmitter {
       this.logger.warn('bot_died', { coords });
       this.emit('event', { type: 'bot_death', reason: `Bot bị chết tại tọa độ ${coords}` });
       setPhysicsEnabled(bot, true, this.logger, 'death');
+    });
+
+    bot.on('respawn', () => {
+      this.logger.info('bot_respawned', { bot: this.username });
+      this.emit('event', { type: 'respawn', message: 'Bot đã hồi sinh (respawn).' });
     });
 
     // Check off-hand totem immediately on spawn
@@ -678,7 +692,7 @@ class MinecraftSession extends EventEmitter {
       if (cmd && cmd.length <= 256 && !isRestrictedMinecraftCommand(cmd) && this.state === 'online' && this.bot) {
         try {
           this.bot.chat(cmd);
-          this.emit('event', { type: 'chat', message: `[${this.bot.username || this.username}] ${cmd}` });
+          this._recordChatMessage(`→ ${cmd}`, 'scheduled_chat');
         } catch (_) {}
       }
     }
@@ -930,6 +944,7 @@ class MinecraftSession extends EventEmitter {
           return;
         }
       }
+      this._recordChatMessage(safeText, 'chat');
     }
   }
 
@@ -942,10 +957,12 @@ class MinecraftSession extends EventEmitter {
     const classification = classifyServerText(text);
     const wasInAfk = this.isInAfkState === true && !this.manualStop && !isVerificationKick;
 
+    const briefKick = this.lastKickReason ? this.lastKickReason.slice(0, 120) : 'Không rõ lý do';
     this.emit('event', {
       type: 'kicked',
-      reason: this.lastKickReason,
-      message: this.lastKickReason
+      reason: briefKick,
+      message: `Ngắt kết nối khỏi máy chủ: ${briefKick}`,
+      details: { kickReason: this.lastKickReason, rawReason: typeof reason === 'string' ? reason : undefined }
     });
 
     if (wasInAfk) {
@@ -953,8 +970,9 @@ class MinecraftSession extends EventEmitter {
       this.wasAfkBeforeDisconnect = true;
       this.emit('event', {
         type: 'afk_kicked',
-        reason: this.lastKickReason || 'Bị kick khi đang treo AFK',
-        message: `Bot đang treo AFK thì bị kick khỏi máy chủ: ${this.lastKickReason || 'Không rõ lý do'}`
+        reason: briefKick,
+        message: `Bot đang treo AFK thì bị ngắt kết nối: ${briefKick}`,
+        details: { kickReason: this.lastKickReason, rawReason: typeof reason === 'string' ? reason : undefined }
       });
     }
 
@@ -1411,7 +1429,7 @@ class MinecraftSession extends EventEmitter {
     if (!message || message.length > 256) throw new Error('Chat message must contain 1–256 characters.');
     if (isRestrictedMinecraftCommand(message)) throw new Error('Account registration and password commands are blocked.');
     bot.chat(message);
-    this.emit('event', { type: 'chat', message: `[${bot.username}] ${message}` });
+    this._recordChatMessage(`→ ${message}`, 'outgoing');
     return { ok: true, sent: message };
   }
 
@@ -1710,6 +1728,10 @@ class MinecraftSession extends EventEmitter {
       await bot.clickWindow(slot, mouseButton, mode);
       this.inventoryRevision += 1;
       this.windowRevision = (this.windowRevision || 0) + 1;
+      this.emit('event', {
+        type: 'window_click',
+        message: `Tương tác menu GUI: Click ô #${slot} (nút: ${mouseButton}, mode: ${mode})`
+      });
       return { ok: true, clickedSlot: slot, inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
     }
     return { ok: true, clickedSlot: slot, note: 'click_registered', inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
@@ -1721,6 +1743,10 @@ class MinecraftSession extends EventEmitter {
     if (window && typeof bot.closeWindow === 'function') {
       bot.closeWindow(window);
       this.windowRevision = (this.windowRevision || 0) + 1;
+      this.emit('event', {
+        type: 'window_close',
+        message: 'Đã đóng giao diện menu GUI.'
+      });
       return { ok: true, closed: true };
     }
     return { ok: true, closed: false, note: 'no_window_open' };
@@ -1839,11 +1865,31 @@ class MinecraftSession extends EventEmitter {
     this.emit('event', { type: 'maintenance_window', message: 'Scheduled stop 04:30–05:30 Vietnam time (UTC+7).' });
   }
 
+  _recordChatMessage(text, source = 'chat') {
+    if (!text || typeof text !== 'string') return;
+    const clean = redactAuditValue(cleanText(text).replace(/[\r\n\t]+/g, ' ')).slice(0, 300).trim();
+    if (!clean) return;
+    if (isRestrictedMinecraftCommand(clean) || /^\/(?:login|dn|register|reg|dk)\b/i.test(clean)) return;
+
+    const sig = `${source}:${clean.toLowerCase()}`;
+    if (this.recentChatSignatures.has(sig)) return;
+    this.recentChatSignatures.add(sig);
+    if (this.recentChatSignatures.size > 200) {
+      const first = this.recentChatSignatures.values().next().value;
+      this.recentChatSignatures.delete(first);
+    }
+    setTimeout(() => {
+      this.recentChatSignatures.delete(sig);
+    }, 2500).unref?.();
+
+    this.emit('event', { type: 'chat', message: clean, source });
+  }
+
   recordChat(bot, username, message) {
     if (this.bot !== bot || username === bot.username) return;
     const clean = redactAuditValue(cleanText(message).replace(/[\r\n\t]+/g, ' ')).slice(0, 240);
     if (!clean) return;
-    this.emit('event', { type: 'chat', message: `[${String(username || 'player').slice(0, 40)}] ${clean}` });
+    this._recordChatMessage(`[${String(username || 'player').slice(0, 40)}] ${clean}`, 'chat');
   }
 
   clearTimers() {
