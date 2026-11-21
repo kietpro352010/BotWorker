@@ -178,6 +178,7 @@ class WorkerFleet {
     for (const instance of this.instances.values()) {
       try {
         await instance.refreshManagerConfig();
+        void instance.reporter.heartbeat(instance.runtime.status()).catch(() => {});
       } catch (error) {
         instance.session.requireManualResume('manager_check_failed');
         this.logger.warn('worker_bootstrap_check_failed', { workerId: instance.config.workerId, error: error.message });
@@ -242,6 +243,11 @@ class WorkerFleet {
         }
         if (position > 0) await delay(8000, this.stopController.signal);
         if (!this.stopping && !instance.session.isHeld()) {
+          if (!instance.session.hasCredentials()) {
+            this.logger.info('worker_auto_start_skipped_no_credentials', { workerId: instance.config.workerId });
+            position += 1;
+            continue;
+          }
           await instance.runtime.execute('start', {}, { skipManagerRefresh: true }).catch((error) => {
             this.logger.warn('worker_auto_start_failed', { workerId: instance.config.workerId, error: error.message });
           });

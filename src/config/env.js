@@ -101,7 +101,7 @@ function loadConfig(env = process.env) {
     proxyUrl: String(env.MC_PROXY_URL || '').trim(),
     afk: Object.freeze({ minMs: actionMin, maxMs: actionMax }),
     authEnabled,
-    autoStart: bool(env.AUTO_START, true),
+    autoStart: bool(env.AUTO_START, false),
     autoReconnect: bool(env.AUTO_RECONNECT, true),
     joinCommand: String(env.JOIN_COMMAND || '').trim(),
     joinDelayMs: positiveInt(env.JOIN_DELAY_MS, 4000, 0, 120000),

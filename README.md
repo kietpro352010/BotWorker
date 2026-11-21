@@ -41,7 +41,7 @@ Slot thứ hai là tùy chọn: đặt thêm `WORKER_ID_2` và `WORKER_SECRET_2`
 | `MC_AUTH_ENABLED` | `true` | Bật xử lý đăng nhập tài khoản tại server. |
 | `MC_AUTH_TYPE` | `offline` | `offline` hoặc `microsoft`; chọn phù hợp với tài khoản Minecraft. |
 | `MC_PROXY_URL` | Không dùng proxy | SOCKS5 proxy dùng cho kết nối Minecraft, nếu cần. |
-| `AUTO_START` | `true` | Tự kết nối sau khi bootstrap Manager thành công. |
+| `AUTO_START` | `false` | Tự kết nối sau khi bootstrap Manager thành công (mặc định: false; bot ở trạng thái offline sẵn sàng). |
 | `AUTO_RECONNECT` | `true` | Tự thử kết nối lại sau khi mất kết nối. |
 | `JOIN_COMMAND` | Luồng mặc định của KingMC | Lệnh vào server phụ; để trống để Worker dùng menu KingMC. |
 | `JOIN_DELAY_MS` | `4000` | Thời gian chờ tối thiểu sau spawn trước khi bắt đầu điều hướng; điều hướng vẫn chờ xác thực. |
