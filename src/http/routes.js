@@ -178,6 +178,13 @@ function createRouter({ fleet, config }) {
     bots: Array.isArray(config?.bots) ? config.bots.map((b) => ({ workerId: b.workerId, slot: b.slot })) : []
   }));
 
+  router.get('/ready', (_req, res) => res.json({
+    ok: true,
+    ready: true,
+    service: 'kingmc-afk-worker',
+    botCount: config?.botCount ?? 0
+  }));
+
   router.get('/api/v1/diagnostics', (req, res) => {
     const secret = extractWorkerToken(req);
     const authed = Array.isArray(config?.bots) && config.bots.some((b) => matchesBotSecret(secret, b));

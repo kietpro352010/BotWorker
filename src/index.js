@@ -82,6 +82,8 @@ async function main() {
       exitCode = 1;
     } finally {
       try {
+        server.closeIdleConnections?.();
+        server.closeAllConnections?.();
         await new Promise((resolve) => server.close(resolve));
       } catch (err) {
         logger.error('worker_shutdown_server_close_error', { error: err?.message || String(err) });

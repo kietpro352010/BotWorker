@@ -309,7 +309,13 @@ class LobbyNavigator {
         }
         try {
           this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
-          await bot.clickWindow(24, 0, 0);
+          await Promise.race([
+            bot.clickWindow(24, 0, 0),
+            new Promise((_, reject) => {
+              const t = setTimeout(() => reject(new Error('click_window_timeout')), 4000);
+              t.unref?.();
+            })
+          ]);
           if (this.bot !== bot) return;
           scheduleJoinVerification(Date.now() + 6000);
         } catch (clickErr) {
@@ -317,11 +323,12 @@ class LobbyNavigator {
           this.logger.warn('lobby_menu_click_failed', { error: clickErr?.message || 'click_failed' });
           this.serverJoinBusy = false;
           this.transitionTo('IDLE', { reason: 'click_failed' });
+          this.lastExhaustedAt = Date.now();
           if (this.serverJoinAttempts < 3 && this.isReadyForNavigation(bot, 'click_retry')) {
             this.retryTimer = setTimeout(() => {
               this.retryTimer = null;
               this.triggerServerJoin(bot, `retry_after_click_error_${this.serverJoinAttempts}`);
-            }, 1000);
+            }, 30000);
             this.retryTimer.unref?.();
           }
         } finally {

@@ -12,7 +12,6 @@ function cancellableSleep(ms, signal) {
       if (signal) signal.removeEventListener('abort', onAbort);
       resolve();
     }, ms);
-    timer.unref?.();
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
 }

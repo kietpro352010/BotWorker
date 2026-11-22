@@ -10,10 +10,8 @@ npm-debug.log*
 *.bat
 scratch/
 
-# Local internal notes, tests & scratch files
+# Local internal notes & scratch files
 CLAUDE.md
 FEATURES.md
-tests/
-test/
 render.yaml
 .github/

@@ -167,7 +167,6 @@ class ServerAuth {
       this.markAuthenticated('server_message');
       return true;
     }
-    if (!this.password) return false;
     const isRegister = /(?:^|\s)\/(?:register|dk)\b/.test(text)
       || /(?:please|you must|first|hay|vui long|ban can|can) .{0,32}(?:register|dang ky)/.test(text)
       || /(?:register|dang ky).{0,32}(?:account|tai khoan|before|first|de tiep tuc)/.test(text);
@@ -175,6 +174,13 @@ class ServerAuth {
       || /(?:please|you must|first|hay|vui long|ban can|can) .{0,32}(?:log in|login|dang nhap)/.test(text)
       || /(?:log in|login|dang nhap).{0,32}(?:account|tai khoan|before|first|de tiep tuc)/.test(text);
     if (!isRegister && !isLogin) return false;
+    if (!this.password) {
+      if (Date.now() - this.lastActionAt >= 5000) {
+        this.lastActionAt = Date.now();
+        this.logger.warn('minecraft_auth_prompt_missing_password', { kind: isRegister ? 'register' : 'login' });
+      }
+      return false;
+    }
     if (Date.now() - this.lastActionAt < 3000) return true;
     const command = isRegister
       ? `/register ${this.password} ${this.password}`

@@ -847,7 +847,7 @@ class MinecraftSession extends EventEmitter {
           }
         }
       } else if (kind === 'lobby') {
-        if (prevKind === 'login') this.auth.markAuthenticated('login_area_exit');
+        if (prevKind === 'login' || prevKind === 'unknown') this.auth.markAuthenticated(prevKind === 'login' ? 'login_area_exit' : 'direct_lobby_spawn');
         if (this.state !== 'entering') this.setState('entering', 'server_lobby');
         setPhysicsEnabled(bot, true, this.logger, 'kingmc_lobby');
         const now = Date.now();
@@ -1284,7 +1284,10 @@ class MinecraftSession extends EventEmitter {
     if (!credentials || typeof credentials !== 'object') return false;
     const username = String(credentials.username || '').trim();
     const password = String(credentials.password ?? '');
-    if (!username || username.length > 64) {
+    if (!username || username.length > 64 || /[\r\n\u0000]/.test(username)) {
+      throw new Error('Manager Minecraft credentials are invalid.');
+    }
+    if (password.length > 380 || /[\r\n\u0000]/.test(password)) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
     this.username = username;
@@ -1543,7 +1546,7 @@ class MinecraftSession extends EventEmitter {
     } else if (len > 0) {
       containerSlots = len;
     }
-    containerSlots = Math.max(9, Math.min(54, containerSlots));
+    containerSlots = Math.max(1, Math.min(54, containerSlots));
 
     // Mảng cố định đúng vị trí ô, ô trống trả về null
     const slots = new Array(containerSlots);
@@ -1794,9 +1797,9 @@ class MinecraftSession extends EventEmitter {
         type: 'window_close',
         message: 'Đã đóng giao diện menu GUI.'
       });
-      return { ok: true, closed: true };
+      return { ok: true, closed: true, currentWindow: null };
     }
-    return { ok: true, closed: false, note: 'no_window_open' };
+    return { ok: true, closed: false, note: 'no_window_open', currentWindow: null };
   }
 
   attachNetworkMetrics(bot) {
@@ -1969,6 +1972,7 @@ class MinecraftSession extends EventEmitter {
     const monitorSnap = this.monitor.snapshot({ skipInventory: true });
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
+      manuallyStopped: Boolean(this.manualStop),
       serverHost: this._getCurrentHost(),
       server: this._getCurrentHost(),
       locationKind: this.lastLocationKind,

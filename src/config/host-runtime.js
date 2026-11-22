@@ -48,7 +48,7 @@ async function listenHttpServer(server, portOrOptions, maybeHost, maybeOptions) 
 
   server.keepAliveTimeout = 65000;
   server.headersTimeout = 66000;
-  server.requestTimeout = 40000;
+  server.requestTimeout = 55000;
 
   let currentPort = Number(port) || 10000;
   let attempts = 0;
