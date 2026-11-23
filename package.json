@@ -1,6 +1,6 @@
 {
   "name": "kingmc-afk-worker",
-  "version": "12.1.0",
+  "version": "12.1.1",
   "private": true,
   "description": "Modular KingMC AFK worker with Render HTTP and Wispbyte poll transports.",
   "main": "index.js",
