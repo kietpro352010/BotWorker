@@ -1159,15 +1159,25 @@ async function runTests() {
     const baseUrl = `http://127.0.0.1:${port}`;
 
     try {
-      // RT-04a: Probe /health returns sanitized bots list without exposing credentials
+      // RT-04a: Probe /health omits workerId/bots and exposes slots; /api/v1/diagnostics returns bots when authed
       const healthRes = await fetch(`${baseUrl}/health`);
       assert.strictEqual(healthRes.status, 200);
       const healthData = await healthRes.json();
       assert.strictEqual(healthData.ok, true);
       assert.strictEqual(healthData.botCount, 1);
-      assert.ok(Array.isArray(healthData.bots), 'Health endpoint returns sanitized bots list');
-      assert.strictEqual(healthData.bots[0].workerId, 'w_test');
-      assert.strictEqual(healthData.bots[0].secret, undefined, 'Health endpoint must not expose secrets');
+      assert.strictEqual(healthData.bots, undefined, 'Health endpoint must NOT leak bots/workerId list');
+      assert.deepStrictEqual(healthData.slots, [1], 'Health endpoint must expose slots without workerId');
+
+      const diagUnauthed = await fetch(`${baseUrl}/api/v1/diagnostics`);
+      assert.strictEqual(diagUnauthed.status, 401, 'Diagnostics must require authentication');
+      const diagAuthed = await fetch(`${baseUrl}/api/v1/diagnostics`, {
+        headers: { 'x-worker-secret': 'test_secret_123' }
+      });
+      assert.strictEqual(diagAuthed.status, 200);
+      const diagData = await diagAuthed.json();
+      assert.ok(Array.isArray(diagData.bots), 'Authenticated diagnostics must return bots list');
+      assert.strictEqual(diagData.bots[0].workerId, 'w_test');
+      assert.strictEqual(diagData.bots[0].secret, undefined, 'Diagnostics must not expose secrets');
 
       // RT-04b: Unauthenticated request to non-existent bot returns 401 unauthorized (not 404)
       const noAuthBadBot = await fetch(`${baseUrl}/api/v1/bots/non_existent/status`);

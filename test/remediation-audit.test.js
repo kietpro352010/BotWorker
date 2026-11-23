@@ -225,8 +225,12 @@ async function testProcessWideErrorAndShutdownHandlers() {
     'src/index.js must register process.on unhandledRejection handler (W-3)'
   );
   assert.ok(
-    indexSource.includes("setTimeout(() => process.exit(0), 2000).unref()"),
-    'src/index.js must register unref fallback timer in shutdown (W-6)'
+    /setTimeout\(\(\) => process\.exit\(currentExitCode\),\s*8000\)/.test(indexSource) && indexSource.includes('forceExitTimer.unref?.()'),
+    'src/index.js must register 8000ms unref fallback timer in shutdown (OPS-TEST-04)'
+  );
+  assert.ok(
+    indexSource.includes("shutdown('unhandledRejection', 1)"),
+    'src/index.js must call shutdown on unhandledRejection (OPS-TEST-04)'
   );
 
   console.log('✅ 7. Process-wide error handlers and shutdown fallback verified.');
@@ -242,7 +246,7 @@ async function testUnrestrictedBotPasswordAndGzip() {
     { mc: { username: 'test_bot', serverHost: '127.0.0.1', serverPort: 25565, authEnabled: true } },
     createMockLogger()
   );
-  const longPass = 'K'.repeat(320) + '!@#\t$';
+  const longPass = 'K'.repeat(320) + '!@#$%';
   assert.strictEqual(session.applyManagerCredentials({ username: 'BotUnlim', password: longPass }), true);
   assert.strictEqual(session.password, longPass, 'Worker must accept bot passwords >256 chars without truncation or error');
 

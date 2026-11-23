@@ -138,7 +138,8 @@ async function assertPublicProxyHost(host, label = 'MC_PROXY_URL') {
       throw new Error(`${label} resolved to a local or private network address.`);
     }
   }
-  return records[0].address;
+  const ipv4Record = records.find((rec) => rec.family === 4 || isIP(rec.address) === 4);
+  return (ipv4Record || records[0]).address;
 }
 
 function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } = {}) {
@@ -195,7 +196,7 @@ function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } =
             host: resolvedIp,
             port: proxy.port,
             type: 5,
-            ...(proxy.username ? { userId: proxy.username, password: proxy.password } : {})
+            ...((proxy.username || proxy.password) ? { userId: proxy.username || '', password: proxy.password || '' } : {})
           },
           command: 'connect',
           destination: { host, port },
@@ -220,6 +221,10 @@ function createSocksConnector(proxy, host, port, { timeoutMs = 10000, logger } =
             return;
           }
 
+          try {
+            info.socket?.setNoDelay?.(true);
+            info.socket?.setKeepAlive?.(true, 15000);
+          } catch (_) {}
           client.setSocket(info.socket);
           client.emit('connect');
         });

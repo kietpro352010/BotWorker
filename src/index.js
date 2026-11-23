@@ -1,6 +1,7 @@
 'use strict';
 
-require('dotenv').config();
+const { loadConfig, loadDotenvSafe } = require('./config/env');
+loadDotenvSafe();
 
 // Kích hoạt V8 Garbage Collection nội bộ (Trụ cột 1.1)
 const v8 = require('node:v8');
@@ -23,7 +24,6 @@ function runGarbageCollection() {
 }
 
 const http = require('node:http');
-const { loadConfig } = require('./config/env');
 const { listenHttpServer } = require('./config/host-runtime');
 const logger = require('./utils/logger');
 const WorkerFleet = require('./services/worker-fleet');
@@ -68,30 +68,36 @@ async function main() {
   const shutdown = async (signal, exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    if (exitCode !== 0) {
-      setTimeout(() => process.exit(exitCode), 2000).unref();
-    } else {
-      setTimeout(() => process.exit(0), 2000).unref();
-    }
+    let currentExitCode = exitCode;
+    const forceExitTimer = setTimeout(() => process.exit(currentExitCode), 8000);
+    forceExitTimer.unref?.();
     clearInterval(memorySweepInterval);
-    logger.info('worker_shutdown', { signal, botCount: config.botCount, exitCode });
+    logger.info('worker_shutdown', { signal, botCount: config.botCount, exitCode: currentExitCode });
     try {
       await fleet.stop();
     } catch (err) {
       logger.error('worker_shutdown_fleet_stop_error', { error: err?.message || String(err) });
-      exitCode = 1;
+      currentExitCode = 1;
     } finally {
+      let graceCloseTimer = null;
       try {
         server.closeIdleConnections?.();
-        server.closeAllConnections?.();
-        await new Promise((resolve) => server.close(resolve));
+        const closePromise = new Promise((resolve) => server.close(resolve));
+        graceCloseTimer = setTimeout(() => {
+          server.closeAllConnections?.();
+        }, 3000);
+        graceCloseTimer.unref?.();
+        await closePromise;
       } catch (err) {
         logger.error('worker_shutdown_server_close_error', { error: err?.message || String(err) });
-        exitCode = 1;
+        currentExitCode = 1;
+      } finally {
+        if (graceCloseTimer) clearTimeout(graceCloseTimer);
       }
     }
-    process.exitCode = exitCode;
-    process.exit(exitCode);
+    clearTimeout(forceExitTimer);
+    process.exitCode = currentExitCode;
+    process.exit(currentExitCode);
   };
 
   process.once('SIGTERM', () => { shutdown('SIGTERM', 0).catch(() => process.exit(1)); });
@@ -102,6 +108,7 @@ async function main() {
   });
   process.on('unhandledRejection', (reason) => {
     logger.error('worker_unhandled_rejection', { error: reason?.message || String(reason), stack: reason?.stack });
+    shutdown('unhandledRejection', 1).catch(() => process.exit(1));
   });
 
   try {

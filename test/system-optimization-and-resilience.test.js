@@ -287,7 +287,7 @@ async function testServerAuthAndHardenedLogger() {
     chat: (msg) => chats.push(msg)
   };
 
-  for (const pass of ['x', 'p@$$!#\t9', 'Q'.repeat(350)]) {
+  for (const pass of ['x', 'p@$$!#%9', 'Q'.repeat(350)]) {
     const auth = new ServerAuth({ password: pass, enabled: true, logger: createSilentLogger() });
     assert.strictEqual(auth.sendDirectAuth(fakeBot, 'dn'), true);
     assert.strictEqual(chats[chats.length - 1], `/dn ${pass}`);
@@ -295,6 +295,7 @@ async function testServerAuthAndHardenedLogger() {
     assert.strictEqual(auth.handleMessage(fakeBot, 'Vui lòng dùng lệnh /login <mat khau> để đăng nhập'), true);
     assert.strictEqual(chats[chats.length - 1], `/login ${pass}`);
   }
+  assert.throws(() => new ServerAuth({ password: 'bad\tpass', enabled: true, logger: createSilentLogger() }));
 
   // Empty password must safely skip /login without throwing or chatting empty string
   const chatsBeforeEmpty = chats.length;

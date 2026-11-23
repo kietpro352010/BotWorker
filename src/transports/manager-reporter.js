@@ -65,11 +65,11 @@ class ManagerReporter {
     return body;
   }
 
-  async heartbeat(status, { signal } = {}) {
+  async heartbeat(status) {
     this.pendingHeartbeat = status;
     if (this.heartbeatPromise) return this.heartbeatPromise;
 
-    this.heartbeatPromise = this.flushHeartbeats({ signal }).finally(() => {
+    this.heartbeatPromise = this.flushHeartbeats().finally(() => {
       this.heartbeatPromise = null;
       if (this.pendingHeartbeat && !this.stopping) {
         const nextStatus = this.pendingHeartbeat;
@@ -81,11 +81,11 @@ class ManagerReporter {
     return this.heartbeatPromise;
   }
 
-  async flushHeartbeats({ signal } = {}) {
+  async flushHeartbeats() {
     while (this.pendingHeartbeat && !this.stopping) {
       const status = this.pendingHeartbeat;
       this.pendingHeartbeat = null;
-      await this.sendHeartbeat(status, { signal });
+      await this.sendHeartbeat(status, { signal: this.stopController.signal });
     }
   }
 
@@ -95,7 +95,10 @@ class ManagerReporter {
     const seq = ++this.statusSeq;
     const digest = computeBotStateDigest(raw);
     const digestUnchanged = this.lastStateDigest === digest && (now - this.lastFullReportAt < 300000);
-    const positionMoved = Boolean(raw.position && this.hasPositionMovedSignificantly(raw.position));
+    const stateStr = String(raw.state || '').toLowerCase();
+    const disconnected = raw.connected === false || !raw.position
+      || ['stopped', 'disconnected', 'error', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
+    const positionMoved = Boolean(!disconnected && raw.position && this.hasPositionMovedSignificantly(raw.position));
 
     const payload = {
       ...raw,
@@ -123,7 +126,7 @@ class ManagerReporter {
       payload.positionUnchanged = true;
     }
 
-    return { seq, payload, digest, digestUnchanged, positionMoved, position: raw.position || null };
+    return { seq, payload, digest, digestUnchanged, disconnected, positionMoved, position: raw.position || null };
   }
 
   recordStatusSent(meta) {
@@ -136,7 +139,9 @@ class ManagerReporter {
       this.lastStateDigest = meta.digest;
       this.lastFullReportAt = Date.now();
     }
-    if (meta.positionMoved && meta.position) {
+    if (meta.disconnected) {
+      this.lastReportedPosition = null;
+    } else if (meta.positionMoved && meta.position) {
       this.lastReportedPosition = { ...meta.position };
     }
   }
@@ -347,6 +352,7 @@ class ManagerReporter {
   reset() {
     this.stopping = false;
     this.stopController = new AbortController();
+    this.lastReportedPosition = null;
   }
 
   stop() {

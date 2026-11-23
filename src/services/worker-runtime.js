@@ -9,7 +9,7 @@ const LIFECYCLE_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'res
 const CLEANUP_ON_ABORT_ACTIONS = new Set(['start', 'stop', 'restart', 'reconnect', 'reset', 'set-proxy']);
 
 const DEFAULT_EXEC_TIMEOUT_MS = 10000;
-const DEFAULT_LIFECYCLE_TIMEOUT_MS = 15000;
+const DEFAULT_LIFECYCLE_TIMEOUT_MS = 20000;
 const DEFAULT_QUEUE_TIMEOUT_MS = 30000;
 const MAX_PENDING_COMMANDS = 10;
 const MAX_TIMEOUT_MS = 120000;

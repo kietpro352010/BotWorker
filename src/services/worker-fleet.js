@@ -212,6 +212,13 @@ class WorkerFleet {
       const metrics = this.sampleResources();
       const rssMb = Math.round(metrics.rssMb);
 
+      // Proactive lightweight memory pruning above 200MB to prevent Wispbyte RAM spikes
+      if (rssMb > 200) {
+        for (const instance of this.instances.values()) {
+          instance.session.pruneMemory?.();
+        }
+      }
+
       // Memory Watchdog (Trụ cột 1.1: Tự động dọn RAM nếu > 350MB)
       if (rssMb > 350) {
         for (const instance of this.instances.values()) {

@@ -12,7 +12,7 @@
     "test": "node test/integration.test.js && node test/remediation-audit.test.js && node test/challenger_stress.test.js && node test/kingmc_lobby_routine.test.js && node test/system-optimization-and-resilience.test.js && node test/deep-audit-fixes.test.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.0.0 <25.0.0"
   },
   "dependencies": {
     "cross-env": "^7.0.3",

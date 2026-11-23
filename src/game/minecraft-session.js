@@ -1,8 +1,6 @@
 'use strict';
 
 const EventEmitter = require('node:events');
-const mineflayer = require('mineflayer');
-const { SocksClient } = require('socks');
 const { logMinecraftHostResolution, attachMinecraftConnectionDiagnostics } = require('./connection-diagnostics');
 const AfkController = require('./afk-controller');
 const LobbyNavigator = require('./lobby-navigator');
@@ -13,8 +11,17 @@ const {
 } = require('./server-auth');
 const { parseSocksProxy, createSocksConnector } = require('../config/proxy');
 const { normalizeState } = require('../domain/worker-state');
-const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, setPhysicsEnabled, startChunkPruner, stopEntityPruner } = require('./packet-optimization');
+const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, setPhysicsEnabled, pruneFarChunks, startChunkPruner, stopEntityPruner } = require('./packet-optimization');
 const { TIME_ZONE, isMaintenanceWindow, nextMaintenanceBoundary } = require('../services/maintenance-window');
+
+function getMineflayer() {
+  return require('mineflayer');
+}
+
+let lastRealBotConnectAt = 0;
+let connectStaggerChain = Promise.resolve();
+let sharedHostPublicIp = null;
+let sharedPublicIpPromise = null;
 
 const FOOD_ITEM_NAMES = new Set([
   'apple', 'baked_potato', 'beetroot', 'beetroot_soup', 'bread', 'carrot',
@@ -105,7 +112,8 @@ class MinecraftSession extends EventEmitter {
     this.spawnCommands = '';
     this.autoChatSchedules = [];
     this.botSchedules = [];
-    this.proxy = config.mc.proxy;
+    this.proxy = config.mc?.proxy || null;
+    this.proxyConfigError = null;
     this.manualStop = true;
     this.restriction = null;
     this.lastError = null;
@@ -120,7 +128,17 @@ class MinecraftSession extends EventEmitter {
     this.networkSampleAt = Date.now();
     this.resourceMetrics = { cpuPercent: 0, rssMb: 0, heapUsedMb: 0 };
     this.afk = new AfkController({ ...config.afk, logger });
-    this.auth = new ServerAuth({ password: this.password, enabled: Boolean(config.authEnabled ?? config.mc?.authEnabled ?? true), logger });
+    this.auth = new ServerAuth({
+      password: this.password,
+      enabled: Boolean(config.authEnabled ?? config.mc?.authEnabled ?? true),
+      logger,
+      onAuthFailed: ({ message } = {}) => {
+        const safeMsg = redactAuditValue(cleanText(message || 'Minecraft authentication failed.')).slice(0, 300)
+          || 'Minecraft authentication failed.';
+        this.lastError = safeMsg;
+        this.emit('event', { type: 'auth_failed', message: safeMsg });
+      }
+    });
     this.navigator = new LobbyNavigator({
       joinCommand: config.joinCommand, joinDelayMs: config.joinDelayMs, logger,
       isAuthenticated: () => this.auth.isAuthenticated()
@@ -137,7 +155,7 @@ class MinecraftSession extends EventEmitter {
     this.botScheduleTimer = null;
     this.botScheduleLastFixedKey = new Map();
     this.botScheduleDailyJitter = new Map();
-    this.botScheduleCycleState = null;
+    this.botScheduleCycleStates = new Map();
     this._autoChatSchedulesSig = '';
     this._botSchedulesSig = '';
     this.isInAfkState = false;
@@ -152,8 +170,7 @@ class MinecraftSession extends EventEmitter {
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
     this.recentChatSignatures = new Set();
-    this.hostPublicIp = null;
-    void this.resolvePublicIp();
+    this.hostPublicIp = sharedHostPublicIp;
     this.scheduleMaintenanceBoundary();
   }
 
@@ -253,6 +270,15 @@ class MinecraftSession extends EventEmitter {
         detail: 'Worker is held by a Manager restriction and cannot connect.', worker: this.getStatus()
       };
     }
+    if (!this.proxy && this.proxyConfigError) {
+      this.lastError = this.proxyConfigError;
+      this.setState('error', 'invalid_proxy');
+      const worker = this.getStatus();
+      return {
+        ok: false, error: 'invalid_proxy', code: 'INVALID_PROXY', status: 422,
+        detail: this.proxyConfigError, worker
+      };
+    }
     if (isMaintenanceWindow()) {
       this.maintenanceWindow = true;
       this.clearTimers();
@@ -307,11 +333,36 @@ class MinecraftSession extends EventEmitter {
     logMinecraftHostResolution(host, this.config.mc.port, this.logger, this.proxy ? 'socks5' : 'direct');
 
     try {
+      const mf = getMineflayer();
+      const isRealCreateBot = typeof mf.createBot === 'function'
+        && (Number(this.config?.connectTimeoutMs) || 40000) >= 5000
+        && /createBot|injectPlugins|Bot/.test(Function.prototype.toString.call(mf.createBot));
+      if (isRealCreateBot && Number(this.config?.botCount) > 1) {
+        await new Promise((resolve) => {
+          connectStaggerChain = connectStaggerChain.then(async () => {
+            const elapsed = Date.now() - lastRealBotConnectAt;
+            const waitMs = Math.max(0, 3500 - elapsed);
+            if (waitMs > 0 && !signal?.aborted && !this.manualStop) {
+              await new Promise((r) => {
+                const t = setTimeout(r, waitMs);
+                t.unref?.();
+              });
+            }
+            lastRealBotConnectAt = Date.now();
+            resolve();
+          }).catch(() => resolve());
+        });
+        if (signal?.aborted || this.manualStop || generation !== this.generation) {
+          return this.getStatus();
+        }
+      }
+
       const options = {
         host, port: this.config.mc.port, username: this.username,
         version: this.config.mc.version,
         viewDistance: this.config.mc.viewDistance || 'tiny',
         physicsEnabled: true,
+        maxCatchupTicks: 1,
         hideErrors: true,
         logErrors: false,
         fakeHost: host || 'kingmc.vn',
@@ -326,7 +377,7 @@ class MinecraftSession extends EventEmitter {
           logger: this.logger
         });
       }
-      this.bot = mineflayer.createBot(options);
+      this.bot = mf.createBot(options);
       const bot = this.bot;
       if (typeof bot.blockAt !== 'function') bot.blockAt = () => null;
       attachEarlyPacketDropFilter(bot);
@@ -351,6 +402,8 @@ class MinecraftSession extends EventEmitter {
       this.connectTimer = setTimeout(() => {
         if (this.bot === bot && generation === this.generation && !this.manualStop && this.state === 'connecting') {
           this.logger.warn('minecraft_connect_timeout', { host });
+          this.lastError = `Minecraft connection timed out (${host}:${this.config.mc.port})`;
+          this.emit('event', { type: 'connection_error', message: this.lastError });
           try { bot.end('Connection timeout'); } catch (_) {}
           if (this.bot === bot && generation === this.generation && !bot._kbotEnded) {
             this.onEnd(bot, generation);
@@ -378,14 +431,14 @@ class MinecraftSession extends EventEmitter {
       });
       bot.on('kicked', (reason) => this.onKicked(bot, generation, reason));
       bot.on('end', () => this.onEnd(bot, generation));
-      bot.on('message', (json) => this.onMessage(bot, generation, json));
-      bot.on('actionBar', (json) => this.onMessage(bot, generation, json));
-      bot.on('title', (json) => this.onMessage(bot, generation, json));
+      bot.on('message', (json) => this.onMessage(bot, generation, json, 'message'));
+      bot.on('actionBar', (json) => this.onMessage(bot, generation, json, 'actionBar'));
+      bot.on('title', (json) => this.onMessage(bot, generation, json, 'title'));
       bot.on('chat', (username, message) => this.recordChat(bot, username, message));
       bot.on('whisper', (username, message) => this.recordChat(bot, username, message));
       bot.on('windowOpen', (win) => {
         this.windowRevision = (this.windowRevision || 0) + 1;
-        const title = typeof win?.title === 'object' ? (win.title.text || win.title.value || '') : (win?.title || '');
+        const title = extractChatMessage(win?.title);
         this.logger.info('window_opened', { title, type: win?.type });
         this.emit('event', { type: 'window_open', title, windowType: win?.type });
         if (win && typeof win.on === 'function') {
@@ -435,10 +488,13 @@ class MinecraftSession extends EventEmitter {
       message: `Bot đã kết nối thành công và xuất hiện tại máy chủ ${host || this._getCurrentHost()}.`
     });
     this.monitor.attach(bot);
+    if (!this.proxy && !this.hostPublicIp) {
+      void this.resolvePublicIp();
+    }
     if (this.ecoMode !== false) {
       applyEcoPhysics(bot);
       if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
-      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 30000, radius: 2 });
+      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 20000, radius: 1 });
     }
     this.navigator.onSpawn(bot);
     this.afk.mode = this.afkMode;
@@ -491,13 +547,22 @@ class MinecraftSession extends EventEmitter {
     this.startAutoChatLoop(bot, generation);
   }
 
+  _bumpInventoryRevision() {
+    if (this.inventoryUpdateTimer) {
+      clearTimeout(this.inventoryUpdateTimer);
+      this.inventoryUpdateTimer = null;
+    }
+    this.inventoryRevision += 1;
+    return this.inventoryRevision;
+  }
+
   scheduleInventoryRevisionBump(bot) {
     if (this.bot !== bot || this.manualStop) return;
     if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
     this.inventoryUpdateTimer = setTimeout(() => {
       this.inventoryUpdateTimer = null;
       if (this.bot !== bot || this.manualStop) return;
-      this.inventoryRevision += 1;
+      this._bumpInventoryRevision();
       const now = Date.now();
       if (now - this.lastInventoryStateEmitAt >= 2000) {
         this.lastInventoryStateEmitAt = now;
@@ -655,6 +720,10 @@ class MinecraftSession extends EventEmitter {
         if (s.mode === 'fixed') {
           const times = Array.isArray(s.times) && s.times.length ? s.times : (s.time ? [s.time] : []);
           if (times.includes(hhmm) && this.autoChatLastFixedKey.get(schedId) !== dateMinKey) {
+            if (!this.autoChatLastFixedKey.has(schedId) && this.autoChatLastFixedKey.size >= 200) {
+              const oldestKey = this.autoChatLastFixedKey.keys().next().value;
+              this.autoChatLastFixedKey.delete(oldestKey);
+            }
             this.autoChatLastFixedKey.set(schedId, dateMinKey);
             this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
           }
@@ -679,15 +748,15 @@ class MinecraftSession extends EventEmitter {
     const act = String(action || '').toLowerCase();
     if (act === 'stop') {
       if (!this.manualStop) {
-        void this.stop('scheduled_stop');
+        void this.stop('scheduled_stop').catch(() => {});
       }
     } else if (act === 'start') {
       if (this.manualStop && !this.restriction && this.hasCredentials()) {
-        void this.start();
+        void this.start().catch(() => {});
       }
     } else if (act === 'restart' || act === 'reconnect') {
       if (!this.restriction && this.hasCredentials()) {
-        void this.restart();
+        void this.restart().catch(() => {});
       }
     } else if (act === 'command' || act === 'chat') {
       const cmd = String(commandText || '').replace(/[\r\n\u0000-\u001f\u007f]/g, ' ').trim();
@@ -740,24 +809,32 @@ class MinecraftSession extends EventEmitter {
         clearInterval(this.botScheduleTimer);
         this.botScheduleTimer = null;
       }
-      this.botScheduleCycleState = null;
+      this.botScheduleCycleStates.clear();
       return;
     }
 
-    const first = schedules[0];
-    if (first && first.mode === 'cycle' && Array.isArray(first.items) && first.items.length > 0) {
-      const sig = JSON.stringify(first.items);
-      if (!this.botScheduleCycleState || this.botScheduleCycleState.sig !== sig) {
-        const firstWaitMs = applyScheduleJitterMs(first.items[0]?.afterMinutes || 120, 15, 60000);
-        this.botScheduleCycleState = {
+    const activeCycleIds = new Set();
+    for (let i = 0; i < schedules.length; i++) {
+      const s = schedules[i];
+      if (!s || s.enabled === false || s.mode !== 'cycle' || !Array.isArray(s.items) || s.items.length === 0) continue;
+      const schedId = String(s.id || `cycle_${i}`);
+      activeCycleIds.add(schedId);
+      const sig = JSON.stringify(s.items);
+      const existing = this.botScheduleCycleStates.get(schedId);
+      if (!existing || existing.sig !== sig) {
+        const firstWaitMs = applyScheduleJitterMs(s.items[0]?.afterMinutes || 120, 15, 60000);
+        this.botScheduleCycleStates.set(schedId, {
           sig,
           index: 0,
           stepStartedAt: Date.now(),
           targetWaitMs: firstWaitMs
-        };
+        });
       }
-    } else {
-      this.botScheduleCycleState = null;
+    }
+    for (const key of this.botScheduleCycleStates.keys()) {
+      if (!activeCycleIds.has(key)) {
+        this.botScheduleCycleStates.delete(key);
+      }
     }
 
     if (this.botScheduleTimer) return;
@@ -767,20 +844,24 @@ class MinecraftSession extends EventEmitter {
       const now = Date.now();
       const { dateStr, hhmm, dateMinKey, minuteOfDay, dayOfWeek } = getVietnamClockParts(new Date(now));
 
-      for (const s of list) {
+      for (let i = 0; i < list.length; i++) {
+        const s = list[i];
         if (!s || s.enabled === false) continue;
         if (Array.isArray(s.items)) {
-          if (s.mode === 'cycle' && this.botScheduleCycleState && s.items.length > 0) {
-            const idx = this.botScheduleCycleState.index % s.items.length;
+          if (s.mode === 'cycle' && s.items.length > 0) {
+            const schedId = String(s.id || `cycle_${i}`);
+            const cycleState = this.botScheduleCycleStates.get(schedId);
+            if (!cycleState) continue;
+            const idx = cycleState.index % s.items.length;
             const item = s.items[idx];
-            const waitMs = Number(this.botScheduleCycleState.targetWaitMs)
+            const waitMs = Number(cycleState.targetWaitMs)
               || applyScheduleJitterMs(item?.afterMinutes || 120, 15, 60000);
-            if (now - this.botScheduleCycleState.stepStartedAt >= waitMs) {
+            if (now - cycleState.stepStartedAt >= waitMs) {
               const nextIdx = (idx + 1) % s.items.length;
               const nextItem = s.items[nextIdx];
-              this.botScheduleCycleState.index = nextIdx;
-              this.botScheduleCycleState.stepStartedAt = now;
-              this.botScheduleCycleState.targetWaitMs = applyScheduleJitterMs(nextItem?.afterMinutes || 120, 15, 60000);
+              cycleState.index = nextIdx;
+              cycleState.stepStartedAt = now;
+              cycleState.targetWaitMs = applyScheduleJitterMs(nextItem?.afterMinutes || 120, 15, 60000);
               this.executeScheduledBotAction(item.action, item.command);
             }
           } else {
@@ -847,7 +928,11 @@ class MinecraftSession extends EventEmitter {
           }
         }
       } else if (kind === 'lobby') {
-        if (prevKind === 'login' || prevKind === 'unknown') this.auth.markAuthenticated(prevKind === 'login' ? 'login_area_exit' : 'direct_lobby_spawn');
+        if (prevKind === 'login') {
+          this.auth.markAuthenticated('login_area_exit');
+        } else if (prevKind === 'unknown' && !this.password) {
+          this.auth.markAuthenticated('direct_lobby_spawn');
+        }
         if (this.state !== 'entering') this.setState('entering', 'server_lobby');
         setPhysicsEnabled(bot, true, this.logger, 'kingmc_lobby');
         const now = Date.now();
@@ -867,6 +952,8 @@ class MinecraftSession extends EventEmitter {
           this.wasAfkBeforeDisconnect = false;
           this.lastReconnectAttemptCount = 0;
           this.setState('online', 'kingmc_in_game');
+          this.pruneMemory();
+          try { if (this.ecoMode !== false) pruneFarChunks(bot, 1); } catch (_) {}
           this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
           if (recoveredFromAfkDrop) {
             this.emit('event', {
@@ -892,13 +979,21 @@ class MinecraftSession extends EventEmitter {
     this.locationTimer.unref?.();
   }
 
-  onMessage(bot, generation, json) {
+  onMessage(bot, generation, json, source = 'message') {
     if (this.bot !== bot || generation !== this.generation) return;
     const text = extractChatMessage(json);
     if (!text) return;
-    const safeText = redactAuditValue(text);
-    this.logger.info('minecraft_message_received', { text: safeText.slice(0, 160) });
     const classification = classifyServerText(text);
+    const isHudOverlay = source === 'actionBar' || source === 'title';
+    if (isHudOverlay && this.state === 'online' && this.auth.isAuthenticated() && !classification) {
+      return;
+    }
+    const safeText = redactAuditValue(text);
+    if (this.state === 'online') {
+      this.logger.debug?.('minecraft_message_received', { text: safeText.slice(0, 160), source });
+    } else {
+      this.logger.info('minecraft_message_received', { text: safeText.slice(0, 160) });
+    }
     if (classification === 'maintenance') {
       if (this.state === 'maintenance') return;
       this.lastKickReason = 'Server maintenance';
@@ -1164,6 +1259,7 @@ class MinecraftSession extends EventEmitter {
     this.manualStop = true;
     this.isInAfkState = false;
     this.wasAfkBeforeDisconnect = false;
+    this.maintenanceWindow = false;
     this.generation += 1;
     this.clearTimers();
     if (this.maintenanceTimer) {
@@ -1187,7 +1283,6 @@ class MinecraftSession extends EventEmitter {
       clearTimeout(this.inventoryUpdateTimer);
       this.inventoryUpdateTimer = null;
     }
-    this.isEquippingTotem = false;
     this.logger?.debug?.('worker_pending_operation_cancelled', { reason });
     return this.getStatus();
   }
@@ -1198,7 +1293,7 @@ class MinecraftSession extends EventEmitter {
 
   async stop(reason = 'manager_stop', { emitEvent = true, signal } = {}) {
     if (signal?.aborted) {
-      this.abortPending(this._abortReasonFromSignal(signal));
+      return this.abortPending(this._abortReasonFromSignal(signal));
     }
     return this._haltSession(reason, { emitEvent });
   }
@@ -1243,7 +1338,7 @@ class MinecraftSession extends EventEmitter {
     this.spawnCommands = '';
     this._botSchedulesSig = '';
     this._autoChatSchedulesSig = '';
-    this.botScheduleCycleState = null;
+    this.botScheduleCycleStates.clear();
     this.botScheduleDailyJitter.clear();
     this.botScheduleLastFixedKey.clear();
     this.autoChatLastFixedKey.clear();
@@ -1255,6 +1350,7 @@ class MinecraftSession extends EventEmitter {
     this.username = '';
     this.password = '';
     this.proxy = null;
+    this.proxyConfigError = null;
     this.connectedAt = null;
     this.auth.setPassword('');
     this.reconnectAttempts = 0;
@@ -1284,10 +1380,10 @@ class MinecraftSession extends EventEmitter {
     if (!credentials || typeof credentials !== 'object') return false;
     const username = String(credentials.username || '').trim();
     const password = String(credentials.password ?? '');
-    if (!username || username.length > 64 || /[\r\n\u0000]/.test(username)) {
+    if (!username || username.length > 64 || /[\r\n\u0000-\u001f\u007f]/.test(username)) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
-    if (password.length > 380 || /[\r\n\u0000]/.test(password)) {
+    if (password.length > 380 || /[\r\n\u0000-\u001f\u007f]/.test(password)) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
     this.username = username;
@@ -1332,9 +1428,10 @@ class MinecraftSession extends EventEmitter {
     if (Object.hasOwn(settings, 'proxyUrl')) {
       try {
         this.proxy = parseSocksProxy(settings.proxyUrl, 'manager proxy');
+        this.proxyConfigError = null;
       } catch (err) {
-        this.proxy = null;
-        this.logger?.warn?.('worker_invalid_manager_proxy_ignored', { error: err?.message || String(err) });
+        this.proxyConfigError = err?.message || 'Invalid proxy configuration.';
+        this.logger?.warn?.('worker_invalid_manager_proxy_ignored', { error: this.proxyConfigError });
       }
     }
     if (Object.hasOwn(settings, 'ecoMode') && settings.ecoMode !== undefined) {
@@ -1474,7 +1571,7 @@ class MinecraftSession extends EventEmitter {
           if (it.name === 'totem_of_undying' || String(it.name).includes('totem')) totemCount += Number(it.count || 1);
           else if (it.name === 'golden_apple' || it.name === 'enchanted_golden_apple') goldenAppleCount += Number(it.count || 1);
           if (FOOD_ITEM_NAMES.has(it.name)) foodCount += Number(it.count || 1);
-          if (items.length < 36) items.push({ name: it.name, count: it.count, slot: s });
+          if (items.length < 45) items.push({ name: it.name, count: it.count, slot: s });
         }
       }
     }
@@ -1512,19 +1609,36 @@ class MinecraftSession extends EventEmitter {
 
   async resolvePublicIp() {
     if (this.hostPublicIp) return this.hostPublicIp;
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
-      timer.unref?.();
-      const res = await fetch('https://api.ipify.org', { signal: controller.signal });
-      clearTimeout(timer);
-      if (res.ok) {
-        const ip = (await res.text()).trim();
-        if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
-          this.hostPublicIp = ip;
+    if (sharedHostPublicIp) {
+      this.hostPublicIp = sharedHostPublicIp;
+      return this.hostPublicIp;
+    }
+    if (sharedPublicIpPromise) {
+      const ip = await sharedPublicIpPromise;
+      if (ip) this.hostPublicIp = ip;
+      return this.hostPublicIp;
+    }
+    sharedPublicIpPromise = (async () => {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 3000);
+        timer.unref?.();
+        const res = await fetch('https://api.ipify.org', { signal: controller.signal });
+        clearTimeout(timer);
+        if (res.ok) {
+          const ip = (await res.text()).trim();
+          if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+            sharedHostPublicIp = ip;
+            return ip;
+          }
         }
-      }
-    } catch (_) {}
+      } catch (_) {}
+      return null;
+    })().finally(() => {
+      sharedPublicIpPromise = null;
+    });
+    const resolved = await sharedPublicIpPromise;
+    if (resolved) this.hostPublicIp = resolved;
     return this.hostPublicIp;
   }
 
@@ -1533,20 +1647,21 @@ class MinecraftSession extends EventEmitter {
     if (!win) return null;
     const rawSlots = win.slots || [];
     const len = Array.isArray(rawSlots) ? rawSlots.length : 0;
+    const winType = String(win.type || 'minecraft:container');
 
     // Xác định chính xác số ô của container (loại trừ 36 ô inventory & hotbar của người chơi)
     let containerSlots = 54;
-    if (typeof win.inventoryStart === 'number' && win.inventoryStart > 0) {
+    if (typeof win.inventoryStart === 'number' && Number.isFinite(win.inventoryStart) && win.inventoryStart > 0) {
       containerSlots = win.inventoryStart;
-    } else if (win.type && /generic_9x([1-6])/.test(win.type)) {
-      const match = win.type.match(/generic_9x([1-6])/);
+    } else if (/generic_9x([1-6])/.test(winType)) {
+      const match = winType.match(/generic_9x([1-6])/);
       containerSlots = Number(match[1]) * 9;
     } else if (len > 36) {
       containerSlots = len - 36;
     } else if (len > 0) {
       containerSlots = len;
     }
-    containerSlots = Math.max(1, Math.min(54, containerSlots));
+    containerSlots = Math.max(1, Math.min(54, Math.floor(containerSlots)));
 
     // Mảng cố định đúng vị trí ô, ô trống trả về null
     const slots = new Array(containerSlots);
@@ -1564,14 +1679,11 @@ class MinecraftSession extends EventEmitter {
       }
     }
 
-    let title = win.title;
-    if (typeof title === 'object' && title !== null) {
-      title = title.text || title.value || JSON.stringify(title);
-    }
+    const title = extractChatMessage(win.title) || 'Container';
     return {
       id: win.id,
-      type: String(win.type || 'minecraft:container'),
-      title: String(title || 'Container'),
+      type: winType,
+      title,
       slots,
       totalSlots: containerSlots,
       revision: this.windowRevision || 0
@@ -1589,6 +1701,8 @@ class MinecraftSession extends EventEmitter {
     const proxy = parseSocksProxy(value, 'proxy');
     const shouldReconnect = Boolean(this.bot && ['online', 'entering', 'connecting', 'authenticating'].includes(this.state));
     this.proxy = proxy;
+    this.proxyConfigError = null;
+    if (!proxy) void this.resolvePublicIp();
     if (shouldReconnect && !signal?.aborted) await this.restart({ signal });
     return { ok: true, proxyEnabled: Boolean(proxy), reconnecting: shouldReconnect };
   }
@@ -1621,14 +1735,14 @@ class MinecraftSession extends EventEmitter {
       const item = bot.inventory.slots[slot];
       if (typeof bot.tossStack === 'function') {
         await bot.tossStack(item);
-        this.inventoryRevision += 1;
+        this._bumpInventoryRevision();
         return { ok: true, tossedSlot: slot, item: item.name, inventory: this.getInventorySnapshot(bot) };
       }
     }
     if (typeof bot.toss === 'function' && payload.itemType) {
       const count = Math.max(1, Math.min(640, Math.floor(Number(payload.count) || 1)));
       await bot.toss(payload.itemType, payload.metadata || null, count);
-      this.inventoryRevision += 1;
+      this._bumpInventoryRevision();
       return { ok: true, tossed: payload.itemType, inventory: this.getInventorySnapshot(bot) };
     }
     return { ok: true, note: 'toss_executed_or_empty_slot', inventory: this.getInventorySnapshot(bot) };
@@ -1645,9 +1759,12 @@ class MinecraftSession extends EventEmitter {
         const rawSrc = payload.sourceSlot ?? payload.slot;
         const srcSlotNum = (rawSrc !== undefined && rawSrc !== null && String(rawSrc).trim() !== '') ? Number(rawSrc) : null;
         const currentItemAtSrc = (srcSlotNum !== null && bot.inventory?.slots) ? bot.inventory.slots[srcSlotNum] : null;
+        const expectedItem = typeof payload.item === 'string'
+          ? payload.item.trim()
+          : (payload.item && typeof payload.item.name === 'string' ? payload.item.name.trim() : '');
 
-        // Chỉ trả về 409 nếu ô nguồn chỉ định bị mất item hoặc không còn tồn tại
-        if (srcSlotNum !== null && !currentItemAtSrc) {
+        // Chỉ trả về 409 nếu ô nguồn chỉ định bị mất item hoặc item đã thay đổi
+        if (srcSlotNum !== null && (!currentItemAtSrc || (expectedItem && currentItemAtSrc.name !== expectedItem))) {
           return {
             ok: false,
             error: 'inventory_revision_mismatch',
@@ -1687,7 +1804,7 @@ class MinecraftSession extends EventEmitter {
         await bot.clickWindow(src, 0, 0);
         await bot.clickWindow(dst, 0, 0);
       }
-      this.inventoryRevision += 1;
+      this._bumpInventoryRevision();
       return {
         ok: true,
         action: 'move',
@@ -1708,7 +1825,7 @@ class MinecraftSession extends EventEmitter {
         bot.inventory?.items?.().find(i => i.name === payload.item);
       if (item && typeof bot.equip === 'function') {
         await bot.equip(item, dest);
-        this.inventoryRevision += 1;
+        this._bumpInventoryRevision();
         return { ok: true, equipped: item.name, destination: dest, inventory: this.getInventorySnapshot(bot) };
       }
       return { ok: true, destination: dest, note: 'item_or_slot_empty', inventory: this.getInventorySnapshot(bot) };
@@ -1733,7 +1850,7 @@ class MinecraftSession extends EventEmitter {
           break;
         }
       }
-      this.inventoryRevision += 1;
+      this._bumpInventoryRevision();
       return {
         ok: true,
         action: 'unequip',
@@ -1752,7 +1869,7 @@ class MinecraftSession extends EventEmitter {
       const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
       if (Number.isInteger(slot) && slot >= 0 && slot <= 8 && typeof bot.setQuickBarSlot === 'function') {
         bot.setQuickBarSlot(slot);
-        this.inventoryRevision += 1;
+        this._bumpInventoryRevision();
         return { ok: true, quickBarSlot: slot, inventory: this.getInventorySnapshot(bot) };
       }
       return { ok: true, selected: slot, inventory: this.getInventorySnapshot(bot) };
@@ -1764,7 +1881,7 @@ class MinecraftSession extends EventEmitter {
   async clickWindow(payload = {}) {
     const bot = this.requireOnlineBot();
     const window = bot.currentWindow;
-    if (!window) return { ok: false, error: 'no_open_window' };
+    if (!window) return { ok: false, error: 'no_open_window', currentWindow: null };
     const rawSlot = payload.slot;
     const slot = rawSlot !== undefined && rawSlot !== null && String(rawSlot).trim() !== '' ? Number(rawSlot) : NaN;
     const mouseButton = Number(payload.mouseButton ?? 0);
@@ -1776,7 +1893,7 @@ class MinecraftSession extends EventEmitter {
     if (!Number.isInteger(mode) || mode < 0 || mode > 6) throw new Error('Invalid click mode (expected 0-6).');
     if (typeof bot.clickWindow === 'function') {
       await bot.clickWindow(slot, mouseButton, mode);
-      this.inventoryRevision += 1;
+      this._bumpInventoryRevision();
       this.windowRevision = (this.windowRevision || 0) + 1;
       this.emit('event', {
         type: 'window_click',
@@ -1807,6 +1924,10 @@ class MinecraftSession extends EventEmitter {
     const attach = () => {
       const socket = client?.socket;
       if (!socket || this.networkSockets.has(socket)) return;
+      try {
+        socket.setNoDelay?.(true);
+        socket.setKeepAlive?.(true, 15000);
+      } catch (_) {}
       this.networkSockets.set(socket, {
         bytesRead: Number(socket.bytesRead) || 0,
         bytesWritten: Number(socket.bytesWritten) || 0
@@ -1872,6 +1993,9 @@ class MinecraftSession extends EventEmitter {
             delete this.bot.uuidToUsername[uuid];
           }
         }
+      }
+      if (this.state === 'online' && this.ecoMode !== false) {
+        try { pruneFarChunks(this.bot, 1); } catch (_) {}
       }
     }
   }
@@ -1978,8 +2102,9 @@ class MinecraftSession extends EventEmitter {
       locationKind: this.lastLocationKind,
       locationState: this.lastLocationKind,
       afkMode: this.afkMode, proxyEnabled: Boolean(this.proxy),
-      hostIp: this.hostPublicIp, ip: this.hostPublicIp,
-      username: this.username || 'N/A', credentialsConfigured: this.hasCredentials(),
+      hostIp: this.proxy ? null : this.hostPublicIp,
+      ip: this.proxy ? (this.proxy.host || null) : this.hostPublicIp,
+      username: this.username || '', credentialsConfigured: this.hasCredentials(),
       connected: Boolean(this.bot && this.bot.player), reconnectAttempts: this.reconnectAttempts,
       reconnectCount: this.reconnectCount,
       connectedAt: this.connectedAt ? new Date(this.connectedAt).toISOString() : null,

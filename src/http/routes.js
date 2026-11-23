@@ -16,10 +16,6 @@ function matchesBotSecret(supplied, bot) {
 function attachBotRoutes(router, fleet, workerId, { legacy = false, config = null } = {}) {
   // RT-04: Secure instance resolution avoiding workerId enumeration
   const resolveInstance = (req, res, next) => {
-    if (req.body && JSON.stringify(req.body).length > 8192) {
-      return res.status(413).json({ ok: false, error: 'payload_too_large' });
-    }
-
     const supplied = extractWorkerToken(req);
     if (!supplied) {
       return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -118,7 +114,7 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false, config = nul
         status = 409;
       } else if (code === 'INVALID_PAYLOAD' || code === 'UNSUPPORTED_ACTION' || /unsupported|payload/i.test(msg)) {
         status = 400;
-      } else if (code === 'COMMAND_ABORTED' || /aborted/i.test(msg)) {
+      } else if (code === 'ABORT_ERR' || code === 'COMMAND_ABORTED' || /aborted/i.test(msg)) {
         // Only suppress response when the HTTP client itself actually disconnected;
         // internal AbortSignal timeouts (e.g. fetch timeout) MUST still respond with 504.
         if (abortController?.signal?.aborted || req.aborted || res.destroyed) {
@@ -175,7 +171,9 @@ function createRouter({ fleet, config }) {
     ok: true,
     service: 'kingmc-afk-worker',
     botCount: config?.botCount ?? 0,
-    bots: Array.isArray(config?.bots) ? config.bots.map((b) => ({ workerId: b.workerId, slot: b.slot })) : []
+    slots: Array.isArray(config?.bots)
+      ? config.bots.map((b, idx) => (Number.isInteger(b?.slot) ? b.slot : idx + 1))
+      : []
   }));
 
   router.get('/ready', (_req, res) => res.json({
@@ -193,6 +191,9 @@ function createRouter({ fleet, config }) {
       ok: true,
       service: 'kingmc-afk-worker',
       botCount: config.botCount,
+      bots: Array.isArray(config?.bots)
+        ? config.bots.map((b, idx) => ({ workerId: b.workerId, slot: Number.isInteger(b?.slot) ? b.slot : idx + 1 }))
+        : [],
       resource: fleet.health()
     });
   });

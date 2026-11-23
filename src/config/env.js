@@ -1,8 +1,59 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
 const { isIP } = require('node:net');
 const { parseSocksProxy } = require('./proxy');
 const { detectHostRuntime } = require('./host-runtime');
+
+function parseDotenvContent(content, targetEnv = process.env) {
+  let loaded = false;
+  for (const rawLine of String(content || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const cleaned = line.startsWith('export ') ? line.slice(7).trim() : line;
+    const eqIdx = cleaned.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = cleaned.slice(0, eqIdx).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    loaded = true;
+    if (targetEnv[key] !== undefined) continue;
+    let val = cleaned.slice(eqIdx + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1).replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+    } else {
+      const commentIdx = val.indexOf(' #');
+      if (commentIdx !== -1) val = val.slice(0, commentIdx).trim();
+    }
+    targetEnv[key] = val;
+  }
+  return loaded;
+}
+
+function loadDotenvSafe(options = {}) {
+  const targetEnv = options.env || process.env;
+  if (!options.forceFallback && !options.env) {
+    try {
+      const dotenv = require('dotenv');
+      if (dotenv && typeof dotenv.config === 'function') {
+        dotenv.config({ quiet: true, ...options });
+        return true;
+      }
+    } catch (_) {}
+  }
+  const candidates = options.path
+    ? [options.path]
+    : [path.resolve(process.cwd(), '.env'), path.resolve(__dirname, '..', '..', '.env')];
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const content = fs.readFileSync(candidate, 'utf8');
+      parseDotenvContent(content, targetEnv);
+      return true;
+    } catch (_) {}
+  }
+  return false;
+}
 
 function positiveInt(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
   const text = String(value ?? '').trim();
@@ -25,11 +76,31 @@ function required(value, key) {
   return text;
 }
 
+function parseGraceUntil(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) {
+    const num = Number(raw);
+    return Number.isFinite(num) && num > 0 ? num : 0;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
 function readSlot(env, slot, common) {
   const suffix = `_${slot}`;
   const slotValue = (name, legacyName = name) => env[`${name}${suffix}`] ?? (slot === 1 ? env[legacyName] : undefined);
   const workerId = required(slotValue('WORKER_ID'), `WORKER_ID${suffix}`);
   const secret = required(slotValue('WORKER_SECRET'), `WORKER_SECRET${suffix}`);
+  const rawPreviousSecret = String(slotValue('WORKER_PREVIOUS_SECRET') || '').trim();
+  if (rawPreviousSecret && /replace-with|example|changeme/i.test(rawPreviousSecret)) {
+    throw new Error(`WORKER_PREVIOUS_SECRET${suffix} must not be a placeholder.`);
+  }
+  if (rawPreviousSecret && rawPreviousSecret.length < 32) {
+    throw new Error(`WORKER_PREVIOUS_SECRET${suffix} must be a unique random secret of at least 32 characters.`);
+  }
+  const previousSecret = rawPreviousSecret || null;
+  const graceUntil = previousSecret ? parseGraceUntil(slotValue('WORKER_SECRET_GRACE_UNTIL')) : 0;
   // Minecraft credentials are managed by Discord Manager and fetched through
   // the worker-authenticated HTTPS bootstrap endpoint, never from host env.
   const username = '';
@@ -50,6 +121,8 @@ function readSlot(env, slot, common) {
     slot,
     workerId,
     secret,
+    previousSecret,
+    graceUntil,
     mc: Object.freeze({ ...common.mc, username, password, authType, viewDistance, proxy }),
     afk: Object.freeze({ ...common.afk, mode: afkMode })
   });
@@ -129,4 +202,4 @@ function loadConfig(env = process.env) {
   return Object.freeze({ ...common, botCount, bots: Object.freeze(bots) });
 }
 
-module.exports = { loadConfig, positiveInt, bool };
+module.exports = { loadConfig, positiveInt, bool, loadDotenvSafe, parseDotenvContent };

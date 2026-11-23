@@ -186,6 +186,10 @@ class LobbyNavigator {
     }
     this.bot = bot;
     if (!this.isReadyForNavigation(bot, 'try_join')) return;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
 
     if (this.joinCommand) {
       if (Date.now() - this.lastJoinAt < 3000) return;
@@ -263,7 +267,7 @@ class LobbyNavigator {
             this.triggerServerJoin(bot, `retry_after_unconfirmed_${this.serverJoinAttempts}`);
           }, 1000);
           this.retryTimer.unref?.();
-        } else if (kind === 'lobby' && this.serverJoinAttempts >= 3) {
+        } else if (this.serverJoinAttempts >= 3) {
           this.lastExhaustedAt = Date.now();
         }
       };
@@ -272,70 +276,99 @@ class LobbyNavigator {
       this.postJoinTimer.unref?.();
     };
 
-    const doClickSlot24 = async (window) => {
-      if (clicked || this.bot !== bot) return;
-      if (!this.isReadyForNavigation(bot, 'menu_click')) {
-        this.serverJoinBusy = false;
-        return;
-      }
-      clicked = true;
-      this.clickInProgress = true;
-      this.clearMenuListener(bot);
-      if (this.retryTimer) clearTimeout(this.retryTimer);
-      this.retryTimer = null;
-      this.transitionTo('CLICK_SERVER');
-      this.clickTimer = setTimeout(async () => {
-        this.clickTimer = null;
-        if (this.bot !== bot) return;
+    const doClickSlot24 = (window) => {
+      try {
+        if (clicked || this.bot !== bot) return;
         if (!this.isReadyForNavigation(bot, 'menu_click')) {
-          this.clickInProgress = false;
           this.serverJoinBusy = false;
           return;
         }
-        const targetWindow = bot.currentWindow || window;
-        if (!targetWindow) {
-          this.clickInProgress = false;
-          this.serverJoinBusy = false;
-          this.transitionTo('IDLE', { reason: 'menu_window_missing' });
-          return;
-        }
-        if (Array.isArray(targetWindow.slots) && targetWindow.slots.length <= 24) {
-          this.logger.warn('lobby_menu_missing_slot_24', { totalSlots: targetWindow.slots.length });
-          this.clickInProgress = false;
-          this.serverJoinBusy = false;
-          try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
-          this.transitionTo('IDLE', { reason: 'missing_slot_24' });
-          return;
-        }
-        try {
-          this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
-          await Promise.race([
-            bot.clickWindow(24, 0, 0),
-            new Promise((_, reject) => {
-              const t = setTimeout(() => reject(new Error('click_window_timeout')), 4000);
-              t.unref?.();
-            })
-          ]);
-          if (this.bot !== bot) return;
-          scheduleJoinVerification(Date.now() + 6000);
-        } catch (clickErr) {
-          if (this.bot !== bot) return;
-          this.logger.warn('lobby_menu_click_failed', { error: clickErr?.message || 'click_failed' });
-          this.serverJoinBusy = false;
-          this.transitionTo('IDLE', { reason: 'click_failed' });
-          this.lastExhaustedAt = Date.now();
-          if (this.serverJoinAttempts < 3 && this.isReadyForNavigation(bot, 'click_retry')) {
-            this.retryTimer = setTimeout(() => {
-              this.retryTimer = null;
-              this.triggerServerJoin(bot, `retry_after_click_error_${this.serverJoinAttempts}`);
-            }, 30000);
-            this.retryTimer.unref?.();
+        clicked = true;
+        this.clickInProgress = true;
+        this.clearMenuListener(bot);
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = null;
+        this.transitionTo('CLICK_SERVER');
+        this.clickTimer = setTimeout(async () => {
+          this.clickTimer = null;
+          let clickTimeout = null;
+          try {
+            if (this.bot !== bot) return;
+            if (!this.isReadyForNavigation(bot, 'menu_click')) {
+              this.clickInProgress = false;
+              this.serverJoinBusy = false;
+              return;
+            }
+            const targetWindow = bot.currentWindow || window;
+            if (!targetWindow) {
+              this.clickInProgress = false;
+              this.serverJoinBusy = false;
+              this.transitionTo('IDLE', { reason: 'menu_window_missing' });
+              if (this.serverJoinAttempts >= 3) {
+                this.lastExhaustedAt = Date.now();
+              }
+              return;
+            }
+            if (Array.isArray(targetWindow.slots) && targetWindow.slots.length <= 24) {
+              this.logger.warn('lobby_menu_missing_slot_24', { totalSlots: targetWindow.slots.length });
+              this.clickInProgress = false;
+              this.serverJoinBusy = false;
+              try { if (bot.currentWindow) bot.closeWindow(bot.currentWindow); } catch (_) {}
+              this.transitionTo('IDLE', { reason: 'missing_slot_24' });
+              if (this.serverJoinAttempts >= 3) {
+                this.lastExhaustedAt = Date.now();
+              }
+              return;
+            }
+            try {
+              this.logger.info('lobby_menu_clicking_slot_24', { slot: 24, target: 'KingSMP' });
+              const clickPromise = Promise.resolve().then(() => bot.clickWindow(24, 0, 0));
+              clickPromise.catch(() => {});
+              await Promise.race([
+                clickPromise,
+                new Promise((_, reject) => {
+                  clickTimeout = setTimeout(() => reject(new Error('click_window_timeout')), 4000);
+                  clickTimeout.unref?.();
+                })
+              ]);
+              if (this.bot !== bot) return;
+              scheduleJoinVerification(Date.now() + 6000);
+            } catch (clickErr) {
+              if (this.bot !== bot) return;
+              this.logger.warn('lobby_menu_click_failed', { error: clickErr?.message || 'click_failed' });
+              this.serverJoinBusy = false;
+              this.transitionTo('IDLE', { reason: 'click_failed' });
+              if (this.serverJoinAttempts >= 3) {
+                this.lastExhaustedAt = Date.now();
+              } else if (this.isReadyForNavigation(bot, 'click_retry')) {
+                this.retryTimer = setTimeout(() => {
+                  this.retryTimer = null;
+                  this.triggerServerJoin(bot, `retry_after_click_error_${this.serverJoinAttempts}`);
+                }, 1000);
+                this.retryTimer.unref?.();
+              }
+            }
+          } catch (unexpectedErr) {
+            if (this.bot !== bot) return;
+            this.logger?.warn?.('lobby_menu_click_unexpected_error', { error: unexpectedErr?.message || 'click_unexpected_error' });
+            this.serverJoinBusy = false;
+            this.transitionTo('IDLE', { reason: 'click_failed' });
+            if (this.serverJoinAttempts >= 3) {
+              this.lastExhaustedAt = Date.now();
+            }
+          } finally {
+            if (clickTimeout) clearTimeout(clickTimeout);
+            if (this.bot === bot) this.clickInProgress = false;
           }
-        } finally {
-          if (this.bot === bot) this.clickInProgress = false;
+        }, 300);
+        this.clickTimer.unref?.();
+      } catch (err) {
+        this.logger?.warn?.('lobby_menu_click_setup_failed', { error: err?.message || 'click_setup_failed' });
+        if (this.bot === bot) {
+          this.clickInProgress = false;
+          this.serverJoinBusy = false;
         }
-      }, 300);
-      this.clickTimer.unref?.();
+      }
     };
 
     if (bot.currentWindow) {
@@ -353,9 +386,7 @@ class LobbyNavigator {
           this.triggerServerJoin(bot, `retry_after_timeout_${this.serverJoinAttempts}`);
         } else {
           this.lastExhaustedAt = Date.now();
-          if (this.state === 'WAIT_MENU') {
-            this.transitionTo('IDLE', { reason: 'menu_window_timeout' });
-          }
+          this.transitionTo('IDLE', { reason: 'menu_window_timeout' });
         }
       }, 5000);
       this.pendingMenuCleanup.unref?.();

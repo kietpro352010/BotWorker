@@ -28,6 +28,7 @@ class WispbytePoller {
     this.failures = 0;
     this.consecutiveAuthFailures = 0;
     this.authPaused = false;
+    this.authStopPending = false;
     this.authFailureThreshold = Math.max(1, Number(authFailureThreshold) || 5);
     this.authBackoffScheduleMs = Array.isArray(authBackoffScheduleMs) && authBackoffScheduleMs.length
       ? authBackoffScheduleMs
@@ -45,6 +46,7 @@ class WispbytePoller {
     this.stopping = false;
     this.consecutiveAuthFailures = 0;
     this.authPaused = false;
+    this.authStopPending = false;
     this.stopController = new AbortController();
     this.loopPromise = this.run().finally(() => { this.loopPromise = null; });
     return this.loopPromise;
@@ -60,13 +62,27 @@ class WispbytePoller {
       threshold: this.authFailureThreshold,
       retryInMs: delayMs
     });
-    if (this.consecutiveAuthFailures >= this.authFailureThreshold && !this.authPaused) {
-      this.authPaused = true;
-      this.logger?.error?.('worker_registration_lost', {
-        status,
-        consecutiveAuthFailures: this.consecutiveAuthFailures
-      });
-      await this.runtime?.execute?.('stop').catch(() => {});
+    if (this.consecutiveAuthFailures >= this.authFailureThreshold) {
+      if (!this.authPaused) {
+        this.authPaused = true;
+        this.authStopPending = true;
+        this.logger?.error?.('worker_registration_lost', {
+          status,
+          consecutiveAuthFailures: this.consecutiveAuthFailures
+        });
+      }
+      if (this.authStopPending && typeof this.runtime?.execute === 'function') {
+        try {
+          await this.runtime.execute('stop');
+          this.authStopPending = false;
+        } catch (err) {
+          if (err?.code === 'LIFECYCLE_CONFLICT' || /already in progress|conflicting/i.test(err?.message || '')) {
+            this.authStopPending = true;
+          } else {
+            this.authStopPending = false;
+          }
+        }
+      }
     }
     return delayMs;
   }
@@ -214,6 +230,7 @@ class WispbytePoller {
           this.logger?.info?.('worker_auth_recovered', { previousAuthFailures: this.consecutiveAuthFailures });
           this.consecutiveAuthFailures = 0;
           this.authPaused = false;
+          this.authStopPending = false;
         }
         if (response.command?.action) {
           const command = response.command;
@@ -236,11 +253,12 @@ class WispbytePoller {
             result,
             completedAt: new Date().toISOString()
           };
+          let authDelayMs = 0;
           try {
             await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, resultPayload);
           } catch (err) {
             if ([401, 404].includes(err.status)) {
-              await this._handleAuthFailure(err.status);
+              authDelayMs = await this._handleAuthFailure(err.status);
             }
             this.logger?.warn?.('wispbyte_result_send_failed_queueing', {
               commandId: command.commandId,
@@ -248,11 +266,11 @@ class WispbytePoller {
             });
             this.enqueueResult(resultPayload);
           }
-          await cancellableSleep(500, this.stopController.signal);
+          await cancellableSleep(authDelayMs > 0 ? authDelayMs : 500, this.stopController.signal);
         } else {
           // Adaptive polling interval: 1.5s when active/transitioning, 5s-8s when steady/idle
           const stateStr = String(prepared.payload?.state || '').toLowerCase();
-          const isIdle = ['idle', 'stopped', 'disconnected', 'afk', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
+          const isIdle = ['idle', 'stopped', 'disconnected', 'error', 'afk', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
           const adaptiveDelayMs = isIdle ? (5000 + Math.floor(Math.random() * 3000)) : 1500;
           await cancellableSleep(adaptiveDelayMs, this.stopController.signal);
         }

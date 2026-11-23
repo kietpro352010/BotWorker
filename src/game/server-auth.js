@@ -17,43 +17,43 @@ function cleanText(input) {
     .trim();
 }
 
+function walkChatNode(node, depth = 0) {
+  if (!node || depth > 32) return '';
+  if (typeof node === 'string') return node;
+  let text = '';
+  if (typeof node.text === 'string') {
+    text = node.text;
+  } else if (node.text && typeof node.text === 'object') {
+    text = walkChatNode(node.text, depth + 1);
+  }
+  if (typeof node.translate === 'string') {
+    text += node.translate;
+  }
+  if (Array.isArray(node.with)) {
+    text += node.with.slice(0, 32).map((child) => walkChatNode(child, depth + 1)).join('');
+  }
+  if (Array.isArray(node.extra)) {
+    text += node.extra.slice(0, 64).map((child) => walkChatNode(child, depth + 1)).join('');
+  }
+  if (!text && node.value !== undefined) {
+    text += walkChatNode(node.value, depth + 1);
+  }
+  return text;
+}
+
 function extractChatMessage(raw) {
   if (!raw) return '';
   if (typeof raw === 'object' && typeof raw.toPlainText === 'function') {
     return cleanText(raw.toPlainText());
   }
   if (typeof raw === 'object') {
-    const walk = (node, depth = 0) => {
-      if (!node || depth > 32) return '';
-      if (typeof node === 'string') return node;
-      let text = typeof node.text === 'string' ? node.text : '';
-      if (typeof node.translate === 'string') {
-        text += node.translate;
-      }
-      if (Array.isArray(node.with)) {
-        text += node.with.slice(0, 32).map((child) => walk(child, depth + 1)).join('');
-      }
-      if (Array.isArray(node.extra)) {
-        text += node.extra.slice(0, 64).map((child) => walk(child, depth + 1)).join('');
-      }
-      return text;
-    };
-    return cleanText(walk(raw));
+    return cleanText(walkChatNode(raw));
   }
-  let str = typeof raw === 'string' ? raw : String(raw);
-  if (typeof str === 'string' && (str.startsWith('{') || str.startsWith('['))) {
+  const str = typeof raw === 'string' ? raw : String(raw);
+  if (str.startsWith('{') || str.startsWith('[')) {
     try {
       const obj = JSON.parse(str);
-      const walk = (node, depth = 0) => {
-        if (!node || depth > 32) return '';
-        if (typeof node === 'string') return node;
-        let text = typeof node.text === 'string' ? node.text : '';
-        if (typeof node.translate === 'string') text += node.translate;
-        if (Array.isArray(node.with)) text += node.with.slice(0, 32).map((child) => walk(child, depth + 1)).join('');
-        if (Array.isArray(node.extra)) text += node.extra.slice(0, 64).map((child) => walk(child, depth + 1)).join('');
-        return text;
-      };
-      return cleanText(walk(obj));
+      return cleanText(walkChatNode(obj));
     } catch (_) {}
   }
   return cleanText(str);
@@ -70,7 +70,7 @@ function isRestrictedMinecraftCommand(value) {
 function redactAuditValue(text) {
   if (typeof text !== 'string') return text;
   return text
-    .replace(/(\/(?:[a-z0-9_-]+:)?(?:login|l|register|reg|dn|dk|changepassword|changepass)\s+).+$/gim, '$1*** REDACTED ***')
+    .replace(/(\/(?:[a-z0-9_-]+:)?(?:login|l|register|reg|dn|dk|changepassword|changepass|password|unregister|email)\s+).+$/gim, '$1*** REDACTED ***')
     .replace(/(password\s*[:=]\s*)(\S+)/gi, '$1*** REDACTED ***');
 }
 
@@ -122,17 +122,23 @@ function isAuthenticationFailureMessage(message) {
 }
 
 class ServerAuth {
-  constructor({ password, enabled = true, logger }) {
-    this.password = password;
+  constructor({ password, enabled = true, logger, onAuthFailed = null }) {
     this.enabled = enabled;
     this.logger = logger;
+    this.onAuthFailed = typeof onAuthFailed === 'function' ? onAuthFailed : null;
     this.lastActionAt = 0;
     this.lastAuthDnActionAt = 0;
     this.authenticated = !enabled;
+    this.password = '';
+    this.setPassword(password);
   }
 
   setPassword(password) {
-    this.password = String(password || '');
+    const next = String(password ?? '');
+    if (next.length > 380 || /[\r\n\u0000-\u001f\u007f]/.test(next)) {
+      throw new Error('Minecraft password contains invalid characters or exceeds 380 characters.');
+    }
+    this.password = next;
     this.authenticated = !this.enabled;
   }
 
@@ -161,6 +167,8 @@ class ServerAuth {
     if (isAuthenticationFailureMessage(text)) {
       this.authenticated = false;
       this.logger.warn('minecraft_authentication_failed');
+      const errMsg = redactAuditValue(cleanText(message)) || 'Minecraft authentication failed.';
+      try { this.onAuthFailed?.({ kind: 'auth_failed', message: errMsg }); } catch (_) {}
       return true;
     }
     if (isAuthenticationSuccessMessage(text)) {
@@ -177,7 +185,12 @@ class ServerAuth {
     if (!this.password) {
       if (Date.now() - this.lastActionAt >= 5000) {
         this.lastActionAt = Date.now();
-        this.logger.warn('minecraft_auth_prompt_missing_password', { kind: isRegister ? 'register' : 'login' });
+        const kind = isRegister ? 'register' : 'login';
+        this.logger.warn('minecraft_auth_prompt_missing_password', { kind });
+        const errMsg = kind === 'register'
+          ? 'Server requires /register but no Minecraft password is configured.'
+          : 'Server requires /login but no Minecraft password is configured.';
+        try { this.onAuthFailed?.({ kind: 'missing_password', promptKind: kind, message: errMsg }); } catch (_) {}
       }
       return false;
     }

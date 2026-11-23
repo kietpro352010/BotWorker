@@ -8,14 +8,17 @@ const DROP_EVENTS = new Set([
   'explosion', 'block_break_animation',
   'entity_effect', 'remove_entity_effect', 'open_horse_window',
   'animation', 'step', 'resource_pack_send', 'add_resource_pack', 'remove_resource_pack',
-  'boss_bar', 'scoreboard_objective', 'scoreboard_score', 'scoreboard_display_objective', 'teams'
+  'boss_bar', 'scoreboard_objective', 'scoreboard_score', 'scoreboard_display_objective', 'teams',
+  'playerlist_header', 'tile_entity_data', 'block_action', 'map', 'trade_list',
+  'open_book', 'open_sign_entity', 'craft_progress_bar', 'advancements',
+  'select_advancement_tab', 'declare_recipes', 'unlock_recipes', 'statistics', 'tags'
 ]);
 
 const ENTITY_UPDATE_EVENTS = new Set([
   'entity_velocity', 'rel_entity_move', 'entity_move_look', 'entity_look',
   'entity_teleport', 'entity_head_rotation', 'entity_status', 'entity_equipment',
   'bed', 'collect', 'set_passengers', 'attach_entity', 'entity_metadata',
-  'entity_destroy', 'destroy_entity'
+  'entity_destroy', 'destroy_entity', 'update_attributes', 'entity_update_attributes'
 ]);
 
 const DISABLED_PLUGINS = Object.freeze({
@@ -23,7 +26,9 @@ const DISABLED_PLUGINS = Object.freeze({
   craft: false, creative: false, enchantment_table: false, furnace: false, anvil: false,
   book: false, command_block: false, villager: false, place_block: false,
   place_entity: false, ray_trace: false, resource_pack: false,
-  generic_place: false, rain: false
+  generic_place: false, rain: false,
+  boss_bar: false, scoreboard: false, team: false, tablist: false,
+  bed: false, block_actions: false, breath: false, experience: false, spawn_point: false
 });
 
 function attachEarlyPacketDropFilter(bot) {
@@ -33,6 +38,7 @@ function attachEarlyPacketDropFilter(bot) {
     const originalEmit = client.emit;
     client.emit = function emit(name, ...args) {
       if (DROP_EVENTS.has(name)) return false;
+      if (name === 'player_remove') return false;
       if (ENTITY_UPDATE_EVENTS.has(name)) {
         const packet = args[0];
         const botId = bot?.entity?.id;
@@ -44,6 +50,39 @@ function attachEarlyPacketDropFilter(bot) {
             return originalEmit.apply(this, [name, ...args]);
           }
         }
+        return false;
+      }
+      if (name === 'player_info') {
+        const packet = args[0];
+        if (packet && Array.isArray(packet.data)) {
+          const botName = bot?.username || bot?._client?.username;
+          const botUuid = bot?.player?.uuid || bot?._client?.uuid;
+          if (botName || botUuid) {
+            const filtered = packet.data.filter((item) => {
+              if (!item) return false;
+              if (botUuid && item.uuid === botUuid) return true;
+              const itemName = item.player?.name || item.name;
+              if (botName && itemName && itemName === botName) return true;
+              return false;
+            });
+            if (filtered.length === 0) return false;
+            packet.data = filtered;
+          }
+        }
+      } else if (name === 'map_chunk') {
+        const packet = args[0];
+        if (packet && typeof packet === 'object') {
+          if (Array.isArray(packet.blockEntities) && packet.blockEntities.length > 0) {
+            packet.blockEntities = [];
+          }
+          packet.skyLight = undefined;
+          packet.blockLight = undefined;
+          packet.skyLightMask = undefined;
+          packet.blockLightMask = undefined;
+          packet.emptySkyLightMask = undefined;
+          packet.emptyBlockLightMask = undefined;
+        }
+      } else if (name === 'update_light' && bot?.world) {
         return false;
       }
       return originalEmit.apply(this, [name, ...args]);
