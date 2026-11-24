@@ -164,6 +164,12 @@ class WorkerFleet {
     };
   }
 
+  pruneAllMemory() {
+    for (const instance of this.instances.values()) {
+      instance.session.pruneMemory?.();
+    }
+  }
+
   sampleResources() {
     const now = Date.now();
     const elapsedMs = Math.max(100, now - this.lastResourceSampleAt);
@@ -232,24 +238,22 @@ class WorkerFleet {
     }, 45000);
     this.heartbeatTimer.unref?.();
 
+    const resourceIntervalMs = this.config.transport === 'wispbyte-poll' ? 30000 : 20000;
+    const pruneThresholdMb = this.config.platform === 'wispbyte' ? 165 : 200;
     this.resourceTimer = setInterval(() => {
       const metrics = this.sampleResources();
       const rssMb = Math.round(metrics.rssMb);
 
-      // Proactive lightweight memory pruning above 200MB to prevent Wispbyte RAM spikes
-      if (rssMb > 200) {
-        for (const instance of this.instances.values()) {
-          instance.session.pruneMemory?.();
-        }
+      // Proactive lightweight memory pruning to prevent Wispbyte RAM spikes
+      if (rssMb > pruneThresholdMb) {
+        this.pruneAllMemory();
       }
 
-      // Memory Watchdog (Trụ cột 1.1: Tự động dọn RAM nếu > 350MB, giữ cooldown 120s tránh V8 GC liên tục)
+      // Emergency Memory Watchdog (>350MB RSS, cooldown 180s tránh V8 GC liên tục)
       if (rssMb > 350) {
-        for (const instance of this.instances.values()) {
-          instance.session.pruneMemory?.();
-        }
+        this.pruneAllMemory();
         const nowGc = Date.now();
-        if (typeof global.gc === 'function' && nowGc - this.lastForcedGcAt >= 120000) {
+        if (typeof global.gc === 'function' && nowGc - this.lastForcedGcAt >= 180000) {
           this.lastForcedGcAt = nowGc;
           try { global.gc(); } catch (_) {}
         }
@@ -259,7 +263,7 @@ class WorkerFleet {
         this.lastResourceWarningAt = Date.now();
         this.logger.warn('worker_memory_high', { rssMb, thresholdMb: this.config.rssWarnMb, botCount: this.instances.size });
       }
-    }, 20000);
+    }, resourceIntervalMs);
     this.resourceTimer.unref?.();
 
     this.state = FleetState.RUNNING;

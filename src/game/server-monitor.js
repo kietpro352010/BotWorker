@@ -1,7 +1,7 @@
 'use strict';
 
 class ServerMonitor {
-  constructor({ sampleMs = 10000 } = {}) {
+  constructor({ sampleMs = 20000 } = {}) {
     this.sampleMs = sampleMs;
     this.bot = null;
     this.ticks = 0;

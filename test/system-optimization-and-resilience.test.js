@@ -9,7 +9,15 @@ const WorkerFleet = require('../src/services/worker-fleet');
 const logger = require('../src/utils/logger');
 const { ServerAuth, redactAuditValue } = require('../src/game/server-auth');
 const { detectHostRuntime } = require('../src/config/host-runtime');
-const { pruneFarChunks, enforceZeroFarmEntities, stopEntityPruner } = require('../src/game/packet-optimization');
+const {
+  pruneFarChunks,
+  enforceZeroFarmEntities,
+  stopEntityPruner,
+  attachEarlyPacketDropFilter,
+  setAfkWorldChunkLock,
+  setPhysicsEnabled,
+  AFK_GROUND_SENTINEL
+} = require('../src/game/packet-optimization');
 const { MinecraftSession } = require('../src/game/minecraft-session');
 
 function createSilentLogger() {
@@ -454,6 +462,91 @@ async function testMinecraftSessionWindowSnapshotAndClick() {
   console.log('✅ 6. MinecraftSession window snapshot, slot extraction & window lifecycle verified.');
 }
 
+async function testAfkWorldChunkLockAndIdleTimers() {
+  console.log('7. Testing AFK zero-chunk lock, idle autoChat zero-timer & Map chat dedup...');
+  const cols = new Map([['0,0', { chunkX: 0, chunkZ: 0 }], ['1,0', { chunkX: 1, chunkZ: 0 }]]);
+  const afkBot = new EventEmitter();
+  afkBot.physicsEnabled = false;
+  afkBot.entity = { id: 10, position: { x: 8, y: 64, z: 8 } };
+  afkBot.world = {
+    getColumns: () => [...cols.values()],
+    unloadColumn: (x, z) => cols.delete(`${x},${z}`)
+  };
+  let origCalled = 0;
+  afkBot.blockAt = () => {
+    origCalled += 1;
+    return { name: 'stone' };
+  };
+  afkBot._client = new EventEmitter();
+  attachEarlyPacketDropFilter(afkBot);
+
+  let receivedChunk = 0;
+  let receivedBlockChange = 0;
+  afkBot._client.on('map_chunk', () => { receivedChunk += 1; });
+  afkBot._client.on('block_change', () => { receivedBlockChange += 1; });
+
+  setAfkWorldChunkLock(afkBot, true);
+  assert.strictEqual(cols.size, 0, 'AFK chunk lock must unload 100% of loaded chunk columns');
+  assert.strictEqual(afkBot.blockAt({ x: 8, y: 64, z: 8 }), AFK_GROUND_SENTINEL);
+  assert.strictEqual(origCalled, 0, 'Wrapped blockAt must short-circuit to zero-alloc sentinel when locked');
+
+  afkBot._client.emit('map_chunk', { x: 0, z: 0 });
+  afkBot._client.emit('block_change', { location: { x: 8, y: 64, z: 8 } });
+  assert.strictEqual(receivedChunk, 0, 'map_chunk must be dropped while AFK chunk lock is active');
+  assert.strictEqual(receivedBlockChange, 0, 'block_change must be dropped while AFK chunk lock is active');
+
+  // Re-enabling physics or receiving respawn unlocks chunks
+  setPhysicsEnabled(afkBot, true);
+  assert.strictEqual(afkBot._kingmcAfkWorldLocked, false);
+  assert.deepStrictEqual(afkBot.blockAt({ x: 8, y: 64, z: 8 }), { name: 'stone' });
+  assert.strictEqual(origCalled, 1);
+
+  afkBot._client.emit('map_chunk', { x: 0, z: 0 });
+  assert.strictEqual(receivedChunk, 1, 'In-range chunk packet allowed when unlocked');
+  afkBot._client.emit('map_chunk', { x: 10, z: 10 });
+  assert.strictEqual(receivedChunk, 1, 'Out-of-radius (>1 chunk) chunk packet dropped');
+
+  afkBot.physicsEnabled = false;
+  setAfkWorldChunkLock(afkBot, true);
+  assert.strictEqual(afkBot._kingmcAfkWorldLocked, true);
+  afkBot._client.emit('respawn', {});
+  assert.strictEqual(afkBot._kingmcAfkWorldLocked, false, 'respawn packet must unlock AFK chunk lock');
+
+  // Idle autoChatSchedules -> 0 timers; enabled schedule -> active timer; disable -> cleared
+  const session = new MinecraftSession({
+    workerId: 'bot-idle',
+    transport: 'wispbyte-poll',
+    mc: { host: 'kingmc.vn', username: 'IdleTester' }
+  }, createSilentLogger());
+  session.bot = afkBot;
+  session.manualStop = false;
+  session.autoChatSchedules = [];
+  session.syncAutoChatLoop(afkBot, session.generation);
+  assert.strictEqual(session.autoChatTimer, null, 'Empty autoChatSchedules must allocate zero intervals');
+
+  session.applyManagerSettings({
+    autoChatSchedules: [{ id: 'c1', enabled: true, mode: 'interval', intervalSeconds: 60, messages: ['hello'] }]
+  });
+  assert.ok(session.autoChatTimer, 'Enabled autoChatSchedule must activate autoChatTimer');
+
+  session.applyManagerSettings({
+    autoChatSchedules: [{ id: 'c1', enabled: false, mode: 'interval', intervalSeconds: 60, messages: ['hello'] }]
+  });
+  assert.strictEqual(session.autoChatTimer, null, 'Disabling autoChatSchedule must stop autoChatTimer');
+
+  // Chat deduplication Map without timers
+  const emittedChats = [];
+  session.on('event', (e) => { if (e?.type === 'chat') emittedChats.push(e.message); });
+  session._recordChatMessage('xin chao', 'chat');
+  session._recordChatMessage('xin chao', 'chat');
+  assert.strictEqual(emittedChats.length, 1, 'Duplicate chat within window suppressed without per-message timers');
+  assert.ok(session.recentChatSignatures instanceof Map);
+
+  session.cleanupSessionResources();
+  afkBot.emit('end');
+  console.log('✅ 7. AFK zero-chunk lock, idle autoChat zero-timer & Map chat dedup verified.');
+}
+
 async function main() {
   console.log('--- [WORKER SYSTEM OPTIMIZATION & RESILIENCE TESTS] ---');
   await testManagerReporterDigestAndRollback();
@@ -462,6 +555,7 @@ async function main() {
   await testServerAuthAndHardenedLogger();
   await testHostRuntimeParityAndPacketOptimizationEdgeCases();
   await testMinecraftSessionWindowSnapshotAndClick();
+  await testAfkWorldChunkLockAndIdleTimers();
   console.log('\n🎉 ALL WORKER OPTIMIZATION & RESILIENCE TESTS PASSED 100%!');
 }
 

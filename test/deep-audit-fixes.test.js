@@ -2340,11 +2340,11 @@ async function testW18ResourceAndAdaptivePollingOptimizations() {
     scheduled[0].fn();
     assert.strictEqual(scheduled.length, 1);
 
-    // Move to AFK world -> switches to 5000ms
+    // Move to AFK world -> switches to 10000ms
     fakeBot.entity.position = { x: 250, y: 70, z: 250 };
     scheduled[0].fn();
-    assert.strictEqual(scheduled.length, 2, 'In-game state must switch locationTimer to 5000ms');
-    assert.strictEqual(scheduled[1].ms, 5000);
+    assert.strictEqual(scheduled.length, 2, 'In-game state must switch locationTimer to 10000ms');
+    assert.strictEqual(scheduled[1].ms, 10000);
     assert.strictEqual(clearedCount, 1);
 
     // Return to lobby -> switches back to 1500ms

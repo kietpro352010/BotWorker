@@ -21,6 +21,12 @@ const ENTITY_UPDATE_EVENTS = new Set([
   'entity_destroy', 'destroy_entity', 'update_attributes', 'entity_update_attributes'
 ]);
 
+const AFK_WORLD_DROP_EVENTS = new Set([
+  'map_chunk', 'unload_chunk', 'multi_block_change', 'block_change', 'world_event', 'world_border'
+]);
+
+const AFK_GROUND_SENTINEL = Object.freeze({ type: 0, name: 'air', boundingBox: 'empty', stateId: 0 });
+
 const DISABLED_PLUGINS = Object.freeze({
   particle: false, sound: false, explosion: false, fishing: false, digging: false,
   craft: false, creative: false, enchantment_table: false, furnace: false, anvil: false,
@@ -50,6 +56,13 @@ function attachEarlyPacketDropFilter(bot) {
     client._kingmcDropHookAttached = true;
     const originalEmit = client.emit;
     client.emit = function emit(name, ...args) {
+      if (name === 'login' || name === 'respawn') {
+        if (bot) bot._kingmcAfkWorldLocked = false;
+        return originalEmit.apply(this, [name, ...args]);
+      }
+      if (bot?._kingmcAfkWorldLocked && bot.physicsEnabled === false && AFK_WORLD_DROP_EVENTS.has(name)) {
+        return false;
+      }
       if (name === 'resource_pack_send' || name === 'add_resource_pack') {
         sendLightweightResourcePackAck(this, args[0]);
         return false;
@@ -89,6 +102,20 @@ function attachEarlyPacketDropFilter(bot) {
       } else if (name === 'map_chunk') {
         const packet = args[0];
         if (packet && typeof packet === 'object') {
+          const pos = bot?.entity?.position;
+          if (
+            pos &&
+            Number.isFinite(pos.x) &&
+            Number.isFinite(pos.z) &&
+            Number.isFinite(packet.x) &&
+            Number.isFinite(packet.z)
+          ) {
+            const cx = Math.floor(pos.x / 16);
+            const cz = Math.floor(pos.z / 16);
+            if (Math.abs(packet.x - cx) > 1 || Math.abs(packet.z - cz) > 1) {
+              return false;
+            }
+          }
           if (Array.isArray(packet.blockEntities) && packet.blockEntities.length > 0) {
             packet.blockEntities = [];
           }
@@ -133,7 +160,7 @@ function enforceZeroFarmEntities(bot) {
         }
       }
     } catch (_) {}
-  }, 5000);
+  }, 15000);
   timer.unref?.();
   bot._kingmcEntityPruneTimer = timer;
   bot.once?.('end', () => stopEntityPruner(bot));
@@ -152,21 +179,47 @@ function applyEcoPhysics(bot) {
   if (bot) bot.physicsEnabled = true;
 }
 
+function setAfkWorldChunkLock(bot, locked) {
+  if (!bot) return false;
+  if (!bot._kingmcBlockAtWrapped && typeof bot.blockAt === 'function') {
+    const origBlockAt = bot.blockAt.bind(bot);
+    bot._kingmcOrigBlockAt = origBlockAt;
+    bot._kingmcBlockAtWrapped = true;
+    bot.blockAt = (point, extraInfos) => {
+      if (bot._kingmcAfkWorldLocked && bot.physicsEnabled === false) {
+        return AFK_GROUND_SENTINEL;
+      }
+      return origBlockAt(point, extraInfos);
+    };
+  }
+  const nextLocked = Boolean(locked);
+  bot._kingmcAfkWorldLocked = nextLocked;
+  if (nextLocked) {
+    try { pruneFarChunks(bot, -1); } catch (_) {}
+  }
+  return nextLocked;
+}
+
 function setPhysicsEnabled(bot, enabled, logger, reason = '') {
   if (!bot) return;
   const prev = bot.physicsEnabled !== false;
-  bot.physicsEnabled = Boolean(enabled);
+  const nextEnabled = Boolean(enabled);
+  if (nextEnabled) {
+    bot._kingmcAfkWorldLocked = false;
+  }
+  bot.physicsEnabled = nextEnabled;
   if (prev !== bot.physicsEnabled && logger) {
     logger.info('physics_toggled', { enabled: bot.physicsEnabled, reason });
   }
 }
 
 function pruneFarChunks(bot, radius = 2) {
-  const position = bot?.entity?.position;
   const world = bot?.world;
-  if (!position || !world || typeof world.getColumns !== 'function') return 0;
-  const chunkX = Math.floor(position.x / 16);
-  const chunkZ = Math.floor(position.z / 16);
+  if (!world || typeof world.getColumns !== 'function') return 0;
+  const position = bot?.entity?.position;
+  if (radius >= 0 && !position) return 0;
+  const chunkX = position ? Math.floor(position.x / 16) : 0;
+  const chunkZ = position ? Math.floor(position.z / 16) : 0;
   const columns = world.getColumns();
   if (!Array.isArray(columns)) return 0;
   let unloaded = 0;
@@ -174,7 +227,7 @@ function pruneFarChunks(bot, radius = 2) {
     const x = Number(column?.chunkX ?? column?.x);
     const z = Number(column?.chunkZ ?? column?.z);
     if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
-    if (Math.abs(x - chunkX) <= radius && Math.abs(z - chunkZ) <= radius) continue;
+    if (radius >= 0 && Math.abs(x - chunkX) <= radius && Math.abs(z - chunkZ) <= radius) continue;
     if (typeof world.unloadColumn === 'function') {
       world.unloadColumn(x, z);
       unloaded += 1;
@@ -183,9 +236,9 @@ function pruneFarChunks(bot, radius = 2) {
   return unloaded;
 }
 
-function startChunkPruner(bot, { intervalMs = 30000, radius = 2 } = {}) {
+function startChunkPruner(bot, { intervalMs = 45000, radius = 1 } = {}) {
   const timer = setInterval(() => {
-    try { pruneFarChunks(bot, radius); } catch (_) {}
+    try { pruneFarChunks(bot, bot?._kingmcAfkWorldLocked ? -1 : radius); } catch (_) {}
   }, intervalMs);
   timer.unref?.();
   bot?.once?.('end', () => clearInterval(timer));
@@ -195,11 +248,14 @@ function startChunkPruner(bot, { intervalMs = 30000, radius = 2 } = {}) {
 module.exports = {
   DISABLED_PLUGINS,
   DROP_EVENTS,
+  AFK_WORLD_DROP_EVENTS,
+  AFK_GROUND_SENTINEL,
   attachEarlyPacketDropFilter,
   optimizeBotPackets: attachEarlyPacketDropFilter,
   enforceZeroFarmEntities,
   stopEntityPruner,
   applyEcoPhysics,
+  setAfkWorldChunkLock,
   setPhysicsEnabled,
   pruneFarChunks,
   startChunkPruner

@@ -11,7 +11,16 @@ const {
 } = require('./server-auth');
 const { parseSocksProxy, createSocksConnector } = require('../config/proxy');
 const { normalizeState } = require('../domain/worker-state');
-const { DISABLED_PLUGINS, attachEarlyPacketDropFilter, applyEcoPhysics, setPhysicsEnabled, pruneFarChunks, startChunkPruner, stopEntityPruner } = require('./packet-optimization');
+const {
+  DISABLED_PLUGINS,
+  attachEarlyPacketDropFilter,
+  applyEcoPhysics,
+  setAfkWorldChunkLock,
+  setPhysicsEnabled,
+  pruneFarChunks,
+  startChunkPruner,
+  stopEntityPruner
+} = require('./packet-optimization');
 const { TIME_ZONE, isMaintenanceWindow, nextMaintenanceBoundary } = require('../services/maintenance-window');
 
 function getMineflayer() {
@@ -173,7 +182,9 @@ class MinecraftSession extends EventEmitter {
     this.windowRevision = 0;
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
-    this.recentChatSignatures = new Set();
+    this.recentChatSignatures = new Map();
+    this.respawnLocationTimer = null;
+    this._locationCheckFn = null;
     this.hostPublicIp = sharedHostPublicIp;
     this.scheduleMaintenanceBoundary();
   }
@@ -512,7 +523,7 @@ class MinecraftSession extends EventEmitter {
     if (this.ecoMode !== false) {
       applyEcoPhysics(bot);
       if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
-      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 20000, radius: 1 });
+      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 45000, radius: 1 });
     }
     this.navigator.onSpawn(bot);
     this.afk.mode = this.afkMode;
@@ -557,8 +568,20 @@ class MinecraftSession extends EventEmitter {
     });
 
     bot.on('respawn', () => {
+      if (this.bot !== bot || generation !== this.generation) return;
+      setAfkWorldChunkLock(bot, false);
       this.logger.info('bot_respawned', { bot: this.username });
       this.emit('event', { type: 'respawn', message: 'Bot đã hồi sinh (respawn).' });
+      if (this.locationTimer && typeof this._locationCheckFn === 'function') {
+        if (this.respawnLocationTimer) clearTimeout(this.respawnLocationTimer);
+        this.respawnLocationTimer = setTimeout(() => {
+          this.respawnLocationTimer = null;
+          if (this.bot === bot && generation === this.generation && !this.manualStop) {
+            this._locationCheckFn?.();
+          }
+        }, 400);
+        this.respawnLocationTimer.unref?.();
+      }
     });
 
     // Check off-hand totem immediately on spawn
@@ -723,8 +746,22 @@ class MinecraftSession extends EventEmitter {
     });
   }
 
-  startAutoChatLoop(bot, generation) {
-    if (this.autoChatTimer) clearInterval(this.autoChatTimer);
+  syncAutoChatLoop(bot = this.bot, generation = this.generation) {
+    if (this.autoChatTimer) {
+      clearInterval(this.autoChatTimer);
+      this.autoChatTimer = null;
+    }
+    const schedules = Array.isArray(this.autoChatSchedules) ? this.autoChatSchedules : [];
+    const activeSchedules = schedules.filter((s) => {
+      if (!s || s.enabled === false) return false;
+      const msgs = Array.isArray(s.messages) && s.messages.length ? s.messages : (s.message ? [s.message] : []);
+      return msgs.some((m) => String(m || '').trim().length > 0);
+    });
+    if (!activeSchedules.length || !bot || this.bot !== bot || generation !== this.generation || this.manualStop) {
+      return;
+    }
+    const hasSub30s = activeSchedules.some((s) => s.mode !== 'fixed' && (Number(s.intervalSeconds) || 3600) < 30);
+    const tickMs = hasSub30s ? 2000 : 5000;
     this.autoChatTimer = setInterval(() => {
       if (this.bot !== bot || generation !== this.generation || this.manualStop) {
         if (this.autoChatTimer) clearInterval(this.autoChatTimer);
@@ -764,8 +801,12 @@ class MinecraftSession extends EventEmitter {
           }
         }
       }
-    }, 2000);
+    }, tickMs);
     this.autoChatTimer.unref?.();
+  }
+
+  startAutoChatLoop(bot, generation) {
+    return this.syncAutoChatLoop(bot, generation);
   }
 
   executeScheduledBotAction(action, commandText = '') {
@@ -920,7 +961,7 @@ class MinecraftSession extends EventEmitter {
           }
         }
       }
-    }, 5000);
+    }, 15000);
     this.botScheduleTimer.unref?.();
   }
 
@@ -949,6 +990,7 @@ class MinecraftSession extends EventEmitter {
       this.lastLocationKind = kind;
 
       if (kind === 'login') {
+        setAfkWorldChunkLock(bot, false);
         if (this.state !== 'authenticating') this.setState('authenticating', 'auth_lobby');
         const now = Date.now();
         if (!this.auth.isAuthenticated() && now >= this.nextAuthAllowedAt && now - this.lastAuthSendAt >= 1500) {
@@ -961,6 +1003,7 @@ class MinecraftSession extends EventEmitter {
           }
         }
       } else if (kind === 'lobby') {
+        setAfkWorldChunkLock(bot, false);
         if (prevKind === 'login') {
           this.auth.markAuthenticated('login_area_exit');
         } else if (prevKind === 'unknown' && !this.password) {
@@ -978,6 +1021,7 @@ class MinecraftSession extends EventEmitter {
       } else if (kind === 'other') {
         this.auth.markAuthenticated('kingmc_world');
         setPhysicsEnabled(bot, this.ecoMode === false, this.logger, 'kingmc_world');
+        setAfkWorldChunkLock(bot, this.ecoMode !== false);
         if (this.state !== 'online') {
           const recoveredFromAfkDrop = this.wasAfkBeforeDisconnect;
           const attemptsTaken = Math.max(1, this.lastReconnectAttemptCount || 1);
@@ -986,7 +1030,7 @@ class MinecraftSession extends EventEmitter {
           this.lastReconnectAttemptCount = 0;
           this.setState('online', 'kingmc_in_game');
           this.pruneMemory();
-          try { if (this.ecoMode !== false) pruneFarChunks(bot, 1); } catch (_) {}
+          try { if (this.ecoMode !== false) pruneFarChunks(bot, -1); } catch (_) {}
           this.emit('event', { type: 'online', host, message: 'Đã vào cụm sinh tồn KingMC' });
           if (recoveredFromAfkDrop) {
             this.emit('event', {
@@ -1000,9 +1044,10 @@ class MinecraftSession extends EventEmitter {
           if (typeof bot.food === 'number' && bot.food < 16) void this.tryEatFood(bot);
         }
       }
-      ensureLocationInterval(kind === 'other' && this.state === 'online' ? 5000 : 1500);
+      ensureLocationInterval(kind === 'other' && this.state === 'online' ? 10000 : 1500);
     };
 
+    this._locationCheckFn = check;
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
     this.initialLocationTimer = setTimeout(() => {
       this.initialLocationTimer = null;
@@ -1504,6 +1549,7 @@ class MinecraftSession extends EventEmitter {
       this.ecoMode = Boolean(settings.ecoMode);
       if (this.bot && prevEco !== this.ecoMode && this.state === 'online') {
         setPhysicsEnabled(this.bot, !this.ecoMode, this.logger, 'settings_eco_mode');
+        setAfkWorldChunkLock(this.bot, this.ecoMode);
       }
     }
     if (Object.hasOwn(settings, 'autoTotem') && settings.autoTotem !== undefined) {
@@ -1543,6 +1589,9 @@ class MinecraftSession extends EventEmitter {
         this._autoChatSchedulesSig = nextSig;
         this.autoChatLastIntervalAt.clear();
         this.autoChatNextIntervalAt.clear();
+      }
+      if (this.bot && !this.manualStop) {
+        this.syncAutoChatLoop(this.bot, this.generation);
       }
     }
     if (Object.hasOwn(settings, 'botSchedules') && Array.isArray(settings.botSchedules)) {
@@ -2129,7 +2178,7 @@ class MinecraftSession extends EventEmitter {
         }
       }
       if (this.state === 'online' && this.ecoMode !== false) {
-        try { pruneFarChunks(this.bot, 1); } catch (_) {}
+        try { pruneFarChunks(this.bot, this.bot._kingmcAfkWorldLocked ? -1 : 0); } catch (_) {}
       }
     }
   }
@@ -2179,16 +2228,20 @@ class MinecraftSession extends EventEmitter {
     if (!clean) return;
     if (isRestrictedMinecraftCommand(clean) || /^\/(?:login|dn|register|reg|dk)\b/i.test(clean)) return;
 
+    const now = Date.now();
     const sig = `${source}:${clean.toLowerCase()}`;
-    if (this.recentChatSignatures.has(sig)) return;
-    this.recentChatSignatures.add(sig);
-    if (this.recentChatSignatures.size > 200) {
-      const first = this.recentChatSignatures.values().next().value;
-      this.recentChatSignatures.delete(first);
+    const prevAt = this.recentChatSignatures.get(sig);
+    if (prevAt && now - prevAt < 2500) return;
+    if (this.recentChatSignatures.size > 150) {
+      for (const [k, ts] of this.recentChatSignatures) {
+        if (now - ts >= 2500) this.recentChatSignatures.delete(k);
+      }
+      while (this.recentChatSignatures.size > 150) {
+        const first = this.recentChatSignatures.keys().next().value;
+        this.recentChatSignatures.delete(first);
+      }
     }
-    setTimeout(() => {
-      this.recentChatSignatures.delete(sig);
-    }, 2500).unref?.();
+    this.recentChatSignatures.set(sig, now);
 
     this.emit('event', { type: 'chat', message: clean, source });
   }
@@ -2204,6 +2257,7 @@ class MinecraftSession extends EventEmitter {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.connectTimer) clearTimeout(this.connectTimer);
     if (this.locationTimer) clearInterval(this.locationTimer);
+    if (this.respawnLocationTimer) clearTimeout(this.respawnLocationTimer);
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
     if (this.lobbyRoutineTimer) clearTimeout(this.lobbyRoutineTimer);
     if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
@@ -2216,6 +2270,8 @@ class MinecraftSession extends EventEmitter {
     this.reconnectTimer = null;
     this.connectTimer = null;
     this.locationTimer = null;
+    this.respawnLocationTimer = null;
+    this._locationCheckFn = null;
     this.initialLocationTimer = null;
     this.lobbyRoutineTimer = null;
     this.inventoryUpdateTimer = null;
