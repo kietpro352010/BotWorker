@@ -2127,6 +2127,118 @@ async function testW16SnapshotCacheFreshnessAndDebounce() {
   console.log('✅ 16. [W-16] Snapshot cache freshness, non-starving debounce, and window cache safety verified.');
 }
 
+async function testW17BootstrapManuallyStoppedGuard() {
+  console.log('17. [W-17] Testing bootstrap manuallyStopped guard skips autoStart, stops split-brain session, and allows explicit start...');
+  let bootstrapState = {
+    ok: true,
+    state: 'stopped',
+    restriction: null,
+    restricted: false,
+    manuallyStopped: true,
+    settingsRevision: 1,
+    settings: {},
+    credentials: { username: 'W17Bot', password: '' }
+  };
+  let pollRequests = 0;
+
+  const mockFetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (u.endsWith('/bootstrap')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => bootstrapState,
+        text: async () => JSON.stringify(bootstrapState)
+      };
+    }
+    if (u.endsWith('/poll')) {
+      pollRequests += 1;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const payload = { ok: true, commands: [], settingsChanged: false };
+          resolve({
+            ok: true,
+            status: 200,
+            json: async () => payload,
+            text: async () => JSON.stringify(payload)
+          });
+        }, 25);
+        timer.unref?.();
+        opts.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          const err = new Error('Aborted');
+          err.name = 'AbortError';
+          reject(err);
+        }, { once: true });
+      });
+    }
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ ok: true }),
+      text: async () => JSON.stringify({ ok: true })
+    };
+  };
+
+  let fleet;
+  let sessionStartCalls = 0;
+  try {
+    fleet = new WorkerFleet({
+      transport: 'wispbyte-poll',
+      autoStart: true,
+      rssWarnMb: 440,
+      wispbyte: { cookie: '', panelUrl: 'https://wispbyte.com/client', intervalMs: 86400000 },
+      bots: [{
+        slot: 1,
+        workerId: 'w-w17',
+        secret: 's'.repeat(32),
+        managerUrl: 'https://mgr.example.com',
+        transport: 'wispbyte-poll',
+        mc: { hosts: ['kingmc.vn'], port: 25565, version: '1.20.1', viewDistance: 'tiny', authType: 'offline' },
+        afk: { mode: 'still', minMs: 180000, maxMs: 360000 }
+      }]
+    }, quietLogger, { fetchImpl: mockFetch });
+
+    const inst = fleet.get('w-w17');
+    inst.session.start = async () => {
+      sessionStartCalls += 1;
+      inst.session.manualStop = false;
+      inst.session.state = 'online';
+      return inst.session.getStatus();
+    };
+
+    await fleet.start();
+    await sleep(40);
+
+    assert.strictEqual(inst.managerManuallyStopped, true, 'refreshManagerConfig must record manuallyStopped from bootstrap');
+    assert.strictEqual(sessionStartCalls, 0, 'WorkerFleet.start must skip autoStart when manager manuallyStopped is true');
+    assert.strictEqual(inst.session.manualStop, true);
+    assert.ok(pollRequests >= 1, 'Wispbyte poller must still stay active so user can remote-start later');
+
+    // Simulate split-brain online state while Manager still has manuallyStopped=true -> live refresh must halt session
+    inst.session.manualStop = false;
+    inst.session.state = 'online';
+    await inst.reporter.onSettingsChanged();
+    assert.strictEqual(inst.session.manualStop, true, 'Live config refresh must stop split-brain active session when manuallyStopped=true');
+    assert.strictEqual(inst.session.state, 'stopped');
+
+    // Explicit start command from Manager must bypass applyManualStop guard so user can Start even before DB flag clears
+    const startedStatus = await inst.runtime.execute('start', {});
+    assert.strictEqual(sessionStartCalls, 1, 'Explicit start command must succeed even if bootstrap manuallyStopped has not yet cleared');
+    assert.strictEqual(startedStatus.state, 'online');
+
+    // Once Manager clears manuallyStopped=false, subsequent refresh keeps session alive
+    bootstrapState = { ...bootstrapState, state: 'online', manuallyStopped: false };
+    await inst.refreshManagerConfig();
+    assert.strictEqual(inst.managerManuallyStopped, false);
+    assert.strictEqual(inst.session.state, 'online');
+  } finally {
+    if (fleet) await fleet.stop();
+  }
+
+  console.log('✅ 17. [W-17] Bootstrap manuallyStopped guard verified.');
+}
+
 async function main() {
   console.log('--- [WORKER DEEP AUDIT FIXES REGRESSION TESTS] ---');
   await testW01NonLifecycleTimeoutPreservesSession();
@@ -2145,6 +2257,7 @@ async function main() {
   await testW14Wave5RemediationFixes();
   await testW15DeepAuditFixes();
   await testW16SnapshotCacheFreshnessAndDebounce();
+  await testW17BootstrapManuallyStoppedGuard();
   console.log('\n🎉 ALL WORKER DEEP AUDIT FIXES REGRESSION TESTS PASSED 100%!');
 }
 

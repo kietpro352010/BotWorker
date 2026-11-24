@@ -59,14 +59,26 @@ class WorkerFleet {
         baseUrl: botConfig.managerUrl, workerId: botConfig.workerId,
         secret: botConfig.secret, logger: botLogger, fetchImpl
       });
-      const refreshManagerConfig = async ({ signal } = {}) => {
+      let instanceRef = null;
+      const refreshManagerConfig = async ({ signal, applyManualStop = true } = {}) => {
         if (signal?.aborted) throw new Error('Aborted');
         const previousRestriction = session.restriction;
         const state = await reporter.bootstrap({ signal });
         if (signal?.aborted) throw new Error('Aborted');
+        const manuallyStopped = Boolean(state?.manuallyStopped);
+        if (instanceRef) instanceRef.managerManuallyStopped = manuallyStopped;
         session.applyManagerSettings(state.settings);
         session.applyManagerCredentials(state.credentials);
         session.restoreManagerState(state);
+        if (
+          applyManualStop
+          && manuallyStopped
+          && (!session.manualStop || session.bot || ['starting', 'connecting', 'online', 'reconnecting'].includes(session.state))
+        ) {
+          await session.stop('manager_offline_stop', { signal }).catch((err) => {
+            botLogger.warn?.('worker_manual_stop_sync_failed', { error: err?.message });
+          });
+        }
         const wasManagerHold = ['manager_check_failed', 'manager_hold'].includes(previousRestriction);
         if (wasManagerHold && !session.isHeld()) {
           try {
@@ -85,7 +97,8 @@ class WorkerFleet {
       const runtime = new WorkerRuntime(session, botConfig, botLogger, { refreshManagerConfig });
       const poller = botConfig.transport === 'wispbyte-poll'
         ? new WispbytePoller({ config: botConfig, runtime, reporter, logger: botLogger, fetchImpl }) : null;
-      const instance = { config: botConfig, session, runtime, reporter, poller, refreshManagerConfig };
+      const instance = { config: botConfig, session, runtime, reporter, poller, managerManuallyStopped: false, refreshManagerConfig };
+      instanceRef = instance;
       this.instances.set(botConfig.workerId, instance);
 
       session.on('event', (event) => {
@@ -118,6 +131,10 @@ class WorkerFleet {
             workerId, restriction: instance.session.getStatus().restriction
           });
           this.scheduleManagerBootstrapRetry(instance);
+          return;
+        }
+        if (instance.managerManuallyStopped) {
+          this.logger.info('worker_auto_start_skipped_manual_stop', { workerId });
           return;
         }
         this.logger.info('worker_manager_bootstrap_recovered', { workerId });
@@ -250,6 +267,11 @@ class WorkerFleet {
         }
         if (position > 0) await delay(8000, this.stopController.signal);
         if (!this.stopping && !instance.session.isHeld()) {
+          if (instance.managerManuallyStopped) {
+            this.logger.info('worker_auto_start_skipped_manual_stop', { workerId: instance.config.workerId });
+            position += 1;
+            continue;
+          }
           if (!instance.session.hasCredentials()) {
             this.logger.info('worker_auto_start_skipped_no_credentials', { workerId: instance.config.workerId });
             position += 1;

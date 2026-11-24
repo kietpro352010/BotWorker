@@ -340,13 +340,13 @@ class WorkerRuntime {
     if (signal?.aborted) throw createAbortError(signal.reason, action);
     switch (action) {
       case 'start':
-        if (!skipManagerRefresh) await this.refreshManagerConfig({ signal });
+        if (!skipManagerRefresh) await this.refreshManagerConfig({ signal, applyManualStop: false });
         if (signal?.aborted) throw createAbortError(signal.reason, action);
         return this.session.start({ signal });
       case 'stop': return this.session.stop('manager_stop', { signal });
       case 'restart':
       case 'reconnect':
-        if (!skipManagerRefresh) await this.refreshManagerConfig({ signal });
+        if (!skipManagerRefresh) await this.refreshManagerConfig({ signal, applyManualStop: false });
         if (signal?.aborted) throw createAbortError(signal.reason, action);
         return this.session.restart({ signal });
       case 'status': return this.status();
