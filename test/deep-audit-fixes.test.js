@@ -1936,6 +1936,165 @@ async function testW15DeepAuditFixes() {
   console.log('✅ 15. [W-15] Deep Audit P0-P2 fixes verified.');
 }
 
+async function testW16SnapshotCacheFreshnessAndDebounce() {
+  console.log('16. [W-16] Testing snapshot cache immediate freshness, non-starving debounce, and window cache safety...');
+
+  // 16a. Inventory cache clears synchronously on updateSlot & debounce does NOT starve under continuous <350ms updates
+  const invSession = new MinecraftSession({
+    workerId: 'w-w16-inv',
+    transport: 'wispbyte-poll',
+    mc: { hosts: ['kingmc.vn'], port: 25565, username: 'SnapBot', password: '' },
+    afk: { mode: 'still' }
+  }, quietLogger);
+
+  const fakeBot = new EventEmitter();
+  fakeBot.username = 'SnapBot';
+  fakeBot.player = { ping: 25 };
+  fakeBot._client = new EventEmitter();
+  fakeBot.entity = { id: 1, position: { x: 10, y: 64, z: 10 } };
+  fakeBot.inventory = new EventEmitter();
+  fakeBot.inventory.slots = { 36: { name: 'apple', count: 2 } };
+  fakeBot.inventory.items = () => Object.values(fakeBot.inventory.slots).filter(Boolean);
+  fakeBot.world = { getColumns: () => [] };
+
+  invSession.bot = fakeBot;
+  invSession.manualStop = false;
+  invSession.generation = 1;
+  invSession.state = 'online';
+  invSession.onSpawn(fakeBot, 1, 'kingmc.vn');
+
+  // Prime _cachedInvSnap
+  const snap1 = invSession.getInventorySnapshot();
+  assert.strictEqual(snap1.slots['36'].name, 'apple');
+  assert.strictEqual(snap1.foodCount, 2);
+
+  // Mutate same slots object and fire updateSlot -> synchronous read MUST NOT return stale cached snapshot
+  fakeBot.inventory.slots[36] = { name: 'totem_of_undying', count: 1 };
+  fakeBot.inventory.slots[37] = { name: 'cooked_beef', count: 5 };
+  fakeBot.inventory.emit('updateSlot', 36);
+  const snapImmediate = invSession.getInventorySnapshot();
+  assert.strictEqual(snapImmediate.slots['36'].name, 'totem_of_undying', 'getInventorySnapshot must invalidate _cachedInvSnap synchronously on updateSlot');
+  assert.strictEqual(snapImmediate.totemCount, 1);
+  assert.strictEqual(snapImmediate.foodCount, 5);
+  assert.strictEqual(invSession.getStatus().totemCount, 1, 'getStatus must reflect updated slot immediately during 350ms debounce window');
+
+  // Continuous <350ms burst must NOT starve the 350ms revision bump timer
+  const revAtBurstStart = invSession.inventoryRevision;
+  let stateEmitsDuringBurst = 0;
+  const onState = () => { stateEmitsDuringBurst += 1; };
+  invSession.on('state', onState);
+  for (let i = 0; i < 5; i++) {
+    await sleep(100);
+    fakeBot.inventory.slots[38] = { name: 'bread', count: i + 1 };
+    fakeBot.inventory.emit('updateSlot', 38);
+    // Mid-burst snapshot must still be live even after priming cache on previous iteration
+    assert.strictEqual(invSession.getInventorySnapshot().slots['38'].count, i + 1);
+  }
+  invSession.off('state', onState);
+  assert.ok(invSession.inventoryRevision > revAtBurstStart, 'Continuous <350ms updateSlot burst must NOT starve inventoryRevision bump');
+  assert.ok(stateEmitsDuringBurst >= 1, 'Continuous <350ms updateSlot burst must emit state on schedule');
+  await invSession.stop('test_cleanup', { emitEvent: false });
+
+  // 16b. Window snapshot cache safety: unbound currentWindow never serves stale cache; windowOpen-bound invalidates cleanly
+  const winSession = new MinecraftSession({
+    workerId: 'w-w16-win',
+    transport: 'wispbyte-poll',
+    mc: { hosts: ['kingmc.vn'], port: 25565, username: 'WinSnapBot', password: '' },
+    afk: { mode: 'still' }
+  }, quietLogger);
+  const unboundBot = new EventEmitter();
+  unboundBot.player = { ping: 20 };
+  unboundBot._client = new EventEmitter();
+  const rawWinSlots = [{ name: 'diamond', count: 1 }, null, null];
+  unboundBot.currentWindow = { id: 1, type: 'minecraft:chest', title: { text: 'Chest' }, slots: rawWinSlots };
+  winSession.bot = unboundBot;
+  winSession.state = 'online';
+
+  assert.strictEqual(winSession.getWindowSnapshot().slots[0].name, 'diamond');
+  rawWinSlots[0] = { name: 'emerald', count: 4 };
+  assert.strictEqual(winSession.getWindowSnapshot().slots[0].name, 'emerald', 'Unbound window must NOT cache stale slots across direct mutation');
+  assert.strictEqual(winSession._cachedWinSnap, null, 'Unbound window must NOT populate _cachedWinSnap');
+
+  // Bound via connect() -> windowOpen -> win.updateSlot -> clickWindow -> windowClose -> resetData
+  const mf = require('mineflayer');
+  const origCreateBot = mf.createBot;
+  let spawnedWinBot = null;
+  mf.createBot = () => {
+    const b = new EventEmitter();
+    b.username = 'WinSnapBot';
+    b.player = { ping: 20 };
+    b._client = new EventEmitter();
+    b._client.socket = new EventEmitter();
+    b.inventory = new EventEmitter();
+    b.inventory.slots = {};
+    b.inventory.items = () => [];
+    b.quit = () => {};
+    b.end = () => {};
+    b.clickWindow = async (slot) => {
+      if (b.currentWindow?.slots) b.currentWindow.slots[slot] = null;
+    };
+    b.closeWindow = () => {
+      b.currentWindow = null;
+    };
+    spawnedWinBot = b;
+    return b;
+  };
+  try {
+    winSession.bot = null;
+    winSession.manualStop = false;
+    await winSession.connect();
+    winSession.state = 'online';
+
+    const win = new EventEmitter();
+    win.id = 9;
+    win.type = 'minecraft:chest';
+    win.title = { text: 'Shop' };
+    win.slots = [{ name: 'gold_ingot', count: 3 }, { name: 'iron_ingot', count: 5 }, null];
+    spawnedWinBot.currentWindow = win;
+    spawnedWinBot.emit('windowOpen', win);
+    assert.strictEqual(winSession._windowEventsBound, win);
+
+    const wSnap1 = winSession.getWindowSnapshot();
+    assert.strictEqual(wSnap1.slots[0].count, 3);
+    assert.ok(winSession._cachedWinSnap, 'Bound window should populate _cachedWinSnap');
+
+    // Mutate slot and emit win.updateSlot -> cache invalidated immediately
+    win.slots[0] = { name: 'gold_ingot', count: 7 };
+    win.emit('updateSlot', 0);
+    assert.strictEqual(winSession._cachedWinSnap, null);
+    assert.strictEqual(winSession.getWindowSnapshot().slots[0].count, 7);
+
+    // clickWindow invalidates cache & refreshes snapshot
+    const clickRes = await winSession.clickWindow({ slot: 1 });
+    assert.strictEqual(clickRes.currentWindow.slots[1], null);
+
+    // windowClose clears _windowEventsBound & _cachedWinSnap
+    spawnedWinBot.currentWindow = null;
+    spawnedWinBot.emit('windowClose', win);
+    assert.strictEqual(winSession._windowEventsBound, null);
+    assert.strictEqual(winSession._cachedWinSnap, null);
+
+    // Re-open and closeWindow / resetData clears _windowEventsBound
+    spawnedWinBot.currentWindow = win;
+    spawnedWinBot.emit('windowOpen', win);
+    assert.strictEqual(winSession._windowEventsBound, win);
+    await winSession.closeWindow();
+    assert.strictEqual(winSession._windowEventsBound, null);
+    assert.strictEqual(winSession._cachedWinSnap, null);
+
+    spawnedWinBot.currentWindow = win;
+    spawnedWinBot.emit('windowOpen', win);
+    await winSession.resetData();
+    assert.strictEqual(winSession._windowEventsBound, null);
+    assert.strictEqual(winSession._cachedWinSnap, null);
+  } finally {
+    mf.createBot = origCreateBot;
+    await winSession.stop('test_cleanup', { emitEvent: false });
+  }
+
+  console.log('✅ 16. [W-16] Snapshot cache freshness, non-starving debounce, and window cache safety verified.');
+}
+
 async function main() {
   console.log('--- [WORKER DEEP AUDIT FIXES REGRESSION TESTS] ---');
   await testW01NonLifecycleTimeoutPreservesSession();
@@ -1953,6 +2112,7 @@ async function main() {
   await testW13HostFailoverAndWhitelist();
   await testW14Wave5RemediationFixes();
   await testW15DeepAuditFixes();
+  await testW16SnapshotCacheFreshnessAndDebounce();
   console.log('\n🎉 ALL WORKER DEEP AUDIT FIXES REGRESSION TESTS PASSED 100%!');
 }
 

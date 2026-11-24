@@ -167,6 +167,7 @@ class MinecraftSession extends EventEmitter {
     this.inventoryUpdateTimer = null;
     this.lastInventoryStateEmitAt = 0;
     this._inventoryEventsBound = null;
+    this._windowEventsBound = null;
     this._cachedInvSnap = null;
     this._cachedWinSnap = null;
     this.windowRevision = 0;
@@ -440,17 +441,28 @@ class MinecraftSession extends EventEmitter {
       bot.on('chat', (username, message) => this.recordChat(bot, username, message));
       bot.on('whisper', (username, message) => this.recordChat(bot, username, message));
       bot.on('windowOpen', (win) => {
+        if (this.bot !== bot || generation !== this.generation) return;
+        this._cachedWinSnap = null;
         this.windowRevision = (this.windowRevision || 0) + 1;
+        this._windowEventsBound = (win && typeof win.on === 'function') ? win : null;
         const title = extractChatMessage(win?.title);
         this.logger.info('window_opened', { title, type: win?.type });
         this.emit('event', { type: 'window_open', title, windowType: win?.type });
-        if (win && typeof win.on === 'function') {
+        if (win && typeof win.on === 'function' && !win._kbotUpdateSlotBound) {
+          win._kbotUpdateSlotBound = true;
           win.on('updateSlot', () => {
+            if (this.bot !== bot || generation !== this.generation) return;
+            this._cachedWinSnap = null;
             this.windowRevision = (this.windowRevision || 0) + 1;
           });
         }
       });
       bot.on('windowClose', (win) => {
+        if (this.bot !== bot || generation !== this.generation) return;
+        this._cachedWinSnap = null;
+        if (!win || this._windowEventsBound === win) {
+          this._windowEventsBound = null;
+        }
         this.windowRevision = (this.windowRevision || 0) + 1;
         this.logger.info('window_closed', { type: win?.type });
         this.emit('event', { type: 'window_close' });
@@ -522,6 +534,7 @@ class MinecraftSession extends EventEmitter {
     if (bot.inventory?.on) {
       this._inventoryEventsBound = bot;
       bot.inventory.on('updateSlot', (slot) => {
+        this._cachedInvSnap = null;
         if (slot === 45 || slot === 40 || !slot) void this.fastEquipTotem(bot);
         this.scheduleInventoryRevisionBump(bot);
       });
@@ -562,8 +575,10 @@ class MinecraftSession extends EventEmitter {
   }
 
   scheduleInventoryRevisionBump(bot) {
-    if (this.bot !== bot || this.manualStop) return;
-    if (this.inventoryUpdateTimer) clearTimeout(this.inventoryUpdateTimer);
+    if (this.bot !== bot) return;
+    this._cachedInvSnap = null;
+    if (this.manualStop) return;
+    if (this.inventoryUpdateTimer) return;
     this.inventoryUpdateTimer = setTimeout(() => {
       this.inventoryUpdateTimer = null;
       if (this.bot !== bot || this.manualStop) return;
@@ -1155,6 +1170,7 @@ class MinecraftSession extends EventEmitter {
     }
     this.networkSockets.clear();
     this._inventoryEventsBound = null;
+    this._windowEventsBound = null;
     this._cachedInvSnap = null;
     this._cachedWinSnap = null;
     this.bot = null;
@@ -1705,6 +1721,7 @@ class MinecraftSession extends EventEmitter {
     const rev = this.windowRevision || 0;
     if (
       bot === this.bot &&
+      this._windowEventsBound === win &&
       this._cachedWinSnap &&
       this._cachedWinSnap.win === win &&
       this._cachedWinSnap.rawSlots === rawSlots &&
@@ -1754,7 +1771,7 @@ class MinecraftSession extends EventEmitter {
       totalSlots: containerSlots,
       revision: rev
     };
-    if (bot === this.bot) {
+    if (bot === this.bot && this._windowEventsBound === win) {
       this._cachedWinSnap = { win, rawSlots, winId: win.id, winType, rev, snap };
     }
     return snap;
@@ -1979,6 +1996,7 @@ class MinecraftSession extends EventEmitter {
     if (typeof bot.clickWindow === 'function') {
       await bot.clickWindow(slot, mouseButton, mode);
       this._bumpInventoryRevision();
+      this._cachedWinSnap = null;
       this.windowRevision = (this.windowRevision || 0) + 1;
       this.emit('event', {
         type: 'window_click',
@@ -1986,6 +2004,7 @@ class MinecraftSession extends EventEmitter {
       });
       return { ok: true, clickedSlot: slot, inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
     }
+    this._cachedWinSnap = null;
     return { ok: true, clickedSlot: slot, note: 'click_registered', inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
   }
 
@@ -1994,6 +2013,10 @@ class MinecraftSession extends EventEmitter {
     const window = bot.currentWindow;
     if (window && typeof bot.closeWindow === 'function') {
       bot.closeWindow(window);
+      this._cachedWinSnap = null;
+      if (this._windowEventsBound === window) {
+        this._windowEventsBound = null;
+      }
       this.windowRevision = (this.windowRevision || 0) + 1;
       this.emit('event', {
         type: 'window_close',
@@ -2001,6 +2024,8 @@ class MinecraftSession extends EventEmitter {
       });
       return { ok: true, closed: true, currentWindow: null };
     }
+    this._cachedWinSnap = null;
+    this._windowEventsBound = null;
     return { ok: true, closed: false, note: 'no_window_open', currentWindow: null };
   }
 
