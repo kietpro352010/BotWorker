@@ -929,6 +929,15 @@ class MinecraftSession extends EventEmitter {
     this.lastLocationKind = 'unknown';
     this.nextAuthAllowedAt = Date.now() + applyCommandJitterMs(3000, 5000, 800);
 
+    let currentLocationIntervalMs = 1500;
+    const ensureLocationInterval = (nextMs) => {
+      if (currentLocationIntervalMs === nextMs || this.bot !== bot || generation !== this.generation || this.manualStop) return;
+      currentLocationIntervalMs = nextMs;
+      if (this.locationTimer) clearInterval(this.locationTimer);
+      this.locationTimer = setInterval(check, nextMs);
+      this.locationTimer.unref?.();
+    };
+
     const check = () => {
       if (this.bot !== bot || generation !== this.generation || this.manualStop) {
         if (this.locationTimer) clearInterval(this.locationTimer);
@@ -991,6 +1000,7 @@ class MinecraftSession extends EventEmitter {
           if (typeof bot.food === 'number' && bot.food < 16) void this.tryEatFood(bot);
         }
       }
+      ensureLocationInterval(kind === 'other' && this.state === 'online' ? 5000 : 1500);
     };
 
     if (this.initialLocationTimer) clearTimeout(this.initialLocationTimer);
@@ -1592,7 +1602,11 @@ class MinecraftSession extends EventEmitter {
 
   getInventorySnapshot(bot = this.bot) {
     if (!bot || !bot.inventory) {
-      return {
+      const rev = this.inventoryRevision || 0;
+      if (this._emptyInvSnap && this._emptyInvSnap.revision === rev) {
+        return this._emptyInvSnap;
+      }
+      this._emptyInvSnap = {
         slots: {},
         armor: { head: null, torso: null, legs: null, feet: null },
         offhand: null,
@@ -1602,9 +1616,10 @@ class MinecraftSession extends EventEmitter {
         goldenAppleCount: 0,
         foodCount: 0,
         selectedHotbar: 0,
-        revision: this.inventoryRevision,
+        revision: rev,
         items: []
       };
+      return this._emptyInvSnap;
     }
     const rawSlots = bot.inventory.slots || {};
     const health = Number.isFinite(bot.health) ? Math.round(bot.health) : 20;

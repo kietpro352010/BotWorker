@@ -100,31 +100,34 @@ class ManagerReporter {
       || ['stopped', 'disconnected', 'error', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
     const positionMoved = Boolean(!disconnected && raw.position && this.hasPositionMovedSignificantly(raw.position));
 
-    const payload = {
-      ...raw,
-      managerLatencyMs: this.managerLatencyMs,
-      stateDigest: digest,
-      digestUnchanged
-    };
-
-    if (digestUnchanged) {
-      payload.isLightweight = true;
-      delete payload.inventory;
-      delete payload.currentWindow;
-      delete payload.items;
-      delete payload.bandwidthRxBps;
-      delete payload.bandwidthTxBps;
-      delete payload.processStartedAt;
-      delete payload.pendingCommands;
-      delete payload.activeLifecycle;
-      delete payload.locationKind;
-      if (!positionMoved) {
-        delete payload.position;
-        payload.positionUnchanged = true;
-      }
-    } else if (raw.position && !positionMoved) {
-      payload.positionUnchanged = true;
-    }
+    const payload = digestUnchanged
+      ? {
+          workerId: raw.workerId,
+          transport: raw.transport,
+          state: raw.state,
+          connected: Boolean(raw.connected),
+          online: Boolean(raw.online ?? raw.connected),
+          ...(raw.manuallyStopped !== undefined ? { manuallyStopped: Boolean(raw.manuallyStopped) } : {}),
+          managerLatencyMs: this.managerLatencyMs,
+          stateDigest: digest,
+          digestUnchanged: true,
+          isLightweight: true,
+          uptimeSeconds: raw.uptimeSeconds,
+          pingMs: raw.pingMs,
+          tps: raw.tps,
+          cpuPercent: raw.cpuPercent,
+          rssMb: raw.rssMb,
+          heapUsedMb: raw.heapUsedMb,
+          ...(raw.lastStateAt !== undefined ? { lastStateAt: raw.lastStateAt } : {}),
+          ...(positionMoved ? { position: raw.position } : { positionUnchanged: true })
+        }
+      : {
+          ...raw,
+          managerLatencyMs: this.managerLatencyMs,
+          stateDigest: digest,
+          digestUnchanged: false,
+          ...(raw.position && !positionMoved ? { positionUnchanged: true } : {})
+        };
 
     return { seq, payload, digest, digestUnchanged, disconnected, positionMoved, position: raw.position || null };
   }

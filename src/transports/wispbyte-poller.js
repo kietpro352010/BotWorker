@@ -268,10 +268,13 @@ class WispbytePoller {
           }
           await cancellableSleep(authDelayMs > 0 ? authDelayMs : 500, this.stopController.signal);
         } else {
-          // Adaptive polling interval: 1.5s when active/transitioning, 5s-8s when steady/idle
+          // Adaptive polling interval: 1.5s when transitioning, 5-8s when online/afk, 8-12s when stopped/inactive
           const stateStr = String(prepared.payload?.state || '').toLowerCase();
           const isIdle = ['idle', 'stopped', 'disconnected', 'error', 'afk', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
-          const adaptiveDelayMs = isIdle ? (5000 + Math.floor(Math.random() * 3000)) : 1500;
+          const isInactive = ['idle', 'stopped', 'disconnected', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
+          const adaptiveDelayMs = isInactive
+            ? (8000 + Math.floor(Math.random() * 4000))
+            : (isIdle ? (5000 + Math.floor(Math.random() * 3000)) : 1500);
           await cancellableSleep(adaptiveDelayMs, this.stopController.signal);
         }
       } catch (error) {

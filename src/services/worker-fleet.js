@@ -46,6 +46,7 @@ class WorkerFleet {
     this.heartbeatTimer = null;
     this.resourceTimer = null;
     this.lastResourceWarningAt = 0;
+    this.lastForcedGcAt = 0;
     this.lastCpuSample = process.cpuUsage();
     this.lastResourceSampleAt = Date.now();
     this.instances = new Map();
@@ -177,7 +178,13 @@ class WorkerFleet {
     };
     for (const instance of this.instances.values()) {
       instance.session.updateResourceMetrics(metrics);
-      instance.session.sampleNetworkMetrics(now);
+      if (instance.session.bot) {
+        instance.session.sampleNetworkMetrics(now);
+      } else {
+        instance.session.bandwidthRxBps = 0;
+        instance.session.bandwidthTxBps = 0;
+        instance.session.networkSampleAt = now;
+      }
     }
     return metrics;
   }
@@ -236,12 +243,14 @@ class WorkerFleet {
         }
       }
 
-      // Memory Watchdog (Trụ cột 1.1: Tự động dọn RAM nếu > 350MB)
+      // Memory Watchdog (Trụ cột 1.1: Tự động dọn RAM nếu > 350MB, giữ cooldown 120s tránh V8 GC liên tục)
       if (rssMb > 350) {
         for (const instance of this.instances.values()) {
           instance.session.pruneMemory?.();
         }
-        if (typeof global.gc === 'function') {
+        const nowGc = Date.now();
+        if (typeof global.gc === 'function' && nowGc - this.lastForcedGcAt >= 120000) {
+          this.lastForcedGcAt = nowGc;
           try { global.gc(); } catch (_) {}
         }
       }

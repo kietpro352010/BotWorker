@@ -50,14 +50,17 @@ async function main() {
   });
 
   // Adaptive Memory Sweeper (Trụ cột 1.1)
+  let lastSweepGcAt = 0;
   const memorySweepInterval = setInterval(() => {
     const memory = process.memoryUsage();
     const rssMb = Math.round(memory.rss / (1024 * 1024));
     const heapUsedMb = Math.round(memory.heapUsed / (1024 * 1024));
     const heapTotalMb = Math.round(memory.heapTotal / (1024 * 1024));
 
-    // Ngưỡng cảnh báo bộ nhớ trên Worker (250MB RSS hoặc >75% heap)
-    if (rssMb > 250 || heapUsedMb > 0.75 * heapTotalMb) {
+    // Ngưỡng cảnh báo bộ nhớ trên Worker (250MB RSS hoặc >75% heap) với cooldown 120s tránh GC liên tục
+    const now = Date.now();
+    if ((rssMb > 250 || heapUsedMb > 0.75 * heapTotalMb) && (now - lastSweepGcAt >= 2 * 60 * 1000 || heapUsedMb > 0.85 * heapTotalMb)) {
+      lastSweepGcAt = now;
       const collected = runGarbageCollection();
       logger.info('worker_memory_sweep', { rssMb, heapUsedMb, heapTotalMb, collected });
     }

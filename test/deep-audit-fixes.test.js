@@ -2239,6 +2239,128 @@ async function testW17BootstrapManuallyStoppedGuard() {
   console.log('✅ 17. [W-17] Bootstrap manuallyStopped guard verified.');
 }
 
+async function testW18ResourceAndAdaptivePollingOptimizations() {
+  console.log('18. [W-18] Testing compact lightweight telemetry, cached empty inventory, and adaptive location timer...');
+
+  // 18a. Compact lightweight payload strips heavy/static fields when digestUnchanged=true
+  const reporter = new ManagerReporter({
+    baseUrl: 'https://mgr.example.com',
+    workerId: 'w-w18',
+    secret: 'r'.repeat(32),
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+    logger: quietLogger
+  });
+  const base = {
+    workerId: 'w-w18',
+    transport: 'wispbyte-poll',
+    state: 'online',
+    connected: true,
+    online: true,
+    manuallyStopped: false,
+    username: 'HeavyName',
+    serverHost: 'kingmc.vn',
+    processStartedAt: '2026-01-01T00:00:00Z',
+    afkMode: 'still',
+    pingMs: 28,
+    tps: 19.8,
+    cpuPercent: 4.2,
+    rssMb: 112,
+    heapUsedMb: 48,
+    uptimeSeconds: 120,
+    position: { x: 100, y: 64, z: 100 },
+    inventory: { slots: { 45: { name: 'totem_of_undying', count: 1 } }, items: [{ name: 'totem_of_undying', count: 1 }], revision: 2 },
+    currentWindow: null
+  };
+  const firstMeta = reporter.prepareStatusPayload(base);
+  assert.strictEqual(firstMeta.digestUnchanged, false);
+  reporter.recordStatusSent(firstMeta);
+
+  const compactMeta = reporter.prepareStatusPayload({ ...base, pingMs: 30, cpuPercent: 5.1, position: { x: 101, y: 64, z: 100 } });
+  assert.strictEqual(compactMeta.digestUnchanged, true);
+  assert.strictEqual(compactMeta.payload.isLightweight, true);
+  assert.strictEqual(compactMeta.payload.positionUnchanged, true);
+  assert.strictEqual(compactMeta.payload.username, undefined, 'Lightweight payload should omit static username');
+  assert.strictEqual(compactMeta.payload.serverHost, undefined, 'Lightweight payload should omit static serverHost');
+  assert.strictEqual(compactMeta.payload.inventory, undefined, 'Lightweight payload should omit inventory');
+  assert.strictEqual(compactMeta.payload.pingMs, 30);
+  assert.strictEqual(compactMeta.payload.tps, 19.8);
+  assert.strictEqual(compactMeta.payload.rssMb, 112);
+
+  // 18b. Cached empty inventory snapshot reuses instance until revision bumps
+  const s = new MinecraftSession({
+    workerId: 'w-w18-sess',
+    transport: 'wispbyte-poll',
+    mc: { hosts: ['kingmc.vn'], port: 25565, username: 'EcoBot', password: '' },
+    afk: { mode: 'still' }
+  }, quietLogger);
+  const empty1 = s.getInventorySnapshot(null);
+  const empty2 = s.getInventorySnapshot(null);
+  assert.strictEqual(empty1, empty2, 'Empty inventory snapshot must reuse cached instance for same revision');
+  s._bumpInventoryRevision();
+  const empty3 = s.getInventorySnapshot(null);
+  assert.notStrictEqual(empty3, empty2);
+  assert.strictEqual(empty3.revision, empty2.revision + 1);
+
+  // 18c. Adaptive locationTimer transitions 1500ms -> 5000ms in-game -> 1500ms back in lobby
+  const origSetInterval = global.setInterval;
+  const origClearInterval = global.clearInterval;
+  const scheduled = [];
+  let clearedCount = 0;
+  global.setInterval = (fn, ms, ...args) => {
+    const handle = { id: scheduled.length + 1, fn, ms, unref() {} };
+    scheduled.push(handle);
+    return handle;
+  };
+  global.clearInterval = (handle) => {
+    if (handle && scheduled.includes(handle)) clearedCount += 1;
+  };
+
+  try {
+    const fakeBot = new EventEmitter();
+    fakeBot.username = 'EcoBot';
+    fakeBot.player = { ping: 20 };
+    fakeBot.health = 20;
+    fakeBot.food = 20;
+    fakeBot.entity = { id: 1, position: { x: 0.5, y: 41.0, z: 0.8 } };
+    fakeBot.inventory = { slots: {}, items: () => [] };
+    fakeBot.chat = () => {};
+    fakeBot.quit = () => {};
+    fakeBot.end = () => {};
+    s.bot = fakeBot;
+    s.manualStop = false;
+    s.generation = 7;
+    s.state = 'entering';
+    s.auth.authenticated = true;
+
+    s.startLocationMonitor(fakeBot, 7, 'kingmc.vn');
+    assert.strictEqual(scheduled.length, 1);
+    assert.strictEqual(scheduled[0].ms, 1500, 'Location timer starts at 1500ms');
+
+    // Run check while at lobby -> remains 1500ms
+    scheduled[0].fn();
+    assert.strictEqual(scheduled.length, 1);
+
+    // Move to AFK world -> switches to 5000ms
+    fakeBot.entity.position = { x: 250, y: 70, z: 250 };
+    scheduled[0].fn();
+    assert.strictEqual(scheduled.length, 2, 'In-game state must switch locationTimer to 5000ms');
+    assert.strictEqual(scheduled[1].ms, 5000);
+    assert.strictEqual(clearedCount, 1);
+
+    // Return to lobby -> switches back to 1500ms
+    fakeBot.entity.position = { x: 0.5, y: 41.0, z: 0.8 };
+    scheduled[1].fn();
+    assert.strictEqual(scheduled.length, 3, 'Returning to lobby must restore 1500ms locationTimer');
+    assert.strictEqual(scheduled[2].ms, 1500);
+  } finally {
+    global.setInterval = origSetInterval;
+    global.clearInterval = origClearInterval;
+    await s.stop('test_cleanup', { emitEvent: false });
+  }
+
+  console.log('✅ 18. [W-18] Worker telemetry, empty inventory cache & adaptive timer verified.');
+}
+
 async function main() {
   console.log('--- [WORKER DEEP AUDIT FIXES REGRESSION TESTS] ---');
   await testW01NonLifecycleTimeoutPreservesSession();
@@ -2258,6 +2380,7 @@ async function main() {
   await testW15DeepAuditFixes();
   await testW16SnapshotCacheFreshnessAndDebounce();
   await testW17BootstrapManuallyStoppedGuard();
+  await testW18ResourceAndAdaptivePollingOptimizations();
   console.log('\n🎉 ALL WORKER DEEP AUDIT FIXES REGRESSION TESTS PASSED 100%!');
 }
 
