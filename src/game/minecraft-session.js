@@ -460,6 +460,9 @@ class MinecraftSession extends EventEmitter {
       bot.on('windowClose', (win) => {
         if (this.bot !== bot || generation !== this.generation) return;
         this._cachedWinSnap = null;
+        if (win && win._kbotUpdateSlotBound) {
+          delete win._kbotUpdateSlotBound;
+        }
         if (!win || this._windowEventsBound === win) {
           this._windowEventsBound = null;
         }
@@ -534,6 +537,7 @@ class MinecraftSession extends EventEmitter {
     if (bot.inventory?.on) {
       this._inventoryEventsBound = bot;
       bot.inventory.on('updateSlot', (slot) => {
+        if (this.bot !== bot) return;
         this._cachedInvSnap = null;
         if (slot === 45 || slot === 40 || !slot) void this.fastEquipTotem(bot);
         this.scheduleInventoryRevisionBump(bot);
@@ -1159,7 +1163,12 @@ class MinecraftSession extends EventEmitter {
       try { bot.removeAllListeners?.(); bot.on?.('error', () => {}); } catch (_) {}
       try { bot._client?.removeAllListeners?.(); bot._client?.on?.('error', () => {}); } catch (_) {}
       try { bot.inventory?.removeAllListeners?.(); } catch (_) {}
-      try { bot.currentWindow?.removeAllListeners?.(); } catch (_) {}
+      try {
+        if (bot.currentWindow) {
+          delete bot.currentWindow._kbotUpdateSlotBound;
+          bot.currentWindow.removeAllListeners?.();
+        }
+      } catch (_) {}
       try { bot._client?.socket?.destroy?.(); } catch (_) {}
       bot.entities = {};
       bot.players = {};

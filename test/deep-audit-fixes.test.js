@@ -1993,6 +1993,23 @@ async function testW16SnapshotCacheFreshnessAndDebounce() {
   invSession.off('state', onState);
   assert.ok(invSession.inventoryRevision > revAtBurstStart, 'Continuous <350ms updateSlot burst must NOT starve inventoryRevision bump');
   assert.ok(stateEmitsDuringBurst >= 1, 'Continuous <350ms updateSlot burst must emit state on schedule');
+
+  // Stale old bot emitting updateSlot must NOT clobber a newer active bot's _cachedInvSnap
+  const newerBot = new EventEmitter();
+  newerBot.username = 'SnapBot';
+  newerBot.player = { ping: 20 };
+  newerBot._client = new EventEmitter();
+  newerBot.inventory = new EventEmitter();
+  newerBot.inventory.slots = { 36: { name: 'golden_apple', count: 3 } };
+  newerBot.inventory.items = () => Object.values(newerBot.inventory.slots).filter(Boolean);
+  invSession.bot = newerBot;
+  invSession.onSpawn(newerBot, 2, 'kingmc.vn');
+  const newerSnap = invSession.getInventorySnapshot();
+  assert.strictEqual(newerSnap.goldenAppleCount, 3);
+  assert.ok(invSession._cachedInvSnap);
+  fakeBot.inventory.emit('updateSlot', 36);
+  assert.ok(invSession._cachedInvSnap, 'Stale bot updateSlot must NOT invalidate newer active bot cache');
+
   await invSession.stop('test_cleanup', { emitEvent: false });
 
   // 16b. Window snapshot cache safety: unbound currentWindow never serves stale cache; windowOpen-bound invalidates cleanly
@@ -2087,6 +2104,21 @@ async function testW16SnapshotCacheFreshnessAndDebounce() {
     await winSession.resetData();
     assert.strictEqual(winSession._windowEventsBound, null);
     assert.strictEqual(winSession._cachedWinSnap, null);
+
+    // Reconnecting and reopening same win emitter after resetData() re-binds updateSlot cleanly
+    winSession.applyManagerCredentials({ username: 'WinSnapBot', password: '' });
+    winSession.manualStop = false;
+    await winSession.connect();
+    winSession.state = 'online';
+    spawnedWinBot.currentWindow = win;
+    spawnedWinBot.emit('windowOpen', win);
+    assert.strictEqual(winSession._windowEventsBound, win);
+    assert.ok(winSession.getWindowSnapshot());
+    assert.ok(winSession._cachedWinSnap);
+    win.slots[0] = { name: 'diamond', count: 9 };
+    win.emit('updateSlot', 0);
+    assert.strictEqual(winSession._cachedWinSnap, null, 'Reopened window after cleanup must re-bind updateSlot listener');
+    assert.strictEqual(winSession.getWindowSnapshot().slots[0].name, 'diamond');
   } finally {
     mf.createBot = origCreateBot;
     await winSession.stop('test_cleanup', { emitEvent: false });
