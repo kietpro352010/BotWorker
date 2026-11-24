@@ -1,9 +1,13 @@
 'use strict';
 
 class AfkController {
-  constructor({ logger } = {}) {
+  constructor({ logger, minMs, maxMs } = {}) {
     this.mode = 'still';
     this.logger = logger;
+    const parsedMin = Number(minMs);
+    const parsedMax = Number(maxMs);
+    this.minMs = Number.isFinite(parsedMin) && parsedMin >= 1000 ? parsedMin : 25000;
+    this.maxMs = Number.isFinite(parsedMax) && parsedMax >= this.minMs ? parsedMax : Math.max(this.minMs, 45000);
     this.bot = null;
     this.active = false;
     this.antiAfkTimer = null;
@@ -13,8 +17,8 @@ class AfkController {
     if (!this.active || !this.bot) return;
     if (this.antiAfkTimer) clearTimeout(this.antiAfkTimer);
 
-    // Random interval between 25 and 45 seconds to bypass server-side heuristics
-    const intervalMs = Math.floor(Math.random() * 20000) + 25000;
+    const spanMs = Math.max(0, this.maxMs - this.minMs);
+    const intervalMs = this.minMs + Math.floor(Math.random() * (spanMs + 1));
     this.antiAfkTimer = setTimeout(() => {
       this.performMicroLookAndSwing();
       this.scheduleAntiAfkAction();

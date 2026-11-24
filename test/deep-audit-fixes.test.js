@@ -1855,6 +1855,87 @@ async function testW14Wave5RemediationFixes() {
   console.log('✅ 14. [W-14] Wave 5 remediation & negative regression tests verified 100%.');
 }
 
+async function testW15DeepAuditFixes() {
+  console.log('15. [W-15] Testing Deep Audit P0-P2 fixes (restriction recovery, AFK config, resource pack ACK, logger redaction)...');
+  const AfkController = require('../src/game/afk-controller');
+  const { attachEarlyPacketDropFilter } = require('../src/game/packet-optimization');
+  const loggerMod = require('../src/utils/logger');
+
+  // 15a. resetData clears ip_limited & banned; setProxy escapes ip_limited but still blocks banned
+  const s = new MinecraftSession({
+    workerId: 'w-w15',
+    transport: 'wispbyte-poll',
+    mc: { hosts: ['kingmc.vn'], port: 25565, username: 'OldUser', password: 'pw' }
+  }, quietLogger);
+  s.pauseForRestriction('ip_limited', 'Too many connections from this IP');
+  assert.strictEqual(s.restriction, 'ip_limited');
+  assert.strictEqual(s.state, 'ip_limited');
+
+  const proxyRes = await s.setProxy('socks5://1.1.1.1:1080');
+  assert.strictEqual(proxyRes.ok, true);
+  assert.strictEqual(proxyRes.clearedRestriction, 'ip_limited');
+  assert.strictEqual(s.restriction, null);
+  assert.strictEqual(s.state, 'stopped');
+
+  s.pauseForRestriction('banned', 'You are banned');
+  await assert.rejects(() => s.setProxy('socks5://8.8.8.8:1080'), /restriction hold/i);
+
+  await s.resetData();
+  assert.strictEqual(s.restriction, null, 'resetData must clear restriction');
+  assert.strictEqual(s.state, 'stopped', 'resetData must transition state back to stopped');
+
+  // 15b. applyManagerSettings valid proxy escapes ip_limited; malformed keeps fail-closed
+  s.pauseForRestriction('ip_limited', 'IP limited again');
+  s.applyManagerSettings({ proxyUrl: 'socks5://bad%ZZuser:pass@1.2.3.4:1080' });
+  assert.strictEqual(s.restriction, 'ip_limited', 'Invalid proxyUrl must keep fail-closed restriction');
+  s.applyManagerSettings({ proxyUrl: 'socks5://8.8.4.4:1080' });
+  assert.strictEqual(s.restriction, null, 'Valid proxy change via applyManagerSettings must clear ip_limited');
+  assert.strictEqual(s.state, 'stopped');
+
+  // 15c. restoreManagerState({ restricted: false }) clears banned/ip_limited; applyManagerCredentials clears banned on username swap
+  s.pauseForRestriction('banned', 'Account banned');
+  assert.strictEqual(s.restoreManagerState({ restricted: false }), true);
+  assert.strictEqual(s.restriction, null);
+
+  s.pauseForRestriction('banned', 'OldAccount banned');
+  s.username = 'OldAccount';
+  s.applyManagerCredentials({ username: 'FreshCustomer', password: 'pw2' });
+  assert.strictEqual(s.restriction, null, 'Switching username must clear prior banned hold');
+
+  // 15d. AfkController uses configured minMs/maxMs
+  const afk = new AfkController({ logger: quietLogger, minMs: 120000, maxMs: 240000 });
+  assert.strictEqual(afk.minMs, 120000);
+  assert.strictEqual(afk.maxMs, 240000);
+
+  // 15e. Lightweight resource_pack_receive ACK for 1.20.1 and 1.20.4
+  const writes = [];
+  let rpForwarded = false;
+  const rpBot = new EventEmitter();
+  rpBot._client = new EventEmitter();
+  rpBot._client.write = (name, data) => writes.push({ name, data });
+  rpBot._client.on('resource_pack_send', () => { rpForwarded = true; });
+  attachEarlyPacketDropFilter(rpBot);
+  rpBot._client.emit('resource_pack_send', { url: 'https://example.com/pack.zip', hash: 'abc' });
+  rpBot._client.emit('add_resource_pack', { uuid: 'u-123', url: 'https://example.com/pack2.zip', hash: 'def' });
+  assert.strictEqual(rpForwarded, false, 'Resource pack event must not trigger heavy Mineflayer plugin handlers');
+  assert.deepStrictEqual(writes, [
+    { name: 'resource_pack_receive', data: { result: 0 } },
+    { name: 'resource_pack_receive', data: { result: 3 } },
+    { name: 'resource_pack_receive', data: { uuid: 'u-123', result: 0 } },
+    { name: 'resource_pack_receive', data: { uuid: 'u-123', result: 3 } }
+  ]);
+
+  // 15f. Logger full secret redaction parity
+  const leaked = loggerMod.redactStringSecrets('Authorization: Bearer secret_tok_999 ?token=q123 /login MyMcPass88');
+  assert.ok(!leaked.includes('secret_tok_999'));
+  assert.ok(!leaked.includes('q123'));
+  assert.ok(!leaked.includes('MyMcPass88'));
+  assert.strictEqual(typeof loggerMod.redact, 'function');
+
+  await s.stop('test_cleanup', { emitEvent: false });
+  console.log('✅ 15. [W-15] Deep Audit P0-P2 fixes verified.');
+}
+
 async function main() {
   console.log('--- [WORKER DEEP AUDIT FIXES REGRESSION TESTS] ---');
   await testW01NonLifecycleTimeoutPreservesSession();
@@ -1871,6 +1952,7 @@ async function main() {
   await testW12Round4IndependentAuditFixes();
   await testW13HostFailoverAndWhitelist();
   await testW14Wave5RemediationFixes();
+  await testW15DeepAuditFixes();
   console.log('\n🎉 ALL WORKER DEEP AUDIT FIXES REGRESSION TESTS PASSED 100%!');
 }
 

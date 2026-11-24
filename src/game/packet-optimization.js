@@ -31,12 +31,29 @@ const DISABLED_PLUGINS = Object.freeze({
   bed: false, block_actions: false, breath: false, experience: false, spawn_point: false
 });
 
+function sendLightweightResourcePackAck(client, packet) {
+  if (!client || typeof client.write !== 'function') return;
+  try {
+    if (packet && packet.uuid) {
+      client.write('resource_pack_receive', { uuid: packet.uuid, result: 0 });
+      client.write('resource_pack_receive', { uuid: packet.uuid, result: 3 });
+    } else {
+      client.write('resource_pack_receive', { result: 0 });
+      client.write('resource_pack_receive', { result: 3 });
+    }
+  } catch (_) {}
+}
+
 function attachEarlyPacketDropFilter(bot) {
   const hook = (client) => {
     if (!client || client._kingmcDropHookAttached) return;
     client._kingmcDropHookAttached = true;
     const originalEmit = client.emit;
     client.emit = function emit(name, ...args) {
+      if (name === 'resource_pack_send' || name === 'add_resource_pack') {
+        sendLightweightResourcePackAck(this, args[0]);
+        return false;
+      }
       if (DROP_EVENTS.has(name)) return false;
       if (name === 'player_remove') return false;
       if (ENTITY_UPDATE_EVENTS.has(name)) {

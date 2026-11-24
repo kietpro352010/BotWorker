@@ -166,6 +166,9 @@ class MinecraftSession extends EventEmitter {
     this.inventoryRevision = 0;
     this.inventoryUpdateTimer = null;
     this.lastInventoryStateEmitAt = 0;
+    this._inventoryEventsBound = null;
+    this._cachedInvSnap = null;
+    this._cachedWinSnap = null;
     this.windowRevision = 0;
     this.isVerificationKickPending = false;
     this.pendingReconnectDelayMs = null;
@@ -517,6 +520,7 @@ class MinecraftSession extends EventEmitter {
     });
 
     if (bot.inventory?.on) {
+      this._inventoryEventsBound = bot;
       bot.inventory.on('updateSlot', (slot) => {
         if (slot === 45 || slot === 40 || !slot) void this.fastEquipTotem(bot);
         this.scheduleInventoryRevisionBump(bot);
@@ -553,6 +557,7 @@ class MinecraftSession extends EventEmitter {
       this.inventoryUpdateTimer = null;
     }
     this.inventoryRevision += 1;
+    this._cachedInvSnap = null;
     return this.inventoryRevision;
   }
 
@@ -1149,6 +1154,9 @@ class MinecraftSession extends EventEmitter {
       bot.blockAt = () => null;
     }
     this.networkSockets.clear();
+    this._inventoryEventsBound = null;
+    this._cachedInvSnap = null;
+    this._cachedWinSnap = null;
     this.bot = null;
     this.connectedAt = null;
   }
@@ -1347,6 +1355,7 @@ class MinecraftSession extends EventEmitter {
     const bot = this.bot;
     this.bot = null;
     this.cleanupSessionResources(bot);
+    this.restriction = null;
     this.username = '';
     this.password = '';
     this.proxy = null;
@@ -1360,7 +1369,7 @@ class MinecraftSession extends EventEmitter {
     this.lastReconnectAttemptCount = 0;
     this.lastError = null;
     this.lastKickReason = null;
-    this.state = ['ip_limited', 'banned'].includes(this.restriction) ? this.restriction : 'stopped';
+    this.state = 'stopped';
     this.lastStateAt = new Date().toISOString();
     this.emit('state', this.getStatus());
     return { ok: true, worker: this.getStatus() };
@@ -1386,19 +1395,27 @@ class MinecraftSession extends EventEmitter {
     if (password.length > 380 || /[\r\n\u0000-\u001f\u007f]/.test(password)) {
       throw new Error('Manager Minecraft credentials are invalid.');
     }
+    const prevUsername = this.username;
     this.username = username;
     this.password = password;
     this.auth.setPassword(password);
+    if (this.restriction === 'banned' && prevUsername && prevUsername !== username) {
+      this.restriction = null;
+      this.state = 'stopped';
+      this.lastKickReason = null;
+      this.lastStateAt = new Date().toISOString();
+    }
     return true;
   }
 
   restoreManagerState({ restricted, restriction, state } = {}) {
     const recoveredRestriction = restriction || (['ip_limited', 'banned'].includes(state) ? state : null);
     if (restricted === false && !recoveredRestriction) {
-      if (['manager_check_failed', 'manager_hold'].includes(this.restriction)) {
+      if (this.restriction) {
         this.restriction = null;
         this.manualStop = true;
         this.state = 'stopped';
+        this.lastKickReason = null;
         this.lastStateAt = new Date().toISOString();
         this.logger.info('worker_manager_hold_cleared');
         this.emit('state', this.getStatus());
@@ -1426,9 +1443,22 @@ class MinecraftSession extends EventEmitter {
     this.afkMode = 'still';
     this.afk.mode = 'still';
     if (Object.hasOwn(settings, 'proxyUrl')) {
+      const prevProxySig = this.proxy
+        ? `${this.proxy.type || 'socks5'}:${this.proxy.host || ''}:${this.proxy.port || ''}:${this.proxy.username || ''}:${this.proxy.password || ''}`
+        : '';
       try {
-        this.proxy = parseSocksProxy(settings.proxyUrl, 'manager proxy');
+        const nextProxy = parseSocksProxy(settings.proxyUrl, 'manager proxy');
+        const nextProxySig = nextProxy
+          ? `${nextProxy.type || 'socks5'}:${nextProxy.host || ''}:${nextProxy.port || ''}:${nextProxy.username || ''}:${nextProxy.password || ''}`
+          : '';
+        this.proxy = nextProxy;
         this.proxyConfigError = null;
+        if (this.restriction === 'ip_limited' && nextProxySig !== prevProxySig) {
+          this.restriction = null;
+          this.state = 'stopped';
+          this.lastKickReason = null;
+          this.lastStateAt = new Date().toISOString();
+        }
       } catch (err) {
         this.proxyConfigError = err?.message || 'Invalid proxy configuration.';
         this.logger?.warn?.('worker_invalid_manager_proxy_ignored', { error: this.proxyConfigError });
@@ -1552,6 +1582,23 @@ class MinecraftSession extends EventEmitter {
       };
     }
     const rawSlots = bot.inventory.slots || {};
+    const health = Number.isFinite(bot.health) ? Math.round(bot.health) : 20;
+    const food = Number.isFinite(bot.food) ? Math.round(bot.food) : 20;
+    const selectedHotbar = Number.isInteger(bot.quickBarSlot) ? bot.quickBarSlot : 0;
+    const rev = this.inventoryRevision || 0;
+    if (
+      bot === this.bot &&
+      this._inventoryEventsBound === bot &&
+      this._cachedInvSnap &&
+      this._cachedInvSnap.bot === bot &&
+      this._cachedInvSnap.rawSlots === rawSlots &&
+      this._cachedInvSnap.rev === rev &&
+      this._cachedInvSnap.health === health &&
+      this._cachedInvSnap.food === food &&
+      this._cachedInvSnap.selectedHotbar === selectedHotbar
+    ) {
+      return this._cachedInvSnap.snap;
+    }
     const slots = {};
     let totemCount = 0;
     let goldenAppleCount = 0;
@@ -1587,7 +1634,7 @@ class MinecraftSession extends EventEmitter {
       }
     }
 
-    return {
+    const snap = {
       slots,
       armor: {
         head: slots['5'] || null,
@@ -1596,15 +1643,19 @@ class MinecraftSession extends EventEmitter {
         feet: slots['8'] || null
       },
       offhand: slots['45'] ? slots['45'].name : null,
-      health: Number.isFinite(bot.health) ? Math.round(bot.health) : 20,
-      food: Number.isFinite(bot.food) ? Math.round(bot.food) : 20,
+      health,
+      food,
       totemCount,
       goldenAppleCount,
       foodCount,
-      selectedHotbar: Number.isInteger(bot.quickBarSlot) ? bot.quickBarSlot : 0,
+      selectedHotbar,
       revision: this.inventoryRevision,
       items
     };
+    if (bot === this.bot && this._inventoryEventsBound === bot) {
+      this._cachedInvSnap = { bot, rawSlots, rev, health, food, selectedHotbar, snap };
+    }
+    return snap;
   }
 
   async resolvePublicIp() {
@@ -1644,10 +1695,25 @@ class MinecraftSession extends EventEmitter {
 
   getWindowSnapshot(bot = this.bot) {
     const win = bot?.currentWindow;
-    if (!win) return null;
+    if (!win) {
+      if (bot === this.bot) this._cachedWinSnap = null;
+      return null;
+    }
     const rawSlots = win.slots || [];
     const len = Array.isArray(rawSlots) ? rawSlots.length : 0;
     const winType = String(win.type || 'minecraft:container');
+    const rev = this.windowRevision || 0;
+    if (
+      bot === this.bot &&
+      this._cachedWinSnap &&
+      this._cachedWinSnap.win === win &&
+      this._cachedWinSnap.rawSlots === rawSlots &&
+      this._cachedWinSnap.winId === win.id &&
+      this._cachedWinSnap.winType === winType &&
+      this._cachedWinSnap.rev === rev
+    ) {
+      return this._cachedWinSnap.snap;
+    }
 
     // Xác định chính xác số ô của container (loại trừ 36 ô inventory & hotbar của người chơi)
     let containerSlots = 54;
@@ -1680,14 +1746,18 @@ class MinecraftSession extends EventEmitter {
     }
 
     const title = extractChatMessage(win.title) || 'Container';
-    return {
+    const snap = {
       id: win.id,
       type: winType,
       title,
       slots,
       totalSlots: containerSlots,
-      revision: this.windowRevision || 0
+      revision: rev
     };
+    if (bot === this.bot) {
+      this._cachedWinSnap = { win, rawSlots, winId: win.id, winType, rev, snap };
+    }
+    return snap;
   }
 
   setAfkMode(_value) {
@@ -1697,14 +1767,29 @@ class MinecraftSession extends EventEmitter {
   }
 
   async setProxy(value, { signal } = {}) {
-    if (this.restriction) throw new Error('Proxy settings cannot be changed while the worker is on a server restriction hold.');
+    if (this.restriction && this.restriction !== 'ip_limited') {
+      throw new Error('Proxy settings cannot be changed while the worker is on a server restriction hold.');
+    }
     const proxy = parseSocksProxy(value, 'proxy');
     const shouldReconnect = Boolean(this.bot && ['online', 'entering', 'connecting', 'authenticating'].includes(this.state));
     this.proxy = proxy;
     this.proxyConfigError = null;
+    const clearedRestriction = this.restriction === 'ip_limited' ? 'ip_limited' : null;
+    if (clearedRestriction) {
+      this.restriction = null;
+      this.state = 'stopped';
+      this.lastKickReason = null;
+      this.lastStateAt = new Date().toISOString();
+      this.emit('state', this.getStatus());
+    }
     if (!proxy) void this.resolvePublicIp();
     if (shouldReconnect && !signal?.aborted) await this.restart({ signal });
-    return { ok: true, proxyEnabled: Boolean(proxy), reconnecting: shouldReconnect };
+    return {
+      ok: true,
+      proxyEnabled: Boolean(proxy),
+      reconnecting: shouldReconnect,
+      ...(clearedRestriction ? { clearedRestriction } : {})
+    };
   }
 
   async respawn() {
