@@ -272,9 +272,9 @@ class WorkerFleet {
       let position = 0;
       for (const instance of this.instances.values()) {
         if (this.stopping) break;
-        // Trì hoãn nếu RAM vượt trần 440MB để tránh OOM
+        // Trì hoãn nếu RAM vượt trần 400MB để tránh OOM
         const mem = process.memoryUsage();
-        if (mem.rss > 440 * 1024 * 1024) {
+        if (mem.rss > 400 * 1024 * 1024) {
           this.logger.warn('bot_spawn_delayed_high_memory', { rssMb: Math.round(mem.rss / (1024 * 1024)) });
           await delay(5000, this.stopController.signal);
         }

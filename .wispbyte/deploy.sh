@@ -1,6 +1,6 @@
 #!/bin/sh
 # Wispbyte pre-deploy hook (executed via: sh .wispbyte/deploy.sh)
-# Prevents Linux cgroup OOM kills during fresh `npm install` on 256MB-512MB containers.
+# Caps V8 heap at 400MB and serializes sockets during `npm ci` / `npm install`.
 
 if [ -f "/home/container/package.json" ]; then
   cd /home/container || exit 0
@@ -15,7 +15,7 @@ if [ ! -x "$NPM_BIN" ]; then
   NPM_BIN="npm"
 fi
 
-export NODE_OPTIONS="--max-old-space-size=112"
+export NODE_OPTIONS="--max-old-space-size=400"
 export UV_THREADPOOL_SIZE="1"
 export npm_config_maxsockets="1"
 export npm_config_audit="false"
@@ -40,7 +40,7 @@ if [ "$NEED_INSTALL" = "0" ]; then
 fi
 
 if [ "$NEED_INSTALL" = "1" ]; then
-  echo "[wispbyte-deploy] Installing worker dependencies in low-memory mode (max-old-space-size=112, maxsockets=1)..."
+  echo "[wispbyte-deploy] Installing worker dependencies (max-old-space-size=400, maxsockets=1)..."
   rm -rf node_modules/.staging 2>/dev/null || true
   if [ -f "package-lock.json" ]; then
     "$NPM_BIN" ci --omit=dev --omit=optional --no-audit --no-fund || "$NPM_BIN" install --omit=dev --omit=optional --no-audit --no-fund

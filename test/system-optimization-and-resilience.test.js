@@ -565,16 +565,16 @@ async function testWispbyteLowMemoryBootstrapAndDeployHook() {
   assert.strictEqual(okRes.healed, false);
   assert.deepStrictEqual(okRes.missing, []);
 
-  // 8b. Overrides oversized --max-old-space-size=384 down to 112MB & sets maxsockets=1
-  const lowEnv = buildLowMemoryInstallEnv({ NODE_OPTIONS: '--max-old-space-size=384 --no-warnings' });
-  assert.strictEqual(lowEnv.NODE_OPTIONS, '--no-warnings --max-old-space-size=112');
+  // 8b. Normalizes --max-old-space-size to 400MB & sets maxsockets=1
+  const lowEnv = buildLowMemoryInstallEnv({ NODE_OPTIONS: '--max-old-space-size=112 --no-warnings' });
+  assert.strictEqual(lowEnv.NODE_OPTIONS, '--no-warnings --max-old-space-size=400');
   assert.strictEqual(lowEnv.UV_THREADPOOL_SIZE, '1');
   assert.strictEqual(lowEnv.npm_config_maxsockets, '1');
   assert.strictEqual(lowEnv.npm_config_audit, 'false');
   assert.strictEqual(lowEnv.npm_config_fund, 'false');
   assert.strictEqual(lowEnv.KBOT_AUTO_INSTALL_ATTEMPTED, '1');
 
-  // 8c. Simulated killed npm install (missing express / .package-lock.json) triggers low-RAM ci heal once
+  // 8c. Simulated killed npm install (missing express / .package-lock.json) triggers 400MB-capped ci heal once
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kbot-wisp-heal-'));
   try {
     fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"t"}');
@@ -594,7 +594,7 @@ async function testWispbyteLowMemoryBootstrapAndDeployHook() {
     const healed = ensureRuntimeDependencies({
       rootDir: tmpDir,
       requiredPackages: ['fake-express'],
-      env: { NODE_OPTIONS: '--max-old-space-size=384' },
+      env: { NODE_OPTIONS: '--max-old-space-size=112' },
       log: createSilentLogger(),
       spawnSyncImpl: (_cmd, args, opts) => {
         spawnCalls.push({ args, env: opts.env });
@@ -609,7 +609,7 @@ async function testWispbyteLowMemoryBootstrapAndDeployHook() {
     assert.strictEqual(healed.healed, true);
     assert.strictEqual(spawnCalls.length, 1);
     assert.ok(spawnCalls[0].args.includes('ci'), 'Must attempt npm ci first when package-lock.json exists');
-    assert.strictEqual(spawnCalls[0].env.NODE_OPTIONS, '--max-old-space-size=112');
+    assert.strictEqual(spawnCalls[0].env.NODE_OPTIONS, '--max-old-space-size=400');
     assert.strictEqual(spawnCalls[0].env.npm_config_maxsockets, '1');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -626,7 +626,7 @@ async function testWispbyteLowMemoryBootstrapAndDeployHook() {
   const deploySh = deployShBytes.toString('utf8');
   assert.ok(deploySh.startsWith('#!/bin/sh\n'), '.wispbyte/deploy.sh must start with #!/bin/sh');
   assert.strictEqual(deploySh.includes('[['), false, '.wispbyte/deploy.sh must not use [[ bashisms under sh');
-  assert.ok(deploySh.includes('--max-old-space-size=112'), '.wispbyte/deploy.sh must cap V8 heap at 112MB');
+  assert.ok(deploySh.includes('--max-old-space-size=400'), '.wispbyte/deploy.sh must cap V8 heap at 400MB');
   assert.ok(deploySh.includes('npm_config_maxsockets="1"'), '.wispbyte/deploy.sh must serialize sockets');
 
   console.log('✅ 8. Wispbyte OOM-safe .npmrc, .wispbyte/deploy.sh & self-healing bootstrap verified.');

@@ -62,8 +62,8 @@ function buildLowMemoryInstallEnv(baseEnv = process.env) {
     .replace(/\s+/g, ' ')
     .trim();
   const nodeOptions = cleanedNodeOptions
-    ? `${cleanedNodeOptions} --max-old-space-size=112`
-    : '--max-old-space-size=112';
+    ? `${cleanedNodeOptions} --max-old-space-size=400`
+    : '--max-old-space-size=400';
 
   return {
     ...baseEnv,

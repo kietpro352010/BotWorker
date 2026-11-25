@@ -51,7 +51,7 @@ async function main() {
 
   // Adaptive Memory Sweeper (so sánh theo heap_size_limit V8, tránh GC liên tục khi heap idle nhỏ)
   let lastSweepGcAt = 0;
-  const heapLimitMb = Math.max(192, Math.round((v8.getHeapStatistics()?.heap_size_limit || 0) / (1024 * 1024)) || 384);
+  const heapLimitMb = Math.max(192, Math.round((v8.getHeapStatistics()?.heap_size_limit || 0) / (1024 * 1024)) || 400);
   const rssThresholdMb = config.platform === 'wispbyte' ? 190 : 250;
   const heapThresholdMb = Math.max(96, Math.round(heapLimitMb * 0.65));
   const emergencyHeapMb = Math.round(heapLimitMb * 0.82);
