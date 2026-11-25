@@ -82,7 +82,10 @@ function formatMinutesToHhmm(totalMinutes) {
   return `${hh}:${mm}`;
 }
 
+const SERVER_RESTRICTION_HINT_REGEX = /mainten|b[aả]o\s*tr|ban|c[aấ]m|gi[oớ]i\s*h[aạ]n|\bip\b|[\u0300-\u036f]/i;
+
 function classifyServerText(message) {
+  if (!message || !SERVER_RESTRICTION_HINT_REGEX.test(message)) return null;
   const text = normalize(message);
   if (/bao tri|maintenance/.test(text)) return 'maintenance';
   if (/your ip is banned|ip bi cam|dia chi ip cua ban da bi|vuot qua gioi han toi da dang ky|gioi han.*dang ky/.test(text)) return 'ip_limited';
@@ -1060,11 +1063,41 @@ class MinecraftSession extends EventEmitter {
 
   onMessage(bot, generation, json, source = 'message') {
     if (this.bot !== bot || generation !== this.generation) return;
+    const isHudOverlay = source === 'actionBar' || source === 'title';
+    const isOnlineAuthedHud = isHudOverlay && this.state === 'online' && this.auth.isAuthenticated();
+    let rawHudKey = null;
+    if (isOnlineAuthedHud) {
+      if (json && json === this._lastOnlineSafeHudRef) {
+        return;
+      }
+      if (typeof json === 'string') {
+        rawHudKey = json;
+      } else if (
+        json &&
+        typeof json === 'object' &&
+        typeof json.text === 'string' &&
+        !json.extra &&
+        !json.with &&
+        !json.translate &&
+        typeof json.toPlainText !== 'function'
+      ) {
+        rawHudKey = json.text;
+      }
+      if (rawHudKey !== null && rawHudKey === this._lastOnlineSafeHudKey) {
+        return;
+      }
+    }
     const text = extractChatMessage(json);
     if (!text) return;
+    if (isOnlineAuthedHud && text === this._lastOnlineSafeHudText) {
+      if (rawHudKey !== null) this._lastOnlineSafeHudKey = rawHudKey;
+      return;
+    }
     const classification = classifyServerText(text);
-    const isHudOverlay = source === 'actionBar' || source === 'title';
-    if (isHudOverlay && this.state === 'online' && this.auth.isAuthenticated() && !classification) {
+    if (isOnlineAuthedHud && !classification) {
+      this._lastOnlineSafeHudRef = typeof json === 'string' ? json : null;
+      this._lastOnlineSafeHudKey = rawHudKey;
+      this._lastOnlineSafeHudText = text;
       return;
     }
     const safeText = redactAuditValue(text);

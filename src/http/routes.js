@@ -176,12 +176,23 @@ function createRouter({ fleet, config }) {
       : []
   }));
 
-  router.get('/ready', (_req, res) => res.json({
-    ok: true,
-    ready: true,
-    service: 'kingmc-afk-worker',
-    botCount: config?.botCount ?? 0
-  }));
+  router.get('/ready', (_req, res) => {
+    if (fleet?.stopping === true || fleet?.state === 'STOPPING') {
+      return res.status(503).json({
+        ok: false,
+        ready: false,
+        status: 'shutting_down',
+        service: 'kingmc-afk-worker',
+        botCount: config?.botCount ?? 0
+      });
+    }
+    return res.json({
+      ok: true,
+      ready: true,
+      service: 'kingmc-afk-worker',
+      botCount: config?.botCount ?? 0
+    });
+  });
 
   router.get('/api/v1/diagnostics', (req, res) => {
     const secret = extractWorkerToken(req);

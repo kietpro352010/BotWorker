@@ -34,6 +34,10 @@ async function main() {
   const fleet = new WorkerFleet(config, logger);
   const app = createApp({ fleet, config, logger });
   const server = http.createServer(app);
+  // Align Node HTTP keep-alive above upstream reverse-proxy idle timeout (60s) to prevent 502 races
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.requestTimeout = 35000;
 
   await listenHttpServer(server, {
     port: config.port,

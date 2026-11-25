@@ -632,6 +632,359 @@ async function testWispbyteLowMemoryBootstrapAndDeployHook() {
   console.log('✅ 8. Wispbyte OOM-safe .npmrc, .wispbyte/deploy.sh & self-healing bootstrap verified.');
 }
 
+async function testEventMicroBatchingAndFastRedaction() {
+  console.log('9. Testing ManagerReporter event micro-batching, 400 fallback & fast logger redaction...');
+  const { redactStringSecrets } = require('../src/utils/logger');
+
+  // 9a. Fast-path clean strings & full secret scrubbing parity
+  assert.strictEqual(redactStringSecrets('online'), 'online');
+  assert.strictEqual(redactStringSecrets('wispbyte-poll'), 'wispbyte-poll');
+  assert.strictEqual(redactStringSecrets('/login secretMcPass'), '/login [REDACTED]');
+  assert.strictEqual(redactStringSecrets('Bearer myToken123456'), 'Bearer [REDACTED]');
+
+  // 9b. Coalesces burst of chat events into a single HTTP POST { events: [...] }
+  const postPayloads = [];
+  const reporter = new ManagerReporter({
+    baseUrl: 'https://manager.example.com',
+    workerId: '15',
+    secret: 's'.repeat(32),
+    logger: createSilentLogger(),
+    fetchImpl: async (_url, opts) => {
+      postPayloads.push(JSON.parse(opts.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+  });
+
+  reporter.enqueueEvent({ type: 'chat', message: '[u1] hi' });
+  reporter.enqueueEvent({ type: 'chat', message: '[u2] hello' });
+  reporter.enqueueEvent({ type: 'chat', message: '/dn topSecretPass' });
+  await reporter.flushEventQueue();
+  reporter.stop();
+
+  assert.strictEqual(postPayloads.length, 1, '3 queued chat events must flush in 1 batch POST');
+  assert.strictEqual(Array.isArray(postPayloads[0].events), true);
+  assert.strictEqual(postPayloads[0].events.length, 3);
+  assert.ok(!JSON.stringify(postPayloads[0]).includes('topSecretPass'), 'Batch events must redact secrets');
+
+  // 9c. Automatic fallback to per-item POST if server returns 400 on batch envelope
+  const fallbackCalls = [];
+  const legacyReporter = new ManagerReporter({
+    baseUrl: 'https://manager.example.com',
+    workerId: '16',
+    secret: 's'.repeat(32),
+    logger: createSilentLogger(),
+    fetchImpl: async (_url, opts) => {
+      const parsed = JSON.parse(opts.body);
+      fallbackCalls.push(parsed);
+      if (Array.isArray(parsed.events)) {
+        return { ok: false, status: 400, json: async () => ({ ok: false, error: 'unsupported_batch' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+  });
+  legacyReporter.enqueueEvent({ type: 'spawn', message: 'e1' });
+  legacyReporter.enqueueEvent({ type: 'window_open', message: 'e2' });
+  await legacyReporter.flushEventQueue();
+  legacyReporter.stop();
+
+  assert.strictEqual(fallbackCalls.length, 3, '1 rejected batch POST + 2 individual fallback POSTs');
+  assert.strictEqual(fallbackCalls[1].message, 'e1');
+  assert.strictEqual(fallbackCalls[2].message, 'e2');
+
+  console.log('✅ 9. Event micro-batching, legacy fallback & fast logger redaction verified.');
+}
+
+async function testWave2HudThrottleDigestAndBrotli() {
+  console.log('10. Testing Wave-2 cleanText/normalize fast-paths, online HUD throttle, V8 state digest & Brotli HTTP...');
+  const http = require('node:http');
+  const zlib = require('node:zlib');
+  const { cleanText, normalize, redactAuditValue } = require('../src/game/server-auth');
+  const { computeBotStateDigest } = require('../src/domain/worker-state');
+  const { createApp } = require('../src/http/app');
+
+  // 10a. cleanText / normalize / redactAuditValue parity on ASCII, Minecraft color codes, and Vietnamese Unicode
+  assert.strictEqual(cleanText('Hello KingMC World'), 'Hello KingMC World');
+  assert.strictEqual(cleanText('§a§lThành công §x§f§f§0§0§0§0VIP!'), 'Thành công VIP!');
+  assert.strictEqual(normalize('§eĐăng Nhập Thành Công!'), 'dang nhap thanh cong!');
+  assert.strictEqual(redactAuditValue('[Player] xin chao moi nguoi'), '[Player] xin chao moi nguoi');
+  assert.strictEqual(redactAuditValue('/login MyPass999'), '/login *** REDACTED ***');
+
+  // 10b. V8 64-bit state digest determinism & sensitivity
+  const d1 = computeBotStateDigest({ state: 'afk', health: 20, food: 20, pingMs: 42, dimension: 'minecraft:overworld' });
+  const d2 = computeBotStateDigest({ state: 'afk', health: 20, food: 20, pingMs: 48, dimension: 'minecraft:overworld' });
+  const d3 = computeBotStateDigest({ state: 'afk', health: 18, food: 20, pingMs: 42, dimension: 'minecraft:overworld' });
+  assert.match(d1, /^[0-9a-f]{16}$/);
+  assert.strictEqual(d1, d2, 'Ping within same 25ms bucket should keep identical digest');
+  assert.notStrictEqual(d1, d3, 'Health change must produce a new digest');
+
+  // 10c. Online authenticated HUD actionBar spam throttle (first inspected, rapid repeats skipped, maintenance still caught)
+  const session = new MinecraftSession({
+    workerId: '15',
+    transport: 'wispbyte-poll',
+    mc: { host: 'kingmc.vn', port: 25565, username: 'Bot15', password: 'pw', version: '1.20.4' }
+  }, createSilentLogger());
+  const fakeBot = { quit: () => {}, end: () => {}, entity: { position: { x: 100, y: 64, z: 100 } } };
+  session.bot = fakeBot;
+  session.generation = 7;
+  session.state = 'online';
+  session.auth.authenticated = true;
+
+  let deepWalks = 0;
+  for (let i = 0; i < 20; i++) {
+    // Distinct fresh objects per packet (just like minecraft-protocol), verifying rawHudKey skips walkChatNode & classifyServerText
+    const pkt = { text: '❤ 20/20   ⚡ Mana 100/100' };
+    Object.defineProperty(pkt, 'value', {
+      get() {
+        deepWalks += 1;
+        return '';
+      }
+    });
+    session.onMessage(fakeBot, 7, pkt, 'actionBar');
+  }
+  assert.strictEqual(deepWalks, 0, '20 online actionBar ticks must short-circuit via rawHudKey without deep tree walk');
+
+  // Maintenance via actionBar OR regular chat is detected immediately with zero delay
+  let maintEmitted = false;
+  session.on('event', (ev) => {
+    if (ev.type === 'maintenance') maintEmitted = true;
+  });
+  session.onMessage(fakeBot, 7, { text: 'Server đang bảo trì định kỳ, vui lòng quay lại sau' }, 'actionBar');
+  assert.strictEqual(maintEmitted, true, 'ActionBar maintenance alert must trigger immediately even right after normal HUD ticks');
+
+  // 10d. Worker HTTP Brotli ('br') response negotiation
+  const sec = 's'.repeat(32);
+  const bigPayload = { items: Array.from({ length: 40 }, (_, idx) => ({ id: idx, label: `worker-item-${idx}-kingmc` })) };
+  const app = createApp({
+    config: { botCount: 1, bots: [{ workerId: '15', slot: 1, secret: sec }] },
+    fleet: {
+      health: () => bigPayload,
+      list: () => []
+    },
+    logger: createSilentLogger()
+  });
+  const srv = http.createServer(app);
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = srv.address().port;
+    const rawBuf = await new Promise((resolve, reject) => {
+      http.get(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: '/api/v1/diagnostics',
+          headers: { 'Accept-Encoding': 'br, gzip', 'x-worker-secret': sec, Connection: 'close' }
+        },
+        (res) => {
+          assert.strictEqual(res.headers['content-encoding'], 'br');
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+        }
+      ).on('error', reject);
+    });
+    const decoded = JSON.parse(zlib.brotliDecompressSync(rawBuf).toString('utf8'));
+    assert.strictEqual(decoded.ok, true);
+    assert.strictEqual(decoded.resource.items.length, 40);
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((resolve) => srv.close(resolve));
+  }
+
+  console.log('✅ 10. Wave-2 HUD throttle, fast text/redact, V8 state digest & Brotli HTTP verified.');
+}
+
+async function testWave3ZeroDataLossDrainSecurityAndObservability() {
+  console.log('11. Testing Wave-3 Zero-Data-Loss Graceful Drain, /ready 503 shutting_down, X-Request-Id, Proto-Sanitizer & Event-Loop Lag...');
+  const http = require('node:http');
+  const { createApp } = require('../src/http/app');
+
+  // 11a. Zero-Data-Loss Graceful Drain on WorkerFleet.stop():
+  // Must flush queued poller results + queued reporter events + final stopped heartbeat BEFORE reporter closes!
+  const deliveredPaths = [];
+  const fleet = new WorkerFleet({
+    platform: 'wispbyte',
+    transport: 'wispbyte-poll',
+    autoStart: false,
+    rssWarnMb: 360,
+    wispbyte: {},
+    bots: [{
+      workerId: '15',
+      slot: 1,
+      transport: 'wispbyte-poll',
+      managerUrl: 'https://manager.example.com',
+      secret: 's'.repeat(32),
+      mc: { host: 'kingmc.vn', port: 25565, username: 'Bot15', password: 'pw' }
+    }]
+  }, createSilentLogger(), {
+    fetchImpl: async (url, opts) => {
+      const u = new URL(url);
+      deliveredPaths.push({ path: u.pathname, body: opts?.body ? JSON.parse(opts.body) : null });
+      return { ok: true, status: 200, json: async () => ({ ok: true, settings: {}, credentials: {} }) };
+    }
+  });
+
+  fleet.state = 'RUNNING';
+  const inst = fleet.get('15');
+  inst.session.state = 'online';
+  inst.poller.enqueueResult({ commandId: 'cmd_drain_1', action: 'chat', result: { ok: true } });
+  inst.reporter.enqueueEvent({ type: 'bot_death', reason: 'Fell from a high place' });
+  if (inst.reporter.eventFlushTimer) {
+    clearTimeout(inst.reporter.eventFlushTimer);
+    inst.reporter.eventFlushTimer = null;
+  }
+
+  const healthSnap = fleet.health();
+  assert.strictEqual(typeof healthSnap.eventLoopLagMs?.mean, 'number');
+  assert.strictEqual(typeof healthSnap.eventLoopLagMs?.p99, 'number');
+
+  await fleet.stop();
+
+  assert.ok(
+    deliveredPaths.some((p) => p.path === '/api/v1/workers/15/result' && p.body?.commandId === 'cmd_drain_1'),
+    'Fleet stop must drain pending command results before exiting'
+  );
+  assert.ok(
+    deliveredPaths.some((p) => p.path === '/api/v1/workers/15/events'),
+    'Fleet stop must drain queued events before closing reporter'
+  );
+  assert.ok(
+    deliveredPaths.some((p) => p.path === '/api/v1/workers/15/heartbeat' && p.body?.status?.state === 'stopped'),
+    'Fleet stop must deliver final stopped heartbeat to prevent 180s ghost online state'
+  );
+
+  // 11b. Worker HTTP: /ready 503 during stopping, X-Request-Id echo, Permissions-Policy & Prototype-Pollution strip
+  let capturedBody = null;
+  const app = createApp({
+    config: { botCount: 1, bots: [{ workerId: '15', slot: 1, secret: 's'.repeat(32) }] },
+    fleet: {
+      stopping: true,
+      state: 'STOPPING',
+      health: () => ({ ok: true }),
+      get: () => ({
+        config: { secret: 's'.repeat(32) },
+        runtime: {
+          status: () => ({ state: 'stopped' }),
+          execute: async (_action, payload) => {
+            capturedBody = payload;
+            return { ok: true };
+          }
+        }
+      })
+    },
+    logger: createSilentLogger()
+  });
+  const srv = http.createServer(app);
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = srv.address().port;
+    const readyRes = await fetch(`http://127.0.0.1:${port}/ready`, {
+      headers: { 'x-request-id': 'req_trace_worker_001' }
+    });
+    assert.strictEqual(readyRes.status, 503, '/ready must return 503 while fleet is shutting down');
+    assert.strictEqual(readyRes.headers.get('x-request-id'), 'req_trace_worker_001');
+    assert.ok(String(readyRes.headers.get('permissions-policy') || '').includes('camera=()'));
+    const readyJson = await readyRes.json();
+    assert.strictEqual(readyJson.status, 'shutting_down');
+
+    const cmdRes = await fetch(`http://127.0.0.1:${port}/api/v1/bots/15/command`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-worker-secret': 's'.repeat(32),
+        'x-request-id': 'req_trace_cmd_002'
+      },
+      body: '{"action":"chat","payload":{"message":"hi","__proto__":{"polluted":true},"constructor":{"prototype":{"bad":1}}}}'
+    });
+    assert.strictEqual(cmdRes.status, 200);
+    assert.strictEqual(cmdRes.headers.get('x-request-id'), 'req_trace_cmd_002');
+    assert.strictEqual(({}).polluted, undefined, 'Object.prototype must not be polluted');
+    assert.strictEqual(Object.prototype.hasOwnProperty.call(capturedBody, 'constructor'), false);
+  } finally {
+    srv.closeAllConnections?.();
+    await new Promise((resolve) => srv.close(resolve));
+  }
+
+  console.log('✅ 11. Wave-3 Zero-Data-Loss Graceful Drain, /ready 503, X-Request-Id, Proto-Sanitizer & Event-Loop Lag verified.');
+}
+
+async function testWave4LongPollAndZeroTelemetrySteadyState() {
+  console.log('12. Testing Wave-4 45s long-poll default & 16-byte zero-telemetry steady-state /poll...');
+  const secret = 'z'.repeat(32);
+  const pollPayloads = [];
+  let poller = null;
+  let currentStatus = {
+    state: 'afk',
+    online: true,
+    connected: true,
+    username: 'BotEco',
+    inventory: { items: [{ id: 1, count: 64 }], slots: { 36: { id: 1, count: 64 } }, revision: 7 }
+  };
+
+  const mockFetch = async (_url, init) => {
+    const parsed = JSON.parse(init.body);
+    pollPayloads.push(parsed);
+    if (pollPayloads.length === 3) {
+      // Simulate real state mutation before poll #4 -> must immediately resume full status!
+      currentStatus = { ...currentStatus, state: 'kicked', online: false, connected: false };
+    }
+    if (pollPayloads.length >= 4) {
+      poller.stopping = true;
+      poller.stopController.abort();
+    }
+    // Return fake command with unknown/no-op fast path? No: return command: null and use tiny poll sleep via abort?
+    // Wait: returning a quick command keeps sleep at 500ms instead of 8-12s!
+    return {
+      ok: true,
+      status: 200,
+      json: async () => (pollPayloads.length < 4
+        ? { ok: true, command: { commandId: `00000000-0000-4000-8000-00000000000${pollPayloads.length}`, action: 'status', payload: {} }, settingsRevision: 1 }
+        : { ok: true, command: null, settingsRevision: 1 })
+    };
+  };
+
+  const reporter = new ManagerReporter({
+    baseUrl: 'http://127.0.0.1:9999',
+    workerId: '15',
+    secret,
+    fetchImpl: mockFetch,
+    logger: createSilentLogger()
+  });
+
+  const pollOnlyPayloads = [];
+  const routedFetch = async (url, init) => {
+    if (String(url).endsWith('/result')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, accepted: true }) };
+    }
+    const res = await mockFetch(url, init);
+    pollOnlyPayloads.push(pollPayloads[pollPayloads.length - 1]);
+    return res;
+  };
+
+  poller = new WispbytePoller({
+    config: { managerUrl: 'http://127.0.0.1:9999', workerId: '15', secret },
+    runtime: {
+      status: () => ({ ...currentStatus }),
+      execute: async () => ({ ok: true })
+    },
+    reporter,
+    logger: createSilentLogger(),
+    fetchImpl: routedFetch
+  });
+
+  await poller.start();
+  await poller.stop();
+
+  assert.strictEqual(pollOnlyPayloads.length, 4, 'Expected 4 /poll cycles');
+  assert.strictEqual(pollOnlyPayloads[0].waitMs, 45000, 'Default /poll waitMs must be 45000ms to cut poll frequency by ~63%');
+  assert.strictEqual(pollOnlyPayloads[0].status.digestUnchanged, false, 'Poll #1 sends full status');
+  assert.strictEqual(pollOnlyPayloads[1].status.isLightweight, true, 'Poll #2 sends lightweight status');
+  assert.strictEqual(pollOnlyPayloads[2].status, undefined, 'Poll #3 in steady state omits status completely (~16-byte payload)');
+  assert.ok(JSON.stringify(pollOnlyPayloads[2]).length <= 24, 'Steady-state poll body must be <= 24 bytes');
+  assert.ok(pollOnlyPayloads[3].status && pollOnlyPayloads[3].status.state === 'kicked', 'State change immediately resumes full status on next poll');
+
+  console.log('✅ 12. Wave-4 45s long-poll & 16-byte zero-telemetry steady-state /poll verified.');
+}
+
 async function main() {
   console.log('--- [WORKER SYSTEM OPTIMIZATION & RESILIENCE TESTS] ---');
   await testManagerReporterDigestAndRollback();
@@ -642,6 +995,10 @@ async function main() {
   await testMinecraftSessionWindowSnapshotAndClick();
   await testAfkWorldChunkLockAndIdleTimers();
   await testWispbyteLowMemoryBootstrapAndDeployHook();
+  await testEventMicroBatchingAndFastRedaction();
+  await testWave2HudThrottleDigestAndBrotli();
+  await testWave3ZeroDataLossDrainSecurityAndObservability();
+  await testWave4LongPollAndZeroTelemetrySteadyState();
   console.log('\n🎉 ALL WORKER OPTIMIZATION & RESILIENCE TESTS PASSED 100%!');
 }
 

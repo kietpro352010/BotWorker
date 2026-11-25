@@ -55,7 +55,10 @@ class ManagerReporter {
       body: JSON.stringify(payload),
       signal: combinedSignal
     });
-    const body = await response.json().catch(() => ({}));
+    const body = await response.json().catch(async () => {
+      await response.body?.cancel?.().catch(() => {});
+      return {};
+    });
     if (!response.ok || (body && typeof body.ok === 'boolean' && !body.ok)) {
       const err = new Error(body?.error || `manager_http_${response.status}`);
       err.status = response.status;
@@ -262,7 +265,8 @@ class ManagerReporter {
     });
 
     if (!this.stopping) {
-      this.scheduleFlush(0);
+      const isLowPriorityChat = sanitized.type === 'chat' || sanitized.type === 'message';
+      this.scheduleFlush(isLowPriorityChat ? 250 : 0);
     }
   }
 
@@ -294,6 +298,7 @@ class ManagerReporter {
     this.eventQueue = [];
     const now = Date.now();
     const remaining = [];
+    const ready = [];
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
 
     for (let i = 0; i < batch.length; i++) {
@@ -304,14 +309,73 @@ class ManagerReporter {
       }
       if (now < item.nextRetryAt) {
         remaining.push(item);
-        continue;
+      } else {
+        ready.push(item);
+      }
+    }
+
+    // Fast path: coalesce multiple ready events into one HTTP POST when >= 2 events are ready
+    if (ready.length >= 2 && !this.stopping && this._batchEventsUnsupported !== true) {
+      try {
+        await this.post(path, { events: ready.map((item) => item.event) });
+        this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+        return;
+      } catch (batchErr) {
+        // If server/mock rejects batch envelope with 400/422, mark unsupported and fall through to per-item delivery
+        if (batchErr?.status === 400 || batchErr?.status === 422) {
+          this._batchEventsUnsupported = true;
+        } else {
+          // Transient failure: apply standard retry/permanent-4xx handling to ready items
+          if (this.stopping) {
+            this.eventQueue = [...ready, ...remaining, ...this.eventQueue].slice(-100);
+            return;
+          }
+          if (batchErr.status && batchErr.status >= 400 && batchErr.status < 500 && batchErr.status !== 429) {
+            this.logger?.warn?.('manager_event_delivery_rejected_permanent', {
+              workerId: this.workerId,
+              status: batchErr.status,
+              error: batchErr.message
+            });
+            this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+            return;
+          }
+          for (const item of ready) {
+            item.attempts += 1;
+            if (item.attempts >= 10) {
+              this.logger?.warn?.('manager_event_delivery_exhausted', {
+                workerId: this.workerId,
+                attempts: item.attempts,
+                error: batchErr.message
+              });
+              continue;
+            }
+            const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 5)));
+            item.nextRetryAt = Date.now() + backoffMs;
+            remaining.push(item);
+          }
+          this.logger?.warn?.('manager_event_delivery_retry', {
+            workerId: this.workerId,
+            batchSize: ready.length,
+            error: batchErr.message
+          });
+          this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+          return;
+        }
+      }
+    }
+
+    for (let i = 0; i < ready.length; i++) {
+      const item = ready[i];
+      if (this.stopping) {
+        remaining.push(...ready.slice(i));
+        break;
       }
 
       try {
         await this.post(path, item.event);
       } catch (err) {
         if (this.stopping) {
-          remaining.push(...batch.slice(i));
+          remaining.push(...ready.slice(i));
           break;
         }
         // Discard permanent 4xx (except 429) errors without retrying forever
@@ -356,6 +420,43 @@ class ManagerReporter {
     this.stopping = false;
     this.stopController = new AbortController();
     this.lastReportedPosition = null;
+  }
+
+  async drain({ finalStatus = null, timeoutMs = 2000 } = {}) {
+    const hasEvents = this.eventQueue.length > 0;
+    if (!hasEvents && !finalStatus) {
+      return { flushedEvents: false, sentFinalStatus: false };
+    }
+    if (this.eventFlushTimer) {
+      clearTimeout(this.eventFlushTimer);
+      this.eventFlushTimer = null;
+    }
+    for (const item of this.eventQueue) {
+      if (item && typeof item === 'object') item.nextRetryAt = 0;
+    }
+    const drainController = new AbortController();
+    const timer = setTimeout(() => drainController.abort(), Math.max(100, timeoutMs));
+    timer.unref?.();
+    try {
+      const tasks = [];
+      if (hasEvents && !this.stopping) {
+        tasks.push(this.flushEventQueue());
+      }
+      if (finalStatus && !this.stopping) {
+        tasks.push(this.sendHeartbeat(finalStatus, { signal: drainController.signal }));
+      }
+      await Promise.race([
+        Promise.allSettled(tasks),
+        new Promise((resolve) => {
+          drainController.signal.addEventListener('abort', resolve, { once: true });
+        })
+      ]);
+      return { flushedEvents: hasEvents && this.eventQueue.length === 0, sentFinalStatus: Boolean(finalStatus) };
+    } catch (_) {
+      return { flushedEvents: false, sentFinalStatus: false };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   stop() {

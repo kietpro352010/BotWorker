@@ -1,7 +1,5 @@
 'use strict';
 
-const crypto = require('node:crypto');
-
 const STATES = Object.freeze([
   'stopped',
   'starting',
@@ -23,6 +21,19 @@ function normalizeState(state) {
   return STATES.includes(state) ? state : 'error';
 }
 
+function fastHexDigest64(str) {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+}
+
 function computeBotStateDigest(status = {}) {
   if (!status || typeof status !== 'object') status = {};
   const stateStr = String(status.state || status.status || 'unknown');
@@ -42,7 +53,7 @@ function computeBotStateDigest(status = {}) {
     : '';
 
   const payload = `${stateStr}|${health}|${food}|${totems}|${loc}|${dim}|${pingBucket}|${err}|${restriction}|${username}|${manuallyStopped}|${invRev}|${winSig}`;
-  return crypto.createHash('md5').update(payload).digest('hex').slice(0, 16);
+  return fastHexDigest64(payload);
 }
 
 class CircularLogBuffer {

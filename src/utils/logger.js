@@ -14,9 +14,11 @@ const JWT_TOKEN_REGEX = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-
 const QUERY_SECRET_REGEX = /([?&](?:api(?:_?key)?|token|access_?token|refresh_?token|key|secret|password|passwd|auth|signature|sig)\s*=\s*)(?!\[REDACTED\])([^&\s\r\n"'#]+)/gi;
 const KV_SECRET_REGEX = /(\b(?:token|secret|password|passwd|api_?key|access_?token|refresh_?token|authorization|cookie|session|key)\s*[:=]\s*)(?!\[REDACTED\])([^\s&"';,\r\n]+)/gi;
 const MC_AUTH_CMD_REGEX = /(\/(?:[a-z0-9_-]+:)?(?:login|l|dn|register|reg|dk|changepassword|changepass|password|unregister|email)\s+)([^\r\n"`]+)/gim;
+const FAST_SECRET_HINT_REGEX = /[:=/&?"']|eyJ|Bearer\s|-----BEGIN/i;
 
 function redactStringSecrets(str) {
-  if (typeof str !== 'string' || !str) return str;
+  if (typeof str !== 'string' || str.length < 4) return str;
+  if (!FAST_SECRET_HINT_REGEX.test(str)) return str;
   return str
     .replace(PRIVATE_KEY_PEM_REGEX, '[REDACTED PRIVATE KEY]')
     .replace(URL_CREDENTIAL_REGEX, '$1***$2')

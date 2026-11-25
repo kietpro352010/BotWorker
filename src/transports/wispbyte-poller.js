@@ -39,6 +39,8 @@ class WispbytePoller {
     this.pendingResults = [];
     this.maxPendingResults = 100;
     this.resultFlushPromise = null;
+    this._unchangedLightPollCount = 0;
+    this._lastTelemetryPollSentAt = 0;
   }
 
   start() {
@@ -47,6 +49,8 @@ class WispbytePoller {
     this.consecutiveAuthFailures = 0;
     this.authPaused = false;
     this.authStopPending = false;
+    this._unchangedLightPollCount = 0;
+    this._lastTelemetryPollSentAt = 0;
     this.stopController = new AbortController();
     this.loopPromise = this.run().finally(() => { this.loopPromise = null; });
     return this.loopPromise;
@@ -170,11 +174,11 @@ class WispbytePoller {
     this.pendingResults = [...remaining, ...this.pendingResults].slice(-this.maxPendingResults);
   }
 
-  async request(path, payload) {
+  async request(path, payload, { timeoutMs = 35000 } = {}) {
     const baseUrl = this.config.managerUrl || this.config.managerBaseUrl || '';
     const url = `${baseUrl}${path}`;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 35000);
+    const timeout = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs) || 35000));
     timeout.unref?.();
     this.activeController = controller;
     this.activeControllers.add(controller);
@@ -189,7 +193,10 @@ class WispbytePoller {
         },
         body: JSON.stringify(payload), signal: combinedSignal
       });
-      const body = await response.json().catch(() => ({}));
+      const body = await response.json().catch(async () => {
+        await response.body?.cancel?.().catch(() => {});
+        return {};
+      });
       if (!response.ok || !body.ok) {
         const error = new Error(body.error || `manager_http_${response.status}`);
         error.status = response.status;
@@ -218,10 +225,34 @@ class WispbytePoller {
         const prepared = (this.reporter && typeof this.reporter.prepareStatusPayload === 'function')
           ? this.reporter.prepareStatusPayload(rawStatus)
           : { payload: { ...rawStatus, managerLatencyMs: this.reporter?.managerLatencyMs } };
-        const response = await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/poll`, {
-          status: prepared.payload, waitMs: 25000, sentAt: new Date().toISOString()
-        });
-        this.reporter?.recordStatusSent?.(prepared);
+        const waitMs = Math.max(1000, Math.min(55000, Number(this.config?.pollWaitMs) || 45000));
+        const nowPollMs = Date.now();
+        const canOmitSteadyTelemetry = Boolean(
+          prepared.digestUnchanged === true &&
+          !prepared.positionMoved &&
+          this._unchangedLightPollCount >= 1 &&
+          this._lastTelemetryPollSentAt > 0 &&
+          (nowPollMs - this._lastTelemetryPollSentAt < 120000)
+        );
+        const pollBody = canOmitSteadyTelemetry
+          ? { waitMs }
+          : { status: prepared.payload, waitMs, sentAt: new Date(nowPollMs).toISOString() };
+        const response = await this.request(
+          `/api/v1/workers/${encodeURIComponent(this.config.workerId)}/poll`,
+          pollBody,
+          { timeoutMs: Math.max(35000, waitMs + 12000) }
+        );
+        if (!canOmitSteadyTelemetry) {
+          this._lastTelemetryPollSentAt = Date.now();
+          if (prepared.digestUnchanged === true && !prepared.positionMoved) {
+            this._unchangedLightPollCount += 1;
+          } else {
+            this._unchangedLightPollCount = 0;
+          }
+          this.reporter?.recordStatusSent?.(prepared);
+        } else if (prepared.digestUnchanged !== true || prepared.positionMoved) {
+          this._unchangedLightPollCount = 0;
+        }
         if (response && response.settingsRevision !== undefined) {
           this.reporter?.noteSettingsRevision?.(response.settingsRevision);
         }
@@ -268,13 +299,13 @@ class WispbytePoller {
           }
           await cancellableSleep(authDelayMs > 0 ? authDelayMs : 500, this.stopController.signal);
         } else {
-          // Adaptive polling interval: 1.5s when transitioning, 5-8s when online/afk, 8-12s when stopped/inactive
+          // Adaptive polling interval: 1.5s when transitioning, 8-12s when online/afk, 12-18s when stopped/inactive
           const stateStr = String(prepared.payload?.state || '').toLowerCase();
           const isIdle = ['idle', 'stopped', 'disconnected', 'error', 'afk', 'afk_locked', 'online', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
           const isInactive = ['idle', 'stopped', 'disconnected', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
           const adaptiveDelayMs = isInactive
-            ? (8000 + Math.floor(Math.random() * 4000))
-            : (isIdle ? (5000 + Math.floor(Math.random() * 3000)) : 1500);
+            ? (12000 + Math.floor(Math.random() * 6000))
+            : (isIdle ? (8000 + Math.floor(Math.random() * 4000)) : 1500);
           await cancellableSleep(adaptiveDelayMs, this.stopController.signal);
         }
       } catch (error) {
@@ -289,6 +320,32 @@ class WispbytePoller {
         const delay = Math.min(60000, 1500 * (2 ** Math.min(this.failures, 5))) + Math.floor(Math.random() * 1000);
         await cancellableSleep(delay, this.stopController.signal);
       }
+    }
+  }
+
+  async drainPendingResults({ timeoutMs = 2000 } = {}) {
+    if (!this.pendingResults.length) return 0;
+    const prevStopping = this.stopping;
+    this.stopping = false;
+    for (const item of this.pendingResults) {
+      if (item && typeof item === 'object') item.nextRetryAt = 0;
+    }
+    let timer = null;
+    try {
+      const initialCount = this.pendingResults.length;
+      await Promise.race([
+        this.flushPendingResults(),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, Math.max(100, timeoutMs));
+          timer.unref?.();
+        })
+      ]);
+      return Math.max(0, initialCount - this.pendingResults.length);
+    } catch (_) {
+      return 0;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.stopping = prevStopping;
     }
   }
 

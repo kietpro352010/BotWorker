@@ -2,19 +2,29 @@
 
 const AUTH_COORDS = Object.freeze({ x: 5, y: 119, z: 4 });
 const LOBBY_COORDS = Object.freeze({ x: 1, y: 41, z: 1 });
+const COLOR_OR_SPACE_HINT_REGEX = /[§&\u00a0\u200b\ufeff]/;
+const NON_ASCII_REGEX = /[^\x00-\x7f]/;
+const REDACT_AUDIT_HINT_REGEX = /\/|password/i;
 
 function cleanText(input) {
-  return String(input || '')
-    .replace(/§x(§[0-9a-f]){6}/gi, '')
-    .replace(/&x(&[0-9a-f]){6}/gi, '')
-    .replace(/&#[0-9a-f]{6}/gi, '')
-    .replace(/§#[0-9a-f]{6}/gi, '')
-    .replace(/§[0-9a-fk-or]/gi, '')
-    .replace(/&[0-9a-fk-or]/gi, '')
-    .replace(/§./g, '')
-    .replace(/[\u00a0\u200b\ufeff]/g, ' ')
-    .normalize('NFC')
-    .trim();
+  const raw = typeof input === 'string' ? input : String(input || '');
+  if (!raw) return '';
+  let cleaned = raw;
+  if (COLOR_OR_SPACE_HINT_REGEX.test(cleaned)) {
+    cleaned = cleaned
+      .replace(/§x(§[0-9a-f]){6}/gi, '')
+      .replace(/&x(&[0-9a-f]){6}/gi, '')
+      .replace(/&#[0-9a-f]{6}/gi, '')
+      .replace(/§#[0-9a-f]{6}/gi, '')
+      .replace(/§[0-9a-fk-or]/gi, '')
+      .replace(/&[0-9a-fk-or]/gi, '')
+      .replace(/§./g, '')
+      .replace(/[\u00a0\u200b\ufeff]/g, ' ');
+  }
+  if (NON_ASCII_REGEX.test(cleaned)) {
+    cleaned = cleaned.normalize('NFC');
+  }
+  return cleaned.trim();
 }
 
 function walkChatNode(node, depth = 0) {
@@ -30,10 +40,16 @@ function walkChatNode(node, depth = 0) {
     text += node.translate;
   }
   if (Array.isArray(node.with)) {
-    text += node.with.slice(0, 32).map((child) => walkChatNode(child, depth + 1)).join('');
+    const len = Math.min(node.with.length, 32);
+    for (let i = 0; i < len; i++) {
+      text += walkChatNode(node.with[i], depth + 1);
+    }
   }
   if (Array.isArray(node.extra)) {
-    text += node.extra.slice(0, 64).map((child) => walkChatNode(child, depth + 1)).join('');
+    const len = Math.min(node.extra.length, 64);
+    for (let i = 0; i < len; i++) {
+      text += walkChatNode(node.extra[i], depth + 1);
+    }
   }
   if (!text && node.value !== undefined) {
     text += walkChatNode(node.value, depth + 1);
@@ -60,7 +76,9 @@ function extractChatMessage(raw) {
 }
 
 function normalize(input) {
-  return cleanText(input).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd');
+  const cleaned = cleanText(input).toLowerCase();
+  if (!cleaned || !NON_ASCII_REGEX.test(cleaned)) return cleaned;
+  return cleaned.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/đ/g, 'd');
 }
 
 function isRestrictedMinecraftCommand(value) {
@@ -68,7 +86,7 @@ function isRestrictedMinecraftCommand(value) {
 }
 
 function redactAuditValue(text) {
-  if (typeof text !== 'string') return text;
+  if (typeof text !== 'string' || !text || !REDACT_AUDIT_HINT_REGEX.test(text)) return text;
   return text
     .replace(/(\/(?:[a-z0-9_-]+:)?(?:login|l|register|reg|dn|dk|changepassword|changepass|password|unregister|email)\s+).+$/gim, '$1*** REDACTED ***')
     .replace(/(password\s*[:=]\s*)(\S+)/gi, '$1*** REDACTED ***');

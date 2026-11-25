@@ -1,5 +1,6 @@
 'use strict';
 
+const { monitorEventLoopDelay } = require('node:perf_hooks');
 const { MinecraftSession } = require('../game/minecraft-session');
 const WorkerRuntime = require('./worker-runtime');
 const ManagerReporter = require('../transports/manager-reporter');
@@ -51,6 +52,15 @@ class WorkerFleet {
     this.lastResourceSampleAt = Date.now();
     this.instances = new Map();
     this.bootstrapRetryTimers = new Map();
+    this.loopDelayMonitor = null;
+    try {
+      if (typeof monitorEventLoopDelay === 'function') {
+        this.loopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
+        this.loopDelayMonitor.enable();
+      }
+    } catch (_) {
+      this.loopDelayMonitor = null;
+    }
     this.wispbyteKeepAlive = new WispbyteKeepAlive(config.wispbyte, logger, { fetchImpl });
 
     for (const botConfig of config.bots) {
@@ -156,10 +166,17 @@ class WorkerFleet {
 
   health() {
     const memory = process.memoryUsage();
+    const lagMeanMs = this.loopDelayMonitor ? Number((this.loopDelayMonitor.mean / 1e6).toFixed(2)) : 0;
+    const lagP99Ms = this.loopDelayMonitor ? Number((this.loopDelayMonitor.percentile(99) / 1e6).toFixed(2)) : 0;
     return {
+      fleetState: this.state,
       botCount: this.instances.size,
       rssMb: Math.round(memory.rss / 1024 / 1024),
       heapUsedMb: Math.round(memory.heapUsed / 1024 / 1024),
+      eventLoopLagMs: {
+        mean: Number.isFinite(lagMeanMs) ? lagMeanMs : 0,
+        p99: Number.isFinite(lagP99Ms) ? lagP99Ms : 0
+      },
       wispbyteKeepAlive: this.wispbyteKeepAlive.getStatus()
     };
   }
@@ -311,10 +328,22 @@ class WorkerFleet {
     if (this.resourceTimer) clearInterval(this.resourceTimer);
     this.heartbeatTimer = null;
     this.resourceTimer = null;
+    try { this.loopDelayMonitor?.disable?.(); } catch (_) {}
     await Promise.all(this.list().map(async (instance) => {
-      instance.reporter?.stop?.();
+      const hadPendingResults = Boolean(instance.poller?.pendingResults?.length > 0);
+      if (hadPendingResults && typeof instance.poller?.drainPendingResults === 'function') {
+        await instance.poller.drainPendingResults({ timeoutMs: 2000 }).catch(() => {});
+      }
       await instance.poller?.stop();
+      const wasActiveSession = Boolean(instance.session?.bot || (instance.session?.state && instance.session.state !== 'stopped'));
       await instance.session.stop('process_shutdown');
+      if (typeof instance.reporter?.drain === 'function' && (wasActiveSession || instance.reporter?.eventQueue?.length > 0)) {
+        await instance.reporter.drain({
+          finalStatus: wasActiveSession ? instance.session.getStatus() : null,
+          timeoutMs: 2000
+        }).catch(() => {});
+      }
+      instance.reporter?.stop?.();
     }));
     this.state = FleetState.STOPPED;
   }
