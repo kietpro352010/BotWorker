@@ -1,0 +1,2 @@
+*.sh text eol=lf
+.npmrc text eol=lf

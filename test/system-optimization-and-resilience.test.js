@@ -547,6 +547,91 @@ async function testAfkWorldChunkLockAndIdleTimers() {
   console.log('✅ 7. AFK zero-chunk lock, idle autoChat zero-timer & Map chat dedup verified.');
 }
 
+async function testWispbyteLowMemoryBootstrapAndDeployHook() {
+  console.log('8. Testing Wispbyte OOM-safe .npmrc, .wispbyte/deploy.sh (LF/POSIX sh) & bootstrap-deps self-healing...');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const os = require('node:os');
+  const {
+    ensureRuntimeDependencies,
+    buildLowMemoryInstallEnv
+  } = require('../src/bootstrap-deps');
+
+  const rootDir = path.resolve(__dirname, '..');
+
+  // 8a. Fast-path when all dependencies are already present
+  const okRes = ensureRuntimeDependencies({ rootDir, log: createSilentLogger() });
+  assert.strictEqual(okRes.ok, true);
+  assert.strictEqual(okRes.healed, false);
+  assert.deepStrictEqual(okRes.missing, []);
+
+  // 8b. Overrides oversized --max-old-space-size=384 down to 112MB & sets maxsockets=1
+  const lowEnv = buildLowMemoryInstallEnv({ NODE_OPTIONS: '--max-old-space-size=384 --no-warnings' });
+  assert.strictEqual(lowEnv.NODE_OPTIONS, '--no-warnings --max-old-space-size=112');
+  assert.strictEqual(lowEnv.UV_THREADPOOL_SIZE, '1');
+  assert.strictEqual(lowEnv.npm_config_maxsockets, '1');
+  assert.strictEqual(lowEnv.npm_config_audit, 'false');
+  assert.strictEqual(lowEnv.npm_config_fund, 'false');
+  assert.strictEqual(lowEnv.KBOT_AUTO_INSTALL_ATTEMPTED, '1');
+
+  // 8c. Simulated killed npm install (missing express / .package-lock.json) triggers low-RAM ci heal once
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kbot-wisp-heal-'));
+  try {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"t"}');
+    fs.writeFileSync(path.join(tmpDir, 'package-lock.json'), '{"name":"t","lockfileVersion":3}');
+
+    // Guard blocks recursion when KBOT_AUTO_INSTALL_ATTEMPTED=1
+    const guarded = ensureRuntimeDependencies({
+      rootDir: tmpDir,
+      requiredPackages: ['express'],
+      env: { KBOT_AUTO_INSTALL_ATTEMPTED: '1' },
+      log: createSilentLogger()
+    });
+    assert.strictEqual(guarded.ok, false);
+    assert.deepStrictEqual(guarded.missing, ['express']);
+
+    const spawnCalls = [];
+    const healed = ensureRuntimeDependencies({
+      rootDir: tmpDir,
+      requiredPackages: ['fake-express'],
+      env: { NODE_OPTIONS: '--max-old-space-size=384' },
+      log: createSilentLogger(),
+      spawnSyncImpl: (_cmd, args, opts) => {
+        spawnCalls.push({ args, env: opts.env });
+        const modDir = path.join(tmpDir, 'node_modules', 'fake-express');
+        fs.mkdirSync(modDir, { recursive: true });
+        fs.writeFileSync(path.join(modDir, 'package.json'), '{"name":"fake-express","main":"index.js"}');
+        fs.writeFileSync(path.join(modDir, 'index.js'), 'module.exports = {};');
+        return { status: 0 };
+      }
+    });
+    assert.strictEqual(healed.ok, true);
+    assert.strictEqual(healed.healed, true);
+    assert.strictEqual(spawnCalls.length, 1);
+    assert.ok(spawnCalls[0].args.includes('ci'), 'Must attempt npm ci first when package-lock.json exists');
+    assert.strictEqual(spawnCalls[0].env.NODE_OPTIONS, '--max-old-space-size=112');
+    assert.strictEqual(spawnCalls[0].env.npm_config_maxsockets, '1');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  // 8d. Verify .npmrc and .wispbyte/deploy.sh invariants (strictly LF, POSIX sh, no [[ bashisms)
+  const npmrc = fs.readFileSync(path.join(rootDir, '.npmrc'), 'utf8');
+  assert.ok(npmrc.includes('maxsockets=1'), '.npmrc must set maxsockets=1');
+  assert.ok(npmrc.includes('audit=false') && npmrc.includes('fund=false'), '.npmrc must disable audit and fund');
+  assert.ok(npmrc.includes('omit=dev'), '.npmrc must omit dev dependencies');
+
+  const deployShBytes = fs.readFileSync(path.join(rootDir, '.wispbyte', 'deploy.sh'));
+  assert.strictEqual(deployShBytes.includes(0x0d), false, '.wispbyte/deploy.sh must use pure LF line endings for Linux /bin/sh');
+  const deploySh = deployShBytes.toString('utf8');
+  assert.ok(deploySh.startsWith('#!/bin/sh\n'), '.wispbyte/deploy.sh must start with #!/bin/sh');
+  assert.strictEqual(deploySh.includes('[['), false, '.wispbyte/deploy.sh must not use [[ bashisms under sh');
+  assert.ok(deploySh.includes('--max-old-space-size=112'), '.wispbyte/deploy.sh must cap V8 heap at 112MB');
+  assert.ok(deploySh.includes('npm_config_maxsockets="1"'), '.wispbyte/deploy.sh must serialize sockets');
+
+  console.log('✅ 8. Wispbyte OOM-safe .npmrc, .wispbyte/deploy.sh & self-healing bootstrap verified.');
+}
+
 async function main() {
   console.log('--- [WORKER SYSTEM OPTIMIZATION & RESILIENCE TESTS] ---');
   await testManagerReporterDigestAndRollback();
@@ -556,6 +641,7 @@ async function main() {
   await testHostRuntimeParityAndPacketOptimizationEdgeCases();
   await testMinecraftSessionWindowSnapshotAndClick();
   await testAfkWorldChunkLockAndIdleTimers();
+  await testWispbyteLowMemoryBootstrapAndDeployHook();
   console.log('\n🎉 ALL WORKER OPTIMIZATION & RESILIENCE TESTS PASSED 100%!');
 }
 
