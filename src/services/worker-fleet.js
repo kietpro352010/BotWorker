@@ -67,8 +67,8 @@ class WorkerFleet {
       const botLogger = scopeLogger(logger, botConfig.workerId);
       const session = new MinecraftSession(botConfig, botLogger);
       const reporter = new ManagerReporter({
-        baseUrl: botConfig.managerUrl, workerId: botConfig.workerId,
-        secret: botConfig.secret, logger: botLogger, fetchImpl
+        baseUrl: botConfig.managerUrl, managerUrls: botConfig.managerUrls, cacheFilePath: botConfig.managerUrlCacheFile,
+        workerId: botConfig.workerId, secret: botConfig.secret, logger: botLogger, fetchImpl
       });
       let instanceRef = null;
       const refreshManagerConfig = async ({ signal, applyManualStop = true } = {}) => {

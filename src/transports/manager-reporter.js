@@ -2,12 +2,14 @@
 
 const { redactAuditValue } = require('../game/server-auth');
 const { computeBotStateDigest } = require('../domain/worker-state');
+const { ManagerUrlPool, shouldFailoverResponse } = require('./manager-urls');
 
 class ManagerReporter {
-  constructor({ baseUrl, workerId, secret, fetchImpl = global.fetch, logger, onSettingsChanged = null }) {
-    this.baseUrl = baseUrl;
+  constructor({ baseUrl, managerUrls = null, cacheFilePath = undefined, workerId, secret = '', fetchImpl = global.fetch, logger, onSettingsChanged = null }) {
+    this.cacheFilePath = cacheFilePath;
+    this.urlPool = new ManagerUrlPool({ baseUrl, managerUrls, cacheFilePath });
     this.workerId = workerId;
-    this.secret = secret;
+    this.secret = String(secret || '').trim();
     this.fetch = fetchImpl;
     this.logger = logger;
     this.onSettingsChanged = typeof onSettingsChanged === 'function' ? onSettingsChanged : null;
@@ -28,6 +30,24 @@ class ManagerReporter {
     this.stopController = new AbortController();
   }
 
+  get baseUrl() {
+    return this.urlPool.currentUrl();
+  }
+
+  set baseUrl(nextUrl) {
+    if (nextUrl) {
+      this.urlPool = new ManagerUrlPool({ baseUrl: nextUrl, managerUrls: this.urlPool?.urls, cacheFilePath: this.cacheFilePath });
+    }
+  }
+
+  learnManagerUrls(rawUrls) {
+    return this.urlPool.learn(rawUrls);
+  }
+
+  getManagerUrls() {
+    return this.urlPool.getUrlsOrdered();
+  }
+
   hasPositionMovedSignificantly(newPos) {
     if (!newPos || !Number.isFinite(newPos.x)) return false;
     if (!this.lastReportedPosition) return true;
@@ -39,33 +59,59 @@ class ManagerReporter {
   }
 
   async post(path, payload, { signal } = {}) {
-    if (!this.baseUrl || !this.fetch || this.stopping) return;
+    const candidates = this.urlPool.getUrlsOrdered();
+    if (!candidates.length || !this.fetch || this.stopping) return;
     const startedAt = Date.now();
-    const timeoutSignal = AbortSignal.timeout(8000);
-    const signals = [timeoutSignal, this.stopController.signal];
-    if (signal) signals.push(signal);
-    const combinedSignal = AbortSignal.any(signals);
-    const response = await this.fetch(`${this.baseUrl}${path}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-worker-secret': this.secret,
-        'x-manager-bot-id': String(this.workerId)
-      },
-      body: JSON.stringify(payload),
-      signal: combinedSignal
-    });
-    const body = await response.json().catch(async () => {
-      await response.body?.cancel?.().catch(() => {});
-      return {};
-    });
-    if (!response.ok || (body && typeof body.ok === 'boolean' && !body.ok)) {
-      const err = new Error(body?.error || `manager_http_${response.status}`);
-      err.status = response.status;
-      throw err;
+    let lastError = null;
+    const headers = {
+      'content-type': 'application/json',
+      ...(this.secret ? { 'x-worker-secret': this.secret } : {}),
+      'x-manager-bot-id': String(this.workerId)
+    };
+
+    for (let i = 0; i < candidates.length; i += 1) {
+      const candidate = candidates[i];
+      const hasMore = i < candidates.length - 1;
+      const timeoutSignal = AbortSignal.timeout(8000);
+      const signals = [timeoutSignal, this.stopController.signal];
+      if (signal) signals.push(signal);
+      const combinedSignal = AbortSignal.any(signals);
+      try {
+        const response = await this.fetch(`${candidate}${path}`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: combinedSignal
+        });
+        const body = await response.json().catch(async () => {
+          await response.body?.cancel?.().catch(() => {});
+          return {};
+        });
+        if (!response.ok || (body && typeof body.ok === 'boolean' && !body.ok)) {
+          const err = new Error(body?.error || `manager_http_${response.status}`);
+          err.status = response.status;
+          if (hasMore && shouldFailoverResponse(response, body)) {
+            lastError = err;
+            this.logger?.warn?.('manager_failover_retry', { workerId: this.workerId, failedUrl: candidate, status: response.status, error: err.message });
+            continue;
+          }
+          throw err;
+        }
+        this.urlPool.markHealthy(candidate);
+        this.urlPool.learnFromResponse(response, body);
+        this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
+        return body;
+      } catch (err) {
+        if (this.stopping || signal?.aborted || this.stopController.signal.aborted) throw err;
+        if (hasMore && (!err?.status || shouldFailoverResponse({ status: err.status }, null))) {
+          lastError = err;
+          this.logger?.warn?.('manager_failover_retry', { workerId: this.workerId, failedUrl: candidate, error: err?.message || String(err) });
+          continue;
+        }
+        throw err;
+      }
     }
-    this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
-    return body;
+    throw lastError || new Error('manager_unreachable');
   }
 
   async heartbeat(status) {
@@ -205,28 +251,53 @@ class ManagerReporter {
   async bootstrap({ signal } = {}) {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/bootstrap`;
     const startedAt = Date.now();
-    const timeoutSignal = AbortSignal.timeout(8000);
-    const signals = [timeoutSignal, this.stopController.signal];
-    if (signal) signals.push(signal);
-    const combinedSignal = AbortSignal.any(signals);
-    const response = await this.fetch(`${this.baseUrl}${path}`, {
-      headers: {
-        'x-worker-secret': this.secret,
-        'x-manager-bot-id': String(this.workerId)
-      },
-      signal: combinedSignal
-    });
-    this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok || !body.ok) {
-      const err = new Error(body?.error || `manager_http_${response.status}`);
-      err.status = response.status;
-      throw err;
+    const candidates = this.urlPool.getUrlsOrdered();
+    const headers = {
+      ...(this.secret ? { 'x-worker-secret': this.secret } : {}),
+      'x-manager-bot-id': String(this.workerId)
+    };
+    let lastError = null;
+    for (let i = 0; i < candidates.length; i += 1) {
+      const candidate = candidates[i];
+      const hasMore = i < candidates.length - 1;
+      const timeoutSignal = AbortSignal.timeout(8000);
+      const signals = [timeoutSignal, this.stopController.signal];
+      if (signal) signals.push(signal);
+      const combinedSignal = AbortSignal.any(signals);
+      try {
+        const response = await this.fetch(`${candidate}${path}`, {
+          headers,
+          signal: combinedSignal
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body.ok) {
+          const err = new Error(body?.error || `manager_http_${response.status}`);
+          err.status = response.status;
+          if (hasMore && shouldFailoverResponse(response, body)) {
+            lastError = err;
+            this.logger?.warn?.('manager_bootstrap_failover_retry', { workerId: this.workerId, failedUrl: candidate, status: response.status, error: err.message });
+            continue;
+          }
+          throw err;
+        }
+        this.urlPool.markHealthy(candidate);
+        this.urlPool.learnFromResponse(response, body);
+        this.managerLatencyMs = Math.max(0, Date.now() - startedAt);
+        if (body.settingsRevision !== undefined) {
+          this.lastSettingsRevision = body.settingsRevision;
+        }
+        return body;
+      } catch (err) {
+        if (this.stopping || signal?.aborted || this.stopController.signal.aborted) throw err;
+        if (hasMore && (!err?.status || shouldFailoverResponse({ status: err.status }, null))) {
+          lastError = err;
+          this.logger?.warn?.('manager_bootstrap_failover_retry', { workerId: this.workerId, failedUrl: candidate, error: err?.message || String(err) });
+          continue;
+        }
+        throw err;
+      }
     }
-    if (body.settingsRevision !== undefined) {
-      this.lastSettingsRevision = body.settingsRevision;
-    }
-    return body;
+    throw lastError || new Error('manager_unreachable');
   }
 
   enqueueEvent(event) {

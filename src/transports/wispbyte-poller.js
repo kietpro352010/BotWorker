@@ -1,5 +1,7 @@
 'use strict';
 
+const { ManagerUrlPool, shouldFailoverResponse } = require('./manager-urls');
+
 function cancellableSleep(ms, signal) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve();
@@ -41,6 +43,11 @@ class WispbytePoller {
     this.resultFlushPromise = null;
     this._unchangedLightPollCount = 0;
     this._lastTelemetryPollSentAt = 0;
+    this.urlPool = reporter?.urlPool || new ManagerUrlPool({
+      baseUrl: config?.managerUrl || config?.managerBaseUrl || '',
+      managerUrls: config?.managerUrls,
+      cacheFilePath: config?.managerUrlCacheFile !== undefined ? config.managerUrlCacheFile : undefined
+    });
   }
 
   start() {
@@ -175,39 +182,66 @@ class WispbytePoller {
   }
 
   async request(path, payload, { timeoutMs = 35000 } = {}) {
-    const baseUrl = this.config.managerUrl || this.config.managerBaseUrl || '';
-    const url = `${baseUrl}${path}`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs) || 35000));
-    timeout.unref?.();
-    this.activeController = controller;
-    this.activeControllers.add(controller);
-    try {
-      const combinedSignal = AbortSignal.any([controller.signal, this.stopController.signal]);
-      const response = await this.fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-worker-secret': this.config.secret,
-          'x-manager-bot-id': String(this.config.workerId)
-        },
-        body: JSON.stringify(payload), signal: combinedSignal
-      });
-      const body = await response.json().catch(async () => {
-        await response.body?.cancel?.().catch(() => {});
-        return {};
-      });
-      if (!response.ok || !body.ok) {
-        const error = new Error(body.error || `manager_http_${response.status}`);
-        error.status = response.status;
-        throw error;
-      }
-      return body;
-    } finally {
-      clearTimeout(timeout);
-      this.activeControllers.delete(controller);
-      if (this.activeController === controller) this.activeController = null;
+    const configPrimary = this.config?.managerUrl || this.config?.managerBaseUrl || '';
+    if (configPrimary && !this.urlPool.urls.includes(configPrimary)) {
+      this.urlPool.learn(configPrimary);
     }
+    const candidates = this.urlPool.getUrlsOrdered();
+    const secret = String(this.config?.secret || '').trim();
+    const headers = {
+      'content-type': 'application/json',
+      ...(secret ? { 'x-worker-secret': secret } : {}),
+      'x-manager-bot-id': String(this.config.workerId)
+    };
+    let lastError = null;
+    for (let i = 0; i < candidates.length; i += 1) {
+      const baseUrl = candidates[i];
+      const hasMore = i < candidates.length - 1;
+      const url = `${baseUrl}${path}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), Math.max(5000, Number(timeoutMs) || 35000));
+      timeout.unref?.();
+      this.activeController = controller;
+      this.activeControllers.add(controller);
+      try {
+        const combinedSignal = AbortSignal.any([controller.signal, this.stopController.signal]);
+        const response = await this.fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload), signal: combinedSignal
+        });
+        const body = await response.json().catch(async () => {
+          await response.body?.cancel?.().catch(() => {});
+          return {};
+        });
+        if (!response.ok || !body.ok) {
+          const error = new Error(body.error || `manager_http_${response.status}`);
+          error.status = response.status;
+          if (hasMore && shouldFailoverResponse(response, body)) {
+            lastError = error;
+            this.logger?.warn?.('wispbyte_manager_failover', { failedUrl: baseUrl, status: response.status, error: error.message });
+            continue;
+          }
+          throw error;
+        }
+        this.urlPool.markHealthy(baseUrl);
+        this.urlPool.learnFromResponse(response, body);
+        return body;
+      } catch (err) {
+        if (this.stopping || this.stopController.signal.aborted) throw err;
+        if (hasMore && (!err?.status || shouldFailoverResponse({ status: err.status }, null))) {
+          lastError = err;
+          this.logger?.warn?.('wispbyte_manager_failover', { failedUrl: baseUrl, error: err?.message || String(err) });
+          continue;
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeout);
+        this.activeControllers.delete(controller);
+        if (this.activeController === controller) this.activeController = null;
+      }
+    }
+    throw lastError || new Error('manager_unreachable');
   }
 
   async run() {

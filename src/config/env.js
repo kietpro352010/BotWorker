@@ -5,6 +5,7 @@ const path = require('node:path');
 const { isIP } = require('node:net');
 const { parseSocksProxy } = require('./proxy');
 const { detectHostRuntime } = require('./host-runtime');
+const { DEFAULT_MANAGER_URL, mergeManagerUrls, loadCachedManagerUrls } = require('../transports/manager-urls');
 
 function parseDotenvContent(content, targetEnv = process.env) {
   let loaded = false;
@@ -91,18 +92,12 @@ function readSlot(env, slot, common) {
   const suffix = `_${slot}`;
   const slotValue = (name, legacyName = name) => env[`${name}${suffix}`] ?? (slot === 1 ? env[legacyName] : undefined);
   const workerId = required(slotValue('WORKER_ID'), `WORKER_ID${suffix}`);
-  const secret = required(slotValue('WORKER_SECRET'), `WORKER_SECRET${suffix}`);
+  const secret = String(slotValue('WORKER_SECRET') || '').trim();
   const rawPreviousSecret = String(slotValue('WORKER_PREVIOUS_SECRET') || '').trim();
-  if (rawPreviousSecret && /replace-with|example|changeme/i.test(rawPreviousSecret)) {
-    throw new Error(`WORKER_PREVIOUS_SECRET${suffix} must not be a placeholder.`);
-  }
-  if (rawPreviousSecret && rawPreviousSecret.length < 32) {
-    throw new Error(`WORKER_PREVIOUS_SECRET${suffix} must be a unique random secret of at least 32 characters.`);
-  }
   const previousSecret = rawPreviousSecret || null;
   const graceUntil = previousSecret ? parseGraceUntil(slotValue('WORKER_SECRET_GRACE_UNTIL')) : 0;
   // Minecraft credentials are managed by Discord Manager and fetched through
-  // the worker-authenticated HTTPS bootstrap endpoint, never from host env.
+  // the ID-verified HTTPS bootstrap endpoint, never from host env.
   const username = '';
   const password = '';
   const proxyUrl = String(slotValue('MC_PROXY_URL') || common.proxyUrl || '').trim();
@@ -111,7 +106,6 @@ function readSlot(env, slot, common) {
   const viewDistance = String(slotValue('MC_VIEW_DISTANCE') || common.viewDistance).trim().toLowerCase();
 
   if (!/^[a-z0-9][a-z0-9_-]{1,39}$/.test(workerId)) throw new Error(`WORKER_ID${suffix} must be 2–40 lowercase letters, numbers, underscores, or hyphens.`);
-  if (secret.length < 32 || /replace-with|example|changeme/i.test(secret)) throw new Error(`WORKER_SECRET${suffix} must be a unique random secret of at least 32 characters.`);
   if (!['offline', 'microsoft'].includes(authType)) throw new Error(`MC_AUTH_TYPE${suffix} must be offline or microsoft.`);
   if (!['tiny', 'short', 'normal', 'far'].includes(viewDistance)) throw new Error(`MC_VIEW_DISTANCE${suffix} must be tiny, short, normal, or far.`);
   const proxy = parseSocksProxy(proxyUrl, `MC_PROXY_URL${suffix}`);
@@ -129,11 +123,17 @@ function readSlot(env, slot, common) {
 }
 
 function loadConfig(env = process.env) {
-  const rawManagerUrl = env.MANAGER_URL || env.MANAGER_BASE_URL;
-  const managerUrl = required(rawManagerUrl, 'MANAGER_URL').replace(/\/+$/, '');
-  if (!/^https:\/\//i.test(managerUrl) && !/^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(managerUrl)) {
+  const rawManagerUrl = String(env.MANAGER_URL || env.MANAGER_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (rawManagerUrl && !/^https:\/\//i.test(rawManagerUrl) && !/^http:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?$/i.test(rawManagerUrl)) {
     throw new Error('MANAGER_URL must use HTTPS.');
   }
+  const extraUrlsRaw = String(env.MANAGER_URLS || '').trim();
+  const cachePath = env.MANAGER_URL_CACHE_FILE || undefined;
+  const cachedUrls = loadCachedManagerUrls(cachePath);
+  const managerUrls = mergeManagerUrls(
+    [rawManagerUrl || '', extraUrlsRaw, cachedUrls, DEFAULT_MANAGER_URL]
+  );
+  const managerUrl = managerUrls[0] || DEFAULT_MANAGER_URL;
 
   const ALLOWED_MC_HOSTS = Object.freeze(['kingmc.vn', 'sgp.kingmc.vn']);
   const configuredHosts = String(env.MC_SERVER_HOSTS || 'kingmc.vn,sgp.kingmc.vn')
@@ -159,6 +159,8 @@ function loadConfig(env = process.env) {
     nodeEnv: env.NODE_ENV || 'development',
     transport,
     managerUrl,
+    managerUrls: Object.freeze(managerUrls),
+    ...(cachePath ? { managerUrlCacheFile: cachePath } : {}),
     authType,
     afkMode,
     viewDistance,
@@ -197,7 +199,6 @@ function loadConfig(env = process.env) {
   const botCount = rawBotCount;
   const bots = Array.from({ length: botCount }, (_, index) => readSlot(env, index + 1, common));
   if (new Set(bots.map((bot) => bot.workerId)).size !== bots.length) throw new Error('Each bot slot must use a different WORKER_ID.');
-  if (new Set(bots.map((bot) => bot.secret)).size !== bots.length) throw new Error('Each bot slot must use a different WORKER_SECRET.');
 
   return Object.freeze({ ...common, botCount, bots: Object.freeze(bots) });
 }

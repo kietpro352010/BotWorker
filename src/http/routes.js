@@ -4,31 +4,36 @@ const express = require('express');
 const { requireWorkerSecret, safeEqual, extractWorkerToken } = require('./auth');
 const { ACTIONS } = require('../services/worker-runtime');
 
-function matchesBotSecret(supplied, bot) {
-  if (!supplied || !bot) return false;
-  if (bot.secret && safeEqual(supplied, bot.secret)) return true;
-  if (bot.previousSecret && Date.now() < (Number(bot.graceUntil) || 0) && safeEqual(supplied, bot.previousSecret)) {
-    return true;
+function matchesBotAuth(req, suppliedSecret, bot) {
+  if (!bot) return false;
+  if (bot.secret) {
+    if (!suppliedSecret) return false;
+    if (safeEqual(suppliedSecret, bot.secret)) return true;
+    if (bot.previousSecret && Date.now() < (Number(bot.graceUntil) || 0) && safeEqual(suppliedSecret, bot.previousSecret)) {
+      return true;
+    }
+    return false;
   }
-  return false;
+  const headerBotId = String(req.get?.('x-manager-bot-id') || '').trim().toLowerCase();
+  return Boolean(headerBotId && headerBotId === String(bot.workerId || '').toLowerCase());
 }
 
 function attachBotRoutes(router, fleet, workerId, { legacy = false, config = null } = {}) {
-  // RT-04: Secure instance resolution avoiding workerId enumeration
+  // RT-04: Instance resolution supporting ID-only mode (when WORKER_SECRET is unset) and optional legacy secret
   const resolveInstance = (req, res, next) => {
     const supplied = extractWorkerToken(req);
-    if (!supplied) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
-
+    const headerBotId = String(req.get?.('x-manager-bot-id') || '').trim().toLowerCase();
     const targetId = workerId || req.params.workerId;
     const instance = typeof fleet?.get === 'function' ? fleet.get(targetId) : null;
 
     if (!instance) {
+      if (!supplied && !headerBotId) {
+        return res.status(401).json({ ok: false, error: 'unauthorized' });
+      }
       const knownBots = (config?.bots && Array.isArray(config.bots))
         ? config.bots
         : (typeof fleet?.list === 'function' ? fleet.list() : []).map((i) => i?.config).filter(Boolean);
-      const isKnownCaller = knownBots.some((b) => matchesBotSecret(supplied, b));
+      const isKnownCaller = knownBots.some((b) => matchesBotAuth(req, supplied, b));
 
       if (!isKnownCaller) {
         return res.status(401).json({ ok: false, error: 'unauthorized' });
@@ -37,11 +42,22 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false, config = nul
     }
 
     req.workerInstance = instance;
-    const authFn = requireWorkerSecret(instance.config.secret, {
-      previousSecret: instance.config.previousSecret,
-      graceUntil: instance.config.graceUntil
-    });
-    return authFn(req, res, next);
+    if (instance.config?.secret) {
+      if (!supplied) return res.status(401).json({ ok: false, error: 'unauthorized' });
+      const authFn = requireWorkerSecret(instance.config.secret, {
+        previousSecret: instance.config.previousSecret,
+        graceUntil: instance.config.graceUntil
+      });
+      return authFn(req, res, next);
+    }
+
+    if (headerBotId && headerBotId !== String(instance.config.workerId || '').toLowerCase()) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    if (!headerBotId && !supplied) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    return next();
   };
 
   const prefix = legacy ? '/api/v1' : `/api/v1/bots/:workerId`;
@@ -55,6 +71,10 @@ function attachBotRoutes(router, fleet, workerId, { legacy = false, config = nul
     let onClose = null;
 
     try {
+      const incomingManagerUrls = typeof req.get === 'function' ? req.get('x-manager-urls') : '';
+      if (incomingManagerUrls && typeof req.workerInstance?.reporter?.learnManagerUrls === 'function') {
+        req.workerInstance.reporter.learnManagerUrls(incomingManagerUrls);
+      }
       const action = String(req.body?.action || '').trim().toLowerCase();
       if (!ACTIONS.has(action)) {
         return res.status(400).json({ ok: false, error: 'unsupported_action' });
@@ -196,7 +216,7 @@ function createRouter({ fleet, config }) {
 
   router.get('/api/v1/diagnostics', (req, res) => {
     const secret = extractWorkerToken(req);
-    const authed = Array.isArray(config?.bots) && config.bots.some((b) => matchesBotSecret(secret, b));
+    const authed = Array.isArray(config?.bots) && config.bots.some((b) => matchesBotAuth(req, secret, b));
     if (!authed) return res.status(401).json({ ok: false, error: 'unauthorized' });
     return res.json({
       ok: true,
