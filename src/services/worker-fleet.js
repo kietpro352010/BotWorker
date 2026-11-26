@@ -55,7 +55,7 @@ class WorkerFleet {
     this.loopDelayMonitor = null;
     try {
       if (typeof monitorEventLoopDelay === 'function') {
-        this.loopDelayMonitor = monitorEventLoopDelay({ resolution: 20 });
+        this.loopDelayMonitor = monitorEventLoopDelay({ resolution: 50 });
         this.loopDelayMonitor.enable();
       }
     } catch (_) {
@@ -255,8 +255,8 @@ class WorkerFleet {
     }, 45000);
     this.heartbeatTimer.unref?.();
 
-    const resourceIntervalMs = this.config.transport === 'wispbyte-poll' ? 30000 : 20000;
-    const pruneThresholdMb = this.config.platform === 'wispbyte' ? 165 : 200;
+    const resourceIntervalMs = this.config.transport === 'wispbyte-poll' ? 45000 : 30000;
+    const pruneThresholdMb = this.config.platform === 'wispbyte' ? 230 : 250;
     this.resourceTimer = setInterval(() => {
       const metrics = this.sampleResources();
       const rssMb = Math.round(metrics.rssMb);

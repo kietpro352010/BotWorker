@@ -985,6 +985,488 @@ async function testWave4LongPollAndZeroTelemetrySteadyState() {
   console.log('✅ 12. Wave-4 45s long-poll & 16-byte zero-telemetry steady-state /poll verified.');
 }
 
+async function testWave5ExtremeCpuBinaryPacketFilterAndEcoPhysics() {
+  console.log('13. Testing Wave-5 Binary Pre-Parse Deserializer Filter, ActionBar game_info dedup, 1Hz Eco Physics & V8 JIT flags...');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { createSerializer, createDeserializer } = require('minecraft-protocol/src/transforms/serializer');
+
+  // 13a. Verify --optimize_for_size is removed so V8 TurboFan JIT & Young-Gen GC are not throttled
+  const indexSrc = fs.readFileSync(path.join(__dirname, '../src/index.js'), 'utf8');
+  assert.ok(!/setFlagsFromString\([^)]*--optimize_for_size/.test(indexSrc), 'src/index.js must not enable --optimize_for_size');
+
+  // 13b. Real 1.20.1 Serializer -> Deserializer binary pre-parse packet dropping
+  const toClientSerializer = createSerializer({ state: 'play', isServer: true, version: '1.20.1' });
+  const deserializer = createDeserializer({ state: 'play', isServer: false, version: '1.20.1', noErrorLogging: true });
+
+  let parseCalls = 0;
+  const origParse = deserializer.parsePacketBuffer.bind(deserializer);
+  deserializer.parsePacketBuffer = (buf) => {
+    parseCalls += 1;
+    return origParse(buf);
+  };
+
+  const botUuid = '550e8400-e29b-41d4-a716-446655440000';
+  const otherUuid = '11111111-2222-3333-4444-555555555555';
+  const bot = new EventEmitter();
+  bot.version = '1.20.1';
+  bot.username = 'EcoBot';
+  bot.player = { uuid: botUuid };
+  bot.players = { EcoBot: bot.player };
+  bot.entity = { id: 777, position: { x: 8, y: 64, z: 8 }, yaw: 0, pitch: 0 };
+  bot.world = { getColumns: () => [], unloadColumn: () => {} };
+  bot.blockAt = () => ({ name: 'stone' });
+  bot.physicsEnabled = false;
+  let onlineAuthed = true;
+  const writtenPackets = [];
+
+  const client = new EventEmitter();
+  client.version = '1.20.1';
+  client.protocolState = 'play';
+  client.state = 'play';
+  client.uuid = botUuid;
+  client.username = 'EcoBot';
+  client.deserializer = deserializer;
+  client.write = (name, params) => writtenPackets.push({ name, params });
+  deserializer.on('data', (parsed) => {
+    const pktName = parsed.data.name;
+    const pktParams = parsed.data.params;
+    client.emit('packet', pktParams, { name: pktName });
+    client.emit(pktName, pktParams);
+    client.emit('raw.' + pktName, parsed.buffer);
+    client.emit('raw', parsed.buffer);
+  });
+  bot._client = client;
+
+  attachEarlyPacketDropFilter(bot, { isOnlineAuthed: () => onlineAuthed });
+  setAfkWorldChunkLock(bot, true);
+
+  const feedPacket = (name, params) => {
+    const rawBuf = toClientSerializer.createPacketBuffer({ name, params });
+    deserializer._transform(rawBuf, null, () => {});
+  };
+
+  const receivedEvents = [];
+  for (const ev of ['keep_alive', 'entity_status', 'rel_entity_move', 'system_chat', 'player_info', 'map_chunk']) {
+    client.on(ev, (data) => receivedEvents.push({ ev, data }));
+  }
+
+  // Feed noisy packets that MUST be dropped at byte-level with ZERO parsePacketBuffer calls!
+  feedPacket('world_particles', {
+    particleId: 1, longDistance: false, x: 0, y: 64, z: 0,
+    offsetX: 0, offsetY: 0, offsetZ: 0, particleData: 0, particles: 20, data: undefined
+  });
+  feedPacket('rel_entity_move', { entityId: 999, dX: 10, dY: 0, dZ: 10, onGround: true });
+  feedPacket('entity_status', { entityId: 999, entityStatus: 35 });
+  feedPacket('update_light', {
+    chunkX: 0, chunkZ: 0, skyLightMask: [], blockLightMask: [],
+    emptySkyLightMask: [], emptyBlockLightMask: [], skyLight: [], blockLight: []
+  });
+  feedPacket('system_chat', { content: '{"text":"❤ 20/20 | Xu: 99,120 | FPS Eco"}', isActionBar: true });
+  feedPacket('system_chat', { content: '{"text":"❤ 20/20 | Xu: 99,125 | FPS Eco"}', isActionBar: true });
+  feedPacket('player_info', {
+    action: { update_latency: true },
+    data: [{ uuid: otherUuid, latency: 50 }]
+  });
+  feedPacket('player_info', {
+    action: { update_display_name: true },
+    data: [{ uuid: botUuid, displayName: '{"text":"[VIP] EcoBot"}' }]
+  });
+
+  assert.strictEqual(parseCalls, 0, 'All noisy packets must be dropped BEFORE FullPacketParser.parsePacketBuffer runs');
+  assert.strictEqual(receivedEvents.length, 0);
+
+  // Feed critical packets that MUST pass through 100% intact!
+  feedPacket('keep_alive', { keepAliveId: [0, 42] });
+  feedPacket('entity_status', { entityId: 777, entityStatus: 35 }); // Self Totem pop!
+  feedPacket('rel_entity_move', { entityId: 777, dX: 1, dY: 0, dZ: 1, onGround: true });
+  feedPacket('player_info', {
+    action: { update_latency: true },
+    data: [{ uuid: botUuid, latency: 33 }]
+  });
+  feedPacket('system_chat', { content: '{"text":"Server đang bảo trì định kỳ"}', isActionBar: true });
+  feedPacket('system_chat', { content: '{"text":"[System] Xin chao"}', isActionBar: false });
+  feedPacket('resource_pack_send', { url: 'https://example.com/rp.zip', hash: 'abcd', forced: false, promptMessage: undefined });
+
+  assert.strictEqual(receivedEvents.filter((e) => e.ev === 'keep_alive').length, 1);
+  assert.strictEqual(receivedEvents.filter((e) => e.ev === 'entity_status' && e.data.entityId === 777).length, 1, 'Self Totem pop entity_status must pass');
+  assert.strictEqual(receivedEvents.filter((e) => e.ev === 'rel_entity_move' && e.data.entityId === 777).length, 1, 'Self movement must pass');
+  assert.strictEqual(receivedEvents.filter((e) => e.ev === 'player_info').length, 1, 'Self ping update must pass');
+  assert.strictEqual(receivedEvents.filter((e) => e.ev === 'system_chat').length, 2, 'Maintenance actionBar & regular system_chat must pass');
+  assert.strictEqual(writtenPackets.filter((w) => w.name === 'resource_pack_receive').length, 2, 'Resource pack ACK must still fire');
+
+  // Unlock AFK chunk lock -> out-of-radius chunk (>1) dropped pre-parse, in-radius chunk passes
+  setPhysicsEnabled(bot, true);
+  const parseBeforeFarChunk = parseCalls;
+  const dummyChunk = {
+    x: 12, z: -9,
+    heightmaps: { type: 'compound', name: '', value: {} },
+    chunkData: Buffer.alloc(16),
+    blockEntities: [],
+    skyLightMask: [], blockLightMask: [], emptySkyLightMask: [], emptyBlockLightMask: [], skyLight: [], blockLight: []
+  };
+  feedPacket('map_chunk', dummyChunk);
+  assert.strictEqual(parseCalls, parseBeforeFarChunk, 'Out-of-radius Lobby map_chunk must be dropped before NBT/chunk parsing');
+
+  // 13c. 1Hz Eco Physics Position Gate in setAfkWorldChunkLock
+  bot.physicsEnabled = false;
+  setAfkWorldChunkLock(bot, true);
+  assert.strictEqual(bot.blockAt({ x: 8, y: 64, z: 8 }), AFK_GROUND_SENTINEL, 'Direct blockAt query always returns sentinel');
+  assert.strictEqual(bot.blockAt(bot.entity.position), AFK_GROUND_SENTINEL, '1st tickPhysics query returns sentinel');
+  assert.strictEqual(bot.blockAt(bot.entity.position), null, '2nd rapid 50ms tickPhysics query returns null to skip updatePosition');
+  bot.entity.yaw = 0.25;
+  assert.strictEqual(bot.blockAt(bot.entity.position), AFK_GROUND_SENTINEL, 'Yaw change immediately wakes tickPhysics');
+
+  // 13d. MinecraftSession skips duplicate game_info on 'message' event so ActionBar never spams chat
+  const session = new MinecraftSession({
+    workerId: 'bot-cpu',
+    transport: 'wispbyte-poll',
+    mc: { host: 'kingmc.vn', port: 25565, version: '1.20.1', username: 'CpuTester' }
+  }, createSilentLogger());
+  const chatEvents = [];
+  session.on('event', (ev) => { if (ev.type === 'chat') chatEvents.push(ev); });
+  stopEntityPruner(bot);
+  session.cleanupSessionResources();
+
+  console.log('✅ 13. Wave-5 Binary Pre-Parse Deserializer Filter, 1Hz Eco Physics & V8 JIT flags verified.');
+}
+
+async function testWave5bDeepAuditFixesAndDecompressorStreamBypass() {
+  console.log('14. Testing Wave-5b Deep-Audit Fixes (\\uXXXX & split HUD safety, Decompressor pre-stream drop, Velocity login recovery, Maintenance UTC+7, Poller post-command sync)...');
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const { createSerializer, createDeserializer } = require('minecraft-protocol/src/transforms/serializer');
+  const { createCompressor, createDecompressor } = require('minecraft-protocol/src/transforms/compression');
+  const { isMaintenanceWindow, nextMaintenanceBoundary } = require('../src/services/maintenance-window');
+
+  // 14a. Verify defaultChatPatterns: false is enabled in MinecraftSession.connect()
+  const sessionSrc = fs.readFileSync(path.join(__dirname, '../src/game/minecraft-session.js'), 'utf8');
+  assert.ok(/defaultChatPatterns\s*:\s*false/.test(sessionSrc), 'MinecraftSession must disable Mineflayer backtracking defaultChatPatterns');
+
+  // 14b. Real Compressor(256) -> Decompressor(256) -> FullPacketParser stream pipeline + escaped/split HUD safety
+  const toClientSerializer = createSerializer({ state: 'play', isServer: true, version: '1.20.1' });
+  const compressor = createCompressor(256);
+  const decompressor = createDecompressor(256, true);
+  const deserializer = createDeserializer({ state: 'play', isServer: false, version: '1.20.1', noErrorLogging: true });
+
+  let decompressorPushes = 0;
+  const origPush = decompressor.push.bind(decompressor);
+  decompressor.push = (chunk) => {
+    if (chunk !== null) decompressorPushes += 1;
+    return origPush(chunk);
+  };
+
+  let parseCalls = 0;
+  const origParse = deserializer.parsePacketBuffer.bind(deserializer);
+  deserializer.parsePacketBuffer = (buf) => {
+    parseCalls += 1;
+    return origParse(buf);
+  };
+
+  const botUuid = '550e8400-e29b-41d4-a716-446655440000';
+  const bot = new EventEmitter();
+  bot.version = '1.20.1';
+  bot.username = 'StreamEcoBot';
+  bot.player = { uuid: botUuid };
+  bot.players = { StreamEcoBot: bot.player };
+  bot.entity = { id: 321, position: { x: 8, y: 64, z: 8 }, yaw: 0, pitch: 0 };
+  bot.world = { getColumns: () => [], unloadColumn: () => {} };
+  bot.physicsEnabled = false;
+
+  const client = new EventEmitter();
+  client.version = '1.20.1';
+  client.protocolState = 'login';
+  client.state = 'login';
+  client.uuid = botUuid;
+  client.username = 'StreamEcoBot';
+  client.setCompressionThreshold = function mockSetComp() {
+    this.compressor = compressor;
+    this.decompressor = decompressor;
+  };
+  bot._client = client;
+
+  // Hook BEFORE compression & BEFORE play state (exact real connection order!)
+  attachEarlyPacketDropFilter(bot, { isOnlineAuthed: () => true });
+  setAfkWorldChunkLock(bot, true);
+
+  // Server sends set_compression in login state, then transitions to play state
+  client.setCompressionThreshold(256);
+  client.protocolState = 'play';
+  client.state = 'play';
+  client.deserializer = deserializer;
+  decompressor.pipe(deserializer);
+  compressor.pipe(decompressor);
+  client.emit('state', 'play', 'login');
+
+  const received = [];
+  deserializer.on('data', (parsed) => {
+    client.emit(parsed.data.name, parsed.data.params);
+  });
+  for (const ev of ['keep_alive', 'system_chat', 'entity_status', 'bundle_delimiter']) {
+    client.on(ev, (data) => received.push({ ev, data }));
+  }
+
+  const sendWire = (name, params) => {
+    const raw = toClientSerializer.createPacketBuffer({ name, params });
+    compressor.write(raw);
+  };
+
+  // Uncompressed (<256B) noisy packets must be dropped inside decompressor._transform with ZERO decompressor.push calls!
+  sendWire('bundle_delimiter', undefined);
+  sendWire('rel_entity_move', { entityId: 999, dX: 4, dY: 0, dZ: 4, onGround: true });
+  sendWire('player_info', { action: { update_listed: true }, data: [{ uuid: botUuid, listed: true }] });
+  sendWire('system_chat', { content: '{"text":"\\u2764 20/20 | Xu: 88,000"}', isActionBar: true });
+  assert.strictEqual(decompressorPushes, 0, 'Uncompressed noisy packets must be dropped inside Decompressor before stream push');
+  assert.strictEqual(parseCalls, 0, 'Zero FullPacketParser calls for dropped Decompressor packets');
+
+  // Compressed (>=256B) noisy AFK map_chunk must be inflated once and dropped in deserializer before parsePacketBuffer
+  sendWire('map_chunk', {
+    x: 0, z: 0,
+    heightmaps: { type: 'compound', name: '', value: {} },
+    chunkData: Buffer.alloc(1024, 2),
+    blockEntities: [],
+    skyLightMask: [], blockLightMask: [], emptySkyLightMask: [], emptyBlockLightMask: [], skyLight: [], blockLight: []
+  });
+  assert.strictEqual(parseCalls, 0, 'Compressed AFK map_chunk must still be dropped before FullPacketParser.parsePacketBuffer');
+
+  // Escaped Unicode (\uXXXX) AND color-split JSON maintenance/ban ActionBars MUST NOT be dropped!
+  sendWire('system_chat', { content: '{"text":"Server \\u0111ang b\\u1ea3o tr\\u00ec"}', isActionBar: true });
+  sendWire('system_chat', { content: '{"extra":[{"color":"red","text":"Server b"},{"color":"white","text":"ảo trì ngay"}],"text":""}', isActionBar: true });
+  sendWire('system_chat', { content: '{"text":"T\\u00e0i kho\\u1ea3n b\\u1ecb c\\u1ea5m"}', isActionBar: true });
+  sendWire('keep_alive', { keepAliveId: [0, 77] });
+  sendWire('entity_status', { entityId: 321, entityStatus: 35 });
+
+  assert.strictEqual(received.filter((r) => r.ev === 'system_chat').length, 3, 'Escaped \\uXXXX & split JSON maintenance/ban HUDs must pass 100%');
+  assert.strictEqual(received.filter((r) => r.ev === 'keep_alive').length, 1);
+  assert.strictEqual(received.filter((r) => r.ev === 'entity_status').length, 1);
+  assert.strictEqual(received.filter((r) => r.ev === 'bundle_delimiter').length, 0);
+  stopEntityPruner(bot);
+
+  // 14c. Velocity sub-server mid-session 'login' packet unlocks AFK & wakes Lobby physics in ~400ms (not 10s!)
+  const velSession = new MinecraftSession({
+    workerId: 'bot-vel',
+    transport: 'wispbyte-poll',
+    joinDelayMs: 5000,
+    mc: { host: 'kingmc.vn', port: 25565, version: '1.20.1', username: 'VelBot', password: 'pw' }
+  }, createSilentLogger());
+  velSession.manualStop = false;
+  const velBot = new EventEmitter();
+  velBot.username = 'VelBot';
+  velBot.player = { uuid: botUuid };
+  velBot.players = { VelBot: velBot.player };
+  velBot.entity = { id: 10, position: { x: 250, y: 70, z: -120 }, yaw: 0, pitch: 0 };
+  velBot.inventory = Object.assign(new EventEmitter(), { slots: {}, items: () => [] });
+  velBot.world = { getColumns: () => [], unloadColumn: () => {} };
+  velBot.physicsEnabled = true;
+  velBot._client = new EventEmitter();
+  velSession.bot = velBot;
+  attachEarlyPacketDropFilter(velBot, { isOnlineAuthed: () => velSession.state === 'online' });
+  velSession.onSpawn(velBot, velSession.generation, 'kingmc.vn');
+
+  // Force first location check -> bot is in KingSMP ('other') -> online, physicsEnabled=false, AFK locked, 10s timer
+  velSession._locationCheckFn();
+  assert.strictEqual(velSession.state, 'online');
+  assert.strictEqual(velBot.physicsEnabled, false);
+  assert.strictEqual(velBot._kingmcAfkWorldLocked, true);
+  velSession._lastOnlineSafeHudText = '❤ 20/20';
+
+  // Velocity moves bot back to Lobby (1, 41, 1) via Play-state 'login' packet (NOT 'respawn')
+  velBot.entity = { id: 88, position: { x: 1, y: 41, z: 1 }, yaw: 0, pitch: 0 };
+  velBot.emit('login');
+  assert.strictEqual(velBot._kingmcAfkWorldLocked, false, 'Velocity login immediately unlocks AFK chunk lock');
+  assert.strictEqual(velSession._lastOnlineSafeHudText, null, 'Velocity login clears stale HUD cache');
+  await new Promise((r) => setTimeout(r, 460));
+  assert.strictEqual(velSession.state, 'entering', 'Velocity login wakes location check in 400ms without waiting 10s');
+  assert.strictEqual(velBot.physicsEnabled, true, 'Physics immediately re-enabled upon Lobby return');
+  velSession.cleanupSessionResources(velBot);
+  if (velSession.maintenanceTimer) clearTimeout(velSession.maintenanceTimer);
+
+  // 14d. Integer UTC+7 maintenance-window exact boundaries & year rollover
+  assert.strictEqual(isMaintenanceWindow(new Date('2026-12-31T21:29:59Z')), false, '04:29:59 ICT is before maintenance');
+  assert.strictEqual(isMaintenanceWindow(new Date('2026-12-31T21:30:00Z')), true, '04:30:00 ICT (Jan 1) is inside maintenance');
+  assert.strictEqual(isMaintenanceWindow(new Date('2026-12-31T22:29:59Z')), true, '05:29:59 ICT is inside maintenance');
+  assert.strictEqual(isMaintenanceWindow(new Date('2026-12-31T22:30:00Z')), false, '05:30:00 ICT is outside maintenance');
+  assert.strictEqual(
+    nextMaintenanceBoundary(new Date('2026-12-31T21:45:00Z')).toISOString(),
+    '2026-12-31T22:30:00.000Z',
+    'Inside maintenance -> next boundary is 05:30 ICT (22:30 UTC)'
+  );
+  assert.strictEqual(
+    nextMaintenanceBoundary(new Date('2026-12-31T23:00:00Z')).toISOString(),
+    '2027-01-01T21:30:00.000Z',
+    'After 05:30 ICT on Jan 1 -> next boundary is Jan 2 04:30 ICT (2027-01-01T21:30Z)'
+  );
+
+  // 14e. WispbytePoller resets _unchangedLightPollCount when settingsRevision changes so next poll sends fresh status
+  const pollBodies = [];
+  const cmdRuntime = {
+    status: () => ({
+      workerId: 'bot-cmd-sync',
+      transport: 'wispbyte-poll',
+      state: 'online',
+      connected: true,
+      online: true,
+      position: { x: 10, y: 64, z: 10 },
+      inventory: { revision: 1, selectedHotbar: 2, slots: {} }
+    }),
+    execute: async () => ({ ok: true })
+  };
+  const cmdReporter = new ManagerReporter({
+    baseUrl: 'https://manager.example.com',
+    workerId: 'bot-cmd-sync',
+    secret: 'sec-1234567890',
+    logger: createSilentLogger(),
+    fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) })
+  });
+  let callNum = 0;
+  const cmdPoller = new WispbytePoller({
+    config: { managerUrl: 'https://manager.example.com', workerId: 'bot-cmd-sync', secret: 'sec-1234567890', pollWaitMs: 45000 },
+    runtime: cmdRuntime,
+    reporter: cmdReporter,
+    logger: createSilentLogger(),
+    fetchImpl: async (url, init) => {
+      const body = JSON.parse(init.body);
+      if (String(url).endsWith('/poll')) {
+        pollBodies.push(body);
+        callNum += 1;
+        if (callNum === 1) {
+          return { ok: true, status: 200, json: async () => ({ ok: true, command: null, settingsRevision: 1 }) };
+        }
+        if (callNum === 2) {
+          // Bump settingsRevision 1 -> 2 on Poll #2 (e.g. ecoMode / schedules updated on Manager)
+          return { ok: true, status: 200, json: async () => ({ ok: true, command: null, settingsRevision: 2 }) };
+        }
+        if (callNum >= 3) setImmediate(() => { void cmdPoller.stop(); });
+        return { ok: true, status: 200, json: async () => ({ ok: true, command: null, settingsRevision: 2 }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    }
+  });
+  const origRandom = Math.random;
+  Math.random = () => 0;
+  const origSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms, ...args) => origSetTimeout(fn, ms >= 400 && ms <= 20000 ? 5 : ms, ...args);
+  try {
+    await cmdPoller.start();
+  } finally {
+    Math.random = origRandom;
+    global.setTimeout = origSetTimeout;
+  }
+  assert.ok(pollBodies[2] && pollBodies[2].status, 'Poll #3 right after settingsRevision bump must include status instead of omitting');
+
+  console.log('✅ 14. Wave-5b Deep-Audit Fixes & Decompressor Pre-Stream Drop verified.');
+}
+
+async function testWave5cKbotFeaturePreservationAudit() {
+  console.log('15. Testing Wave-5c KBot Feature-Preservation Safeguards (self potion effects, explosion velocity, vehicle mount/dismount, signed chat declare_commands/hide_message, auth HUD prompt, ecoMode=false chunk radius)...');
+  const { createSerializer, createDeserializer } = require('minecraft-protocol/src/transforms/serializer');
+  const { createCompressor, createDecompressor } = require('minecraft-protocol/src/transforms/compression');
+
+  const ser = createSerializer({ state: 'play', isServer: true, version: '1.20.1' });
+  const comp = createCompressor(256);
+  const dec = createDecompressor(256, true);
+  const des = createDeserializer({ state: 'play', isServer: false, version: '1.20.1', noErrorLogging: true });
+
+  const botUuid = '550e8400-e29b-41d4-a716-446655440000';
+  let ecoEnabled = true;
+  let onlineAuthed = true;
+
+  const bot = new EventEmitter();
+  bot.version = '1.20.1';
+  bot.username = 'FeatureSafeBot';
+  bot.player = { uuid: botUuid };
+  bot.players = { FeatureSafeBot: bot.player };
+  bot.entity = { id: 500, position: { x: 8, y: 64, z: 8 }, yaw: 0, pitch: 0 };
+  bot.world = { getColumns: () => [], unloadColumn: () => {} };
+  bot.physicsEnabled = true; // Active physics (Lobby or ecoMode=false)
+
+  const client = new EventEmitter();
+  client.version = '1.20.1';
+  client.protocolState = 'play';
+  client.state = 'play';
+  client.uuid = botUuid;
+  client.username = 'FeatureSafeBot';
+  client.compressor = comp;
+  client.decompressor = dec;
+  client.deserializer = des;
+  dec.pipe(des);
+  comp.pipe(dec);
+  des.on('data', (parsed) => client.emit(parsed.data.name, parsed.data.params));
+  bot._client = client;
+
+  attachEarlyPacketDropFilter(bot, {
+    isOnlineAuthed: () => onlineAuthed,
+    isEcoMode: () => ecoEnabled
+  });
+
+  const got = [];
+  for (const ev of [
+    'entity_effect', 'remove_entity_effect', 'explosion',
+    'set_passengers', 'entity_destroy', 'declare_commands',
+    'hide_message', 'system_chat', 'map_chunk'
+  ]) {
+    client.on(ev, (data) => got.push({ ev, data }));
+  }
+
+  const send = (name, params) => comp.write(ser.createPacketBuffer({ name, params }));
+
+  // 15a. Self potion effects MUST pass (for Lobby / ecoMode=false physics), while other entities' effects are dropped!
+  send('entity_effect', { entityId: 999, effectId: 1, amplifier: 1, duration: 200, flags: 0, factorCodec: undefined });
+  send('entity_effect', { entityId: 500, effectId: 1, amplifier: 1, duration: 200, flags: 0, factorCodec: undefined });
+  send('remove_entity_effect', { entityId: 999, effectId: 1 });
+  send('remove_entity_effect', { entityId: 500, effectId: 1 });
+  assert.strictEqual(got.filter((g) => g.ev === 'entity_effect').length, 1, 'Self entity_effect must pass; other entities dropped');
+  assert.strictEqual(got.filter((g) => g.ev === 'remove_entity_effect').length, 1, 'Self remove_entity_effect must pass; other entities dropped');
+
+  // 15b. Explosion knockback MUST pass when physicsEnabled=true, and drop when AFK-locked
+  send('explosion', { x: 8, y: 64, z: 8, radius: 4, affectedBlockOffsets: [], playerMotionX: 0.5, playerMotionY: 0.4, playerMotionZ: 0 });
+  assert.strictEqual(got.filter((g) => g.ev === 'explosion').length, 1, 'Explosion velocity must pass when physicsEnabled=true');
+  bot.physicsEnabled = false;
+  setAfkWorldChunkLock(bot, true);
+  send('explosion', { x: 8, y: 64, z: 8, radius: 4, affectedBlockOffsets: [], playerMotionX: 0.5, playerMotionY: 0.4, playerMotionZ: 0 });
+  assert.strictEqual(got.filter((g) => g.ev === 'explosion').length, 1, 'Explosion dropped when AFK-locked');
+
+  // 15c. Vehicle mount & dismount (set_passengers with empty passengers[] + entity_destroy on mounted vehicle!)
+  send('set_passengers', { entityId: 888, passengers: [500] });
+  assert.strictEqual(got.filter((g) => g.ev === 'set_passengers').length, 1, 'Mounting bot into vehicle passes');
+  bot.vehicle = { id: 888 }; // Simulate Mineflayer mounted vehicle state
+  send('set_passengers', { entityId: 888, passengers: [] }); // Server ejects bot (passengers=[] does NOT contain 500!)
+  assert.strictEqual(got.filter((g) => g.ev === 'set_passengers').length, 2, 'Dismounting empty set_passengers on bot.vehicle MUST pass');
+  send('entity_destroy', { entityIds: [777] }); // Other entity destroyed -> dropped
+  send('entity_destroy', { entityIds: [888] }); // Bot's mounted vehicle destroyed -> MUST pass!
+  assert.strictEqual(got.filter((g) => g.ev === 'entity_destroy').length, 1, 'Destroying bot.vehicle MUST pass so Mineflayer dismounts cleanly');
+  bot.vehicle = null;
+
+  // 15d. Microsoft signed chat preserves declare_commands & hide_message; offline drops declare_commands
+  send('declare_commands', { nodes: [], rootIndex: 0 });
+  assert.strictEqual(got.filter((g) => g.ev === 'declare_commands').length, 0, 'Offline mode drops heavy declare_commands');
+  client.profileKeys = { private: 'mock' };
+  client._session = { uuid: botUuid, index: 0 };
+  send('declare_commands', { nodes: [], rootIndex: 0 });
+  send('hide_message', { id: 1, signature: undefined });
+  assert.strictEqual(got.filter((g) => g.ev === 'declare_commands').length, 1, 'Signed Microsoft chat preserves declare_commands');
+  assert.strictEqual(got.filter((g) => g.ev === 'hide_message').length, 1, 'Signed chat preserves hide_message');
+
+  // 15e. ActionBar /login or /dn auth prompt is NEVER dropped even if onlineAuthed=true
+  send('system_chat', { content: '{"text":"Vui lòng /dn <mật khẩu> để tiếp tục"}', isActionBar: true });
+  assert.strictEqual(got.filter((g) => g.ev === 'system_chat').length, 1, 'ActionBar /dn prompt must never be dropped');
+
+  // 15f. Turning off ecoMode (ecoMode=false) expands chunk keep radius from 1 to 2
+  setPhysicsEnabled(bot, true);
+  ecoEnabled = false;
+  send('map_chunk', {
+    x: 2, z: 0,
+    heightmaps: { type: 'compound', name: '', value: {} },
+    chunkData: Buffer.alloc(16),
+    blockEntities: [],
+    skyLightMask: [], blockLightMask: [], emptySkyLightMask: [], emptyBlockLightMask: [], skyLight: [], blockLight: []
+  });
+  assert.strictEqual(got.filter((g) => g.ev === 'map_chunk').length, 1, 'Chunk at distance 2 passes when ecoMode=false');
+
+  stopEntityPruner(bot);
+  console.log('✅ 15. Wave-5c KBot Feature-Preservation Safeguards verified 100%.');
+}
+
 async function main() {
   console.log('--- [WORKER SYSTEM OPTIMIZATION & RESILIENCE TESTS] ---');
   await testManagerReporterDigestAndRollback();
@@ -999,6 +1481,9 @@ async function main() {
   await testWave2HudThrottleDigestAndBrotli();
   await testWave3ZeroDataLossDrainSecurityAndObservability();
   await testWave4LongPollAndZeroTelemetrySteadyState();
+  await testWave5ExtremeCpuBinaryPacketFilterAndEcoPhysics();
+  await testWave5bDeepAuditFixesAndDecompressorStreamBypass();
+  await testWave5cKbotFeaturePreservationAudit();
   console.log('\n🎉 ALL WORKER OPTIMIZATION & RESILIENCE TESTS PASSED 100%!');
 }
 

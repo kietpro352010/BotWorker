@@ -3,11 +3,11 @@
 const { loadConfig, loadDotenvSafe } = require('./config/env');
 loadDotenvSafe();
 
-// Kích hoạt V8 Garbage Collection nội bộ (Trụ cột 1.1)
+// Kích hoạt V8 Garbage Collection nội bộ (KHÔNG bật --optimize_for_size vì cờ này tắt TurboFan JIT inlining và gây bão GC tốn gấp 2-4 lần CPU)
 const v8 = require('node:v8');
 const vm = require('node:vm');
 try {
-  v8.setFlagsFromString('--expose_gc --optimize_for_size');
+  v8.setFlagsFromString('--expose_gc');
   if (typeof global.gc !== 'function') {
     global.gc = vm.runInNewContext('gc');
   }
@@ -53,12 +53,12 @@ async function main() {
     portSource: config.portSource
   });
 
-  // Adaptive Memory Sweeper (so sánh theo heap_size_limit V8, tránh GC liên tục khi heap idle nhỏ)
+  // Adaptive Memory Sweeper (so sánh theo heap_size_limit V8, tránh GC Stop-The-World liên tục gây spike CPU trên container 400MB)
   let lastSweepGcAt = 0;
   const heapLimitMb = Math.max(192, Math.round((v8.getHeapStatistics()?.heap_size_limit || 0) / (1024 * 1024)) || 400);
-  const rssThresholdMb = config.platform === 'wispbyte' ? 190 : 250;
-  const heapThresholdMb = Math.max(96, Math.round(heapLimitMb * 0.65));
-  const emergencyHeapMb = Math.round(heapLimitMb * 0.82);
+  const rssThresholdMb = config.platform === 'wispbyte' ? 260 : 280;
+  const heapThresholdMb = Math.max(128, Math.round(heapLimitMb * 0.72));
+  const emergencyHeapMb = Math.round(heapLimitMb * 0.85);
 
   const memorySweepInterval = setInterval(() => {
     const memory = process.memoryUsage();
@@ -68,17 +68,17 @@ async function main() {
 
     const now = Date.now();
     const overThreshold = rssMb >= rssThresholdMb || heapUsedMb >= heapThresholdMb;
-    const emergency = rssMb >= 320 || heapUsedMb >= emergencyHeapMb;
-    if (overThreshold && (now - lastSweepGcAt >= 3 * 60 * 1000 || emergency)) {
+    const emergency = rssMb >= 340 || heapUsedMb >= emergencyHeapMb;
+    if (overThreshold && (now - lastSweepGcAt >= 5 * 60 * 1000 || emergency)) {
       lastSweepGcAt = now;
       fleet.pruneAllMemory?.();
-      const collected = runGarbageCollection();
+      const collected = emergency ? runGarbageCollection() : false;
       const after = process.memoryUsage();
       const afterRssMb = Math.round(after.rss / (1024 * 1024));
       const afterHeapMb = Math.round(after.heapUsed / (1024 * 1024));
       const reclaimedRssMb = rssMb - afterRssMb;
       const reclaimedHeapMb = heapUsedMb - afterHeapMb;
-      if (reclaimedRssMb >= 4 || reclaimedHeapMb >= 3 || afterRssMb >= 280) {
+      if (reclaimedRssMb >= 4 || reclaimedHeapMb >= 3 || afterRssMb >= 300) {
         logger.info('worker_memory_sweep', {
           rssMb: afterRssMb,
           heapUsedMb: afterHeapMb,
@@ -97,7 +97,7 @@ async function main() {
         });
       }
     }
-  }, 30000);
+  }, 60000);
   memorySweepInterval.unref();
 
   let shuttingDown = false;

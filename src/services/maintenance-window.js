@@ -4,14 +4,17 @@ const TIME_ZONE = 'Asia/Ho_Chi_Minh';
 const MAINTENANCE_START_MINUTE = 4 * 60 + 30;
 const MAINTENANCE_END_MINUTE = 5 * 60 + 30;
 const BANGKOK_OFFSET_MS = 7 * 60 * 60 * 1000;
-const formatter = new Intl.DateTimeFormat('en-CA', {
-  timeZone: TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit',
-  hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
-});
 
 function localParts(value = new Date()) {
-  const parts = Object.fromEntries(formatter.formatToParts(value).map((part) => [part.type, part.value]));
-  return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day), hour: Number(parts.hour), minute: Number(parts.minute) };
+  const ts = value instanceof Date ? value.getTime() : Number(value);
+  const vnDate = new Date((Number.isFinite(ts) ? ts : Date.now()) + BANGKOK_OFFSET_MS);
+  return {
+    year: vnDate.getUTCFullYear(),
+    month: vnDate.getUTCMonth() + 1,
+    day: vnDate.getUTCDate(),
+    hour: vnDate.getUTCHours(),
+    minute: vnDate.getUTCMinutes()
+  };
 }
 
 function isMaintenanceWindow(value = new Date()) {

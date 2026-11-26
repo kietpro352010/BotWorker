@@ -254,7 +254,11 @@ class WispbytePoller {
           this._unchangedLightPollCount = 0;
         }
         if (response && response.settingsRevision !== undefined) {
+          const prevSettingsRev = this.reporter?.lastSettingsRevision;
           this.reporter?.noteSettingsRevision?.(response.settingsRevision);
+          if (prevSettingsRev !== null && prevSettingsRev !== undefined && prevSettingsRev !== response.settingsRevision) {
+            this._unchangedLightPollCount = 0;
+          }
         }
         this.failures = 0;
         if (this.consecutiveAuthFailures > 0 || this.authPaused) {

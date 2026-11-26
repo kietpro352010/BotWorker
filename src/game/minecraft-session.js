@@ -113,6 +113,7 @@ class MinecraftSession extends EventEmitter {
     this.reconnectAttempts = 0;
     this.reconnectCount = 0;
     this.connectedAt = null;
+    this.connectedAtIso = null;
     this.username = String(config.mc.username || '').trim();
     this.password = String(config.mc.password || '');
     this.afkMode = 'still';
@@ -381,6 +382,7 @@ class MinecraftSession extends EventEmitter {
         viewDistance: this.config.mc.viewDistance || 'tiny',
         physicsEnabled: true,
         maxCatchupTicks: 1,
+        defaultChatPatterns: false,
         hideErrors: true,
         logErrors: false,
         fakeHost: host || 'kingmc.vn',
@@ -398,7 +400,10 @@ class MinecraftSession extends EventEmitter {
       this.bot = mf.createBot(options);
       const bot = this.bot;
       if (typeof bot.blockAt !== 'function') bot.blockAt = () => null;
-      attachEarlyPacketDropFilter(bot);
+      attachEarlyPacketDropFilter(bot, {
+        isOnlineAuthed: () => this.bot === bot && this.state === 'online' && this.isInAfkState === true && this.auth.isAuthenticated(),
+        isEcoMode: () => this.ecoMode !== false
+      });
       this.attachNetworkMetrics(bot);
       attachMinecraftConnectionDiagnostics(bot, { host, port: this.config.mc.port, logger: this.logger });
 
@@ -449,7 +454,12 @@ class MinecraftSession extends EventEmitter {
       });
       bot.on('kicked', (reason) => this.onKicked(bot, generation, reason));
       bot.on('end', () => this.onEnd(bot, generation));
-      bot.on('message', (json) => this.onMessage(bot, generation, json, 'message'));
+      bot.on('message', (json, position) => {
+        // Mineflayer emits BOTH 'message' (position='game_info') AND 'actionBar' for every ActionBar HUD tick;
+        // skip 'game_info' here so ActionBar is handled once via the deduplicated 'actionBar' path instead of spamming chat/CPU.
+        if (position === 'game_info') return;
+        this.onMessage(bot, generation, json, 'message');
+      });
       bot.on('actionBar', (json) => this.onMessage(bot, generation, json, 'actionBar'));
       bot.on('title', (json) => this.onMessage(bot, generation, json, 'title'));
       bot.on('chat', (username, message) => this.recordChat(bot, username, message));
@@ -513,6 +523,7 @@ class MinecraftSession extends EventEmitter {
     this.reconnectAttempts = 0;
     this.consecutiveHostFailures = 0;
     this.connectedAt = Date.now();
+    this.connectedAtIso = new Date(this.connectedAt).toISOString();
     this.lastError = null;
     this.setState('entering', 'minecraft_spawn');
     this.emit('event', {
@@ -526,7 +537,7 @@ class MinecraftSession extends EventEmitter {
     if (this.ecoMode !== false) {
       applyEcoPhysics(bot);
       if (this.chunkPruneTimer) clearInterval(this.chunkPruneTimer);
-      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 45000, radius: 1 });
+      this.chunkPruneTimer = startChunkPruner(bot, { intervalMs: 90000, radius: 1 });
     }
     this.navigator.onSpawn(bot);
     this.afk.mode = this.afkMode;
@@ -570,11 +581,19 @@ class MinecraftSession extends EventEmitter {
       setPhysicsEnabled(bot, true, this.logger, 'death');
     });
 
-    bot.on('respawn', () => {
+    const onWorldDimensionSwitch = (switchSource) => {
       if (this.bot !== bot || generation !== this.generation) return;
+      this.isInAfkState = false;
       setAfkWorldChunkLock(bot, false);
-      this.logger.info('bot_respawned', { bot: this.username });
-      this.emit('event', { type: 'respawn', message: 'Bot đã hồi sinh (respawn).' });
+      this._lastOnlineSafeHudRef = null;
+      this._lastOnlineSafeHudKey = null;
+      this._lastOnlineSafeHudText = null;
+      if (switchSource === 'respawn') {
+        this.logger.info('bot_respawned', { bot: this.username });
+        this.emit('event', { type: 'respawn', message: 'Bot đã hồi sinh (respawn).' });
+      } else {
+        this.logger.debug?.('bot_subserver_login_packet', { bot: this.username });
+      }
       if (this.locationTimer && typeof this._locationCheckFn === 'function') {
         if (this.respawnLocationTimer) clearTimeout(this.respawnLocationTimer);
         this.respawnLocationTimer = setTimeout(() => {
@@ -585,7 +604,10 @@ class MinecraftSession extends EventEmitter {
         }, 400);
         this.respawnLocationTimer.unref?.();
       }
-    });
+    };
+
+    bot.on('respawn', () => onWorldDimensionSwitch('respawn'));
+    bot.on('login', () => onWorldDimensionSwitch('login'));
 
     // Check off-hand totem immediately on spawn
     void this.fastEquipTotem(bot);
@@ -1270,8 +1292,12 @@ class MinecraftSession extends EventEmitter {
     this._windowEventsBound = null;
     this._cachedInvSnap = null;
     this._cachedWinSnap = null;
+    this._lastOnlineSafeHudRef = null;
+    this._lastOnlineSafeHudKey = null;
+    this._lastOnlineSafeHudText = null;
     this.bot = null;
     this.connectedAt = null;
+    this.connectedAtIso = null;
   }
 
   onEnd(bot, generation) {
@@ -1474,6 +1500,7 @@ class MinecraftSession extends EventEmitter {
     this.proxy = null;
     this.proxyConfigError = null;
     this.connectedAt = null;
+    this.connectedAtIso = null;
     this.auth.setPassword('');
     this.reconnectAttempts = 0;
     this.reconnectCount = 0;
@@ -2251,6 +2278,7 @@ class MinecraftSession extends EventEmitter {
     }
     this.bot = null;
     this.connectedAt = null;
+    this.connectedAtIso = null;
     this.setState('maintenance', 'fixed_maintenance_window');
     this.emit('event', { type: 'maintenance_window', message: 'Scheduled stop 04:30–05:30 Vietnam time (UTC+7).' });
   }
@@ -2317,11 +2345,17 @@ class MinecraftSession extends EventEmitter {
     const invSnapshot = this.getInventorySnapshot(this.bot);
     const winSnapshot = this.getWindowSnapshot(this.bot);
     const monitorSnap = this.monitor.snapshot({ skipInventory: true });
+    const currentHost = this._getCurrentHost();
+    const connectedAtIso = this.connectedAt
+      ? (this.connectedAtIso && this._connectedAtCachedVal === this.connectedAt
+          ? this.connectedAtIso
+          : (this._connectedAtCachedVal = this.connectedAt, this.connectedAtIso = new Date(this.connectedAt).toISOString()))
+      : null;
     return {
       workerId: this.config.workerId, transport: this.config.transport, state: this.state,
       manuallyStopped: Boolean(this.manualStop),
-      serverHost: this._getCurrentHost(),
-      server: this._getCurrentHost(),
+      serverHost: currentHost,
+      server: currentHost,
       locationKind: this.lastLocationKind,
       locationState: this.lastLocationKind,
       afkMode: this.afkMode, proxyEnabled: Boolean(this.proxy),
@@ -2330,7 +2364,7 @@ class MinecraftSession extends EventEmitter {
       username: this.username || '', credentialsConfigured: this.hasCredentials(),
       connected: Boolean(this.bot && this.bot.player), reconnectAttempts: this.reconnectAttempts,
       reconnectCount: this.reconnectCount,
-      connectedAt: this.connectedAt ? new Date(this.connectedAt).toISOString() : null,
+      connectedAt: connectedAtIso,
       uptimeSeconds: this.connectedAt ? Math.max(0, Math.floor((Date.now() - this.connectedAt) / 1000)) : 0,
       maintenanceWindow: this.maintenanceWindow,
       maintenanceTimeZone: TIME_ZONE,
