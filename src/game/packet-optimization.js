@@ -315,6 +315,7 @@ function attachBinaryDeserializerFilter(client, bot, options = {}) {
       if (chunk.length > pOffset + 1 && chunk[chunk.length - 1] === 1 && isOnlineAuthed()) {
         const pktLen = chunk.length - baseOffset;
         if (
+          pktLen <= 2048 &&
           lastSafeHudBuf &&
           pktLen === lastSafeHudBuf.length &&
           chunk.compare(lastSafeHudBuf, 0, lastSafeHudBuf.length, baseOffset, chunk.length) === 0
@@ -322,7 +323,9 @@ function attachBinaryDeserializerFilter(client, bot, options = {}) {
           return true;
         }
         if (isSafeOnlineHudStringChunk(chunk, pOffset, true)) {
-          lastSafeHudBuf = Buffer.from(chunk.subarray(baseOffset));
+          if (pktLen <= 2048) {
+            lastSafeHudBuf = Buffer.from(chunk.subarray(baseOffset));
+          }
           return true;
         }
       }
@@ -332,6 +335,7 @@ function attachBinaryDeserializerFilter(client, bot, options = {}) {
       if (chunk.length > pOffset && isOnlineAuthed()) {
         const pktLen = chunk.length - baseOffset;
         if (
+          pktLen <= 2048 &&
           lastSafeHudBuf &&
           pktLen === lastSafeHudBuf.length &&
           chunk.compare(lastSafeHudBuf, 0, lastSafeHudBuf.length, baseOffset, chunk.length) === 0
@@ -339,7 +343,9 @@ function attachBinaryDeserializerFilter(client, bot, options = {}) {
           return true;
         }
         if (isSafeOnlineHudStringChunk(chunk, pOffset, false)) {
-          lastSafeHudBuf = Buffer.from(chunk.subarray(baseOffset));
+          if (pktLen <= 2048) {
+            lastSafeHudBuf = Buffer.from(chunk.subarray(baseOffset));
+          }
           return true;
         }
       }

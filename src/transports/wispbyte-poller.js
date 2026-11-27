@@ -3,6 +3,9 @@
 const { ManagerUrlPool, shouldFailoverResponse, isConfirmedWorkerAuthError } = require('./manager-urls');
 const { resolveWorkerFetch } = require('./http-client');
 
+const MAX_EXECUTED_COMMANDS = 128;
+const EXECUTED_COMMAND_TTL_MS = 10 * 60 * 1000;
+
 function cancellableSleep(ms, signal) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve();
@@ -41,6 +44,7 @@ class WispbytePoller {
     this.stopController = new AbortController();
     this.pendingResults = [];
     this.maxPendingResults = 100;
+    this.executedCommands = new Map();
     this.resultFlushPromise = null;
     this._unchangedLightPollCount = 0;
     this._lastTelemetryPollSentAt = 0;
@@ -99,15 +103,73 @@ class WispbytePoller {
     return delayMs;
   }
 
+  _getCachedCommandResult(commandId, now = Date.now()) {
+    const key = commandId !== undefined && commandId !== null ? String(commandId).trim() : '';
+    if (!key) return null;
+    while (this.executedCommands.size > 0) {
+      const oldestKey = this.executedCommands.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldestEntry = this.executedCommands.get(oldestKey);
+      if (oldestEntry && oldestEntry.expiresAt > now) break;
+      this.executedCommands.delete(oldestKey);
+    }
+    const cached = this.executedCommands.get(key);
+    if (!cached) return null;
+    if (!(cached.expiresAt > now)) {
+      this.executedCommands.delete(key);
+      return null;
+    }
+    return cached.payload;
+  }
+
+  _rememberExecutedCommand(commandId, resultPayload, now = Date.now()) {
+    const key = commandId !== undefined && commandId !== null ? String(commandId).trim() : '';
+    if (!key || !resultPayload) return;
+    if (this.executedCommands.has(key)) {
+      this.executedCommands.delete(key);
+    }
+    while (this.executedCommands.size > 0) {
+      const oldestKey = this.executedCommands.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldestEntry = this.executedCommands.get(oldestKey);
+      if (this.executedCommands.size < MAX_EXECUTED_COMMANDS && oldestEntry && oldestEntry.expiresAt > now) {
+        break;
+      }
+      this.executedCommands.delete(oldestKey);
+    }
+    this.executedCommands.set(key, {
+      payload: resultPayload,
+      expiresAt: now + EXECUTED_COMMAND_TTL_MS
+    });
+  }
+
   enqueueResult(resultPayload) {
+    const cmdId = resultPayload && resultPayload.commandId !== undefined && resultPayload.commandId !== null
+      ? String(resultPayload.commandId).trim()
+      : '';
+    if (cmdId) {
+      for (let i = 0; i < this.pendingResults.length; i++) {
+        const existing = this.pendingResults[i];
+        const existingId = existing?.payload?.commandId !== undefined && existing?.payload?.commandId !== null
+          ? String(existing.payload.commandId).trim()
+          : '';
+        if (existingId === cmdId) {
+          existing.payload = resultPayload;
+          existing.nextRetryAt = 0;
+          return existing;
+        }
+      }
+    }
     if (this.pendingResults.length >= this.maxPendingResults) {
       this.pendingResults.shift(); // Drop oldest to prevent unbounded growth
     }
-    this.pendingResults.push({
+    const entry = {
       payload: resultPayload,
       attempts: 0,
       nextRetryAt: 0
-    });
+    };
+    this.pendingResults.push(entry);
+    return entry;
   }
 
   async flushPendingResults() {
@@ -196,6 +258,7 @@ class WispbytePoller {
       'x-manager-bot-id': String(this.config.workerId),
       ...(urlsSig ? { 'x-manager-urls-sig': urlsSig } : {})
     };
+    const bodyJson = JSON.stringify(payload);
     let lastError = null;
     for (let i = 0; i < candidates.length; i += 1) {
       const baseUrl = candidates[i];
@@ -211,7 +274,7 @@ class WispbytePoller {
         const response = await this.fetch(url, {
           method: 'POST',
           headers,
-          body: JSON.stringify(payload),
+          body: bodyJson,
           signal: combinedSignal,
           connectTimeoutMs
         });
@@ -315,28 +378,47 @@ class WispbytePoller {
         }
         if (response.command?.action) {
           const command = response.command;
-          let result;
-          if (command.expiresAt && Date.parse(command.expiresAt) <= Date.now()) {
-            result = { ok: false, error: 'command_expired' };
+          const cmdId = command.commandId !== undefined && command.commandId !== null
+            ? String(command.commandId).trim()
+            : '';
+          const cachedPayload = cmdId ? this._getCachedCommandResult(cmdId) : null;
+          let resultPayload;
+          if (cachedPayload) {
+            resultPayload = cachedPayload;
+            this.logger?.info?.('wispbyte_command_deduplicated', {
+              commandId: cmdId,
+              action: command.action
+            });
           } else {
-            const rawPayload = (command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload))
-              ? { ...command.payload }
-              : {};
-            delete rawPayload.timeoutMs;
-            delete rawPayload.execTimeoutMs;
-            delete rawPayload.queueTimeoutMs;
-            try { result = await this.runtime.execute(command.action, rawPayload, { signal: this.stopController.signal }); }
-            catch (error) { result = { ok: false, error: error.message, code: error.code || null, status: error.status || null }; }
+            let result;
+            if (command.expiresAt && Date.parse(command.expiresAt) <= Date.now()) {
+              result = { ok: false, error: 'command_expired' };
+            } else {
+              const rawPayload = (command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload))
+                ? { ...command.payload }
+                : {};
+              delete rawPayload.timeoutMs;
+              delete rawPayload.execTimeoutMs;
+              delete rawPayload.queueTimeoutMs;
+              try { result = await this.runtime.execute(command.action, rawPayload, { signal: this.stopController.signal }); }
+              catch (error) { result = { ok: false, error: error.message, code: error.code || null, status: error.status || null }; }
+            }
+            resultPayload = {
+              commandId: command.commandId,
+              action: command.action,
+              result,
+              completedAt: new Date().toISOString()
+            };
+            if (cmdId) {
+              this._rememberExecutedCommand(cmdId, resultPayload);
+            }
           }
-          const resultPayload = {
-            commandId: command.commandId,
-            action: command.action,
-            result,
-            completedAt: new Date().toISOString()
-          };
           let authDelayMs = 0;
           try {
             await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, resultPayload, { timeoutMs: 12000, connectTimeoutMs: 6000 });
+            if (cmdId && this.pendingResults.length) {
+              this.pendingResults = this.pendingResults.filter((item) => String(item?.payload?.commandId ?? '').trim() !== cmdId);
+            }
           } catch (err) {
             if (err.isWorkerAuthError === true || (err.status === 401 && err.isWorkerAuthError !== false)) {
               authDelayMs = await this._handleAuthFailure(err.status);

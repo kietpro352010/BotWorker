@@ -4,11 +4,6 @@ const http = require('node:http');
 const https = require('node:https');
 const zlib = require('node:zlib');
 const crypto = require('node:crypto');
-const { promisify } = require('node:util');
-
-const gunzipAsync = promisify(zlib.gunzip);
-const inflateAsync = promisify(zlib.inflate);
-const brotliDecompressAsync = promisify(zlib.brotliDecompress);
 
 const NATIVE_GLOBAL_FETCH = typeof globalThis.fetch === 'function' ? globalThis.fetch : null;
 const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -85,14 +80,19 @@ function normalizeRequestHeaders(headers = {}, bodyBuffer = null) {
   return normalized;
 }
 
-async function decompressBody(buffer, contentEncoding) {
-  if (!buffer || buffer.length === 0) return buffer;
+function createDecompressorStream(contentEncoding) {
   const enc = String(contentEncoding || '').trim().toLowerCase();
-  if (!enc || enc === 'identity') return buffer;
-  if (enc.includes('br')) return brotliDecompressAsync(buffer);
-  if (enc.includes('gzip')) return gunzipAsync(buffer);
-  if (enc.includes('deflate')) return inflateAsync(buffer);
-  return buffer;
+  if (!enc || enc === 'identity') return null;
+  if (enc.includes('br')) return zlib.createBrotliDecompress();
+  if (enc.includes('gzip')) return zlib.createGunzip();
+  if (enc.includes('deflate')) return zlib.createInflate();
+  return null;
+}
+
+function isCompressedEncoding(contentEncoding) {
+  const enc = String(contentEncoding || '').trim().toLowerCase();
+  if (!enc || enc === 'identity') return false;
+  return enc.includes('br') || enc.includes('gzip') || enc.includes('deflate');
 }
 
 function createAbortError(signal) {
@@ -180,7 +180,9 @@ function workerFetch(urlStr, options = {}) {
     };
 
     req.on('socket', (socket) => {
-      if (!socket || !socket.connecting) return;
+      if (!socket) return;
+      try { socket.setNoDelay?.(true); } catch (_) {}
+      if (!socket.connecting) return;
       attachedSocket = socket;
       connectTimer = setTimeout(() => {
         const err = new Error(`TCP/TLS connect timeout after ${connectTimeoutMs}ms`);
@@ -191,6 +193,13 @@ function workerFetch(urlStr, options = {}) {
       socket.once(isHttps ? 'secureConnect' : 'connect', clearConnectTimer);
       socket.once('error', clearConnectTimer);
       socket.once('close', clearConnectTimer);
+    });
+
+    req.once('timeout', () => {
+      const err = new Error('HTTP request socket idle timeout');
+      err.code = 'ETIMEDOUT';
+      clearConnectTimer();
+      req.destroy(err);
     });
 
     req.once('error', (err) => {
@@ -210,43 +219,105 @@ function workerFetch(urlStr, options = {}) {
       }
       settled = true;
 
+      const contentEncoding = res.headers['content-encoding'];
+      const needsDecompress = isCompressedEncoding(contentEncoding);
       let bodyConsumed = false;
       let bodyCancelled = false;
-      let textPromise = null;
+      let bodyPromise = null;
+      let decoder = null;
 
-      const readRawBuffer = () => {
-        if (textPromise) return textPromise;
-        textPromise = new Promise((resolveBody, rejectBody) => {
+      const destroyDecoder = () => {
+        if (!decoder) return;
+        const d = decoder;
+        decoder = null;
+        try {
+          d.removeAllListeners('data');
+          d.removeAllListeners('end');
+          d.removeAllListeners('drain');
+          if (d.listenerCount('error') === 0) d.on('error', () => {});
+        } catch (_) {}
+        try { d.destroy(); } catch (_) {}
+        try { d.close?.(); } catch (_) {}
+      };
+
+      const readDecodedBuffer = () => {
+        if (bodyPromise) return bodyPromise;
+        bodyPromise = new Promise((resolveBody, rejectBody) => {
           if (bodyCancelled || res.destroyed) {
             detachAbort();
+            destroyDecoder();
             return resolveBody(Buffer.alloc(0));
           }
           if (signal?.aborted) {
             detachAbort();
+            destroyDecoder();
             res.destroy();
             return rejectBody(createAbortError(signal));
           }
           const chunks = [];
           let totalBytes = 0;
-          let truncated = false;
+          let wireBytes = 0;
+          let settledBody = false;
 
           const cleanupBodyListeners = () => {
             detachAbort();
             if (signal) signal.removeEventListener('abort', onBodyAbort);
-            res.removeListener('data', onData);
-            res.removeListener('end', onEnd);
-            res.removeListener('error', onErr);
+            res.removeListener('data', onResData);
+            res.removeListener('end', onResEnd);
+            res.removeListener('error', onStreamErr);
             res.removeListener('aborted', onResAborted);
+            res.removeListener('timeout', onResTimeout);
           };
 
           const onBodyAbort = () => {
+            if (settledBody) return;
+            settledBody = true;
             cleanupBodyListeners();
+            destroyDecoder();
             res.destroy();
             rejectBody(createAbortError(signal));
           };
 
-          const onData = (chunk) => {
-            if (truncated) return;
+          const onResTimeout = () => {
+            if (settledBody) return;
+            settledBody = true;
+            cleanupBodyListeners();
+            destroyDecoder();
+            const err = new Error('Response stream idle timeout');
+            err.code = 'ETIMEDOUT';
+            res.destroy(err);
+            rejectBody(err);
+          };
+
+          const onStreamErr = (err) => {
+            if (settledBody) return;
+            settledBody = true;
+            cleanupBodyListeners();
+            destroyDecoder();
+            if (!res.destroyed) res.destroy();
+            rejectBody(err);
+          };
+
+          const onResAborted = () => {
+            if (settledBody) return;
+            settledBody = true;
+            cleanupBodyListeners();
+            destroyDecoder();
+            if (signal?.aborted) rejectBody(createAbortError(signal));
+            else rejectBody(new Error('Response stream aborted'));
+          };
+
+          const finishBody = () => {
+            if (settledBody) return;
+            settledBody = true;
+            bodyConsumed = true;
+            cleanupBodyListeners();
+            destroyDecoder();
+            resolveBody(totalBytes > 0 ? Buffer.concat(chunks, totalBytes) : Buffer.alloc(0));
+          };
+
+          const pushDecodedChunk = (chunk) => {
+            if (settledBody || !chunk || chunk.length === 0) return;
             const remaining = maxBytes - totalBytes;
             if (remaining <= 0 || chunk.length > remaining) {
               if (truncateOnMaxBytes) {
@@ -254,14 +325,17 @@ function workerFetch(urlStr, options = {}) {
                   chunks.push(chunk.subarray(0, remaining));
                   totalBytes += remaining;
                 }
-                truncated = true;
-                cleanupBodyListeners();
+                settledBody = true;
                 bodyConsumed = true;
+                cleanupBodyListeners();
+                destroyDecoder();
                 res.destroy();
-                resolveBody(Buffer.concat(chunks, totalBytes));
+                resolveBody(totalBytes > 0 ? Buffer.concat(chunks, totalBytes) : Buffer.alloc(0));
                 return;
               }
+              settledBody = true;
               cleanupBodyListeners();
+              destroyDecoder();
               const err = new Error(`Response body exceeded maxBytes limit (${maxBytes})`);
               err.code = 'ERR_RESPONSE_TOO_LARGE';
               res.destroy(err);
@@ -272,43 +346,69 @@ function workerFetch(urlStr, options = {}) {
             totalBytes += chunk.length;
           };
 
-          const onEnd = () => {
-            cleanupBodyListeners();
-            bodyConsumed = true;
-            resolveBody(Buffer.concat(chunks, totalBytes));
+          const onResData = (rawChunk) => {
+            if (settledBody || !rawChunk || rawChunk.length === 0) return;
+            wireBytes += rawChunk.length;
+            if (!truncateOnMaxBytes && wireBytes > maxBytes) {
+              settledBody = true;
+              cleanupBodyListeners();
+              destroyDecoder();
+              const err = new Error(`Response body exceeded maxBytes limit (${maxBytes})`);
+              err.code = 'ERR_RESPONSE_TOO_LARGE';
+              res.destroy(err);
+              rejectBody(err);
+              return;
+            }
+            if (!needsDecompress) {
+              pushDecodedChunk(rawChunk);
+              return;
+            }
+            if (!decoder) {
+              decoder = createDecompressorStream(contentEncoding);
+              if (!decoder) {
+                pushDecodedChunk(rawChunk);
+                return;
+              }
+              decoder.on('data', pushDecodedChunk);
+              decoder.once('end', finishBody);
+              decoder.once('error', onStreamErr);
+            }
+            const canContinue = decoder.write(rawChunk);
+            if (!canContinue && !settledBody && !res.destroyed) {
+              res.pause();
+              decoder.once('drain', () => {
+                if (!settledBody && !res.destroyed) res.resume();
+              });
+            }
           };
 
-          const onErr = (err) => {
-            cleanupBodyListeners();
-            rejectBody(err);
-          };
-
-          const onResAborted = () => {
-            cleanupBodyListeners();
-            if (signal?.aborted) rejectBody(createAbortError(signal));
-            else rejectBody(new Error('Response stream aborted'));
+          const onResEnd = () => {
+            if (settledBody) return;
+            if (decoder) {
+              decoder.end();
+            } else {
+              finishBody();
+            }
           };
 
           if (signal) signal.addEventListener('abort', onBodyAbort, { once: true });
-          res.on('data', onData);
-          res.once('end', onEnd);
-          res.once('error', onErr);
+          res.on('data', onResData);
+          res.once('end', onResEnd);
+          res.once('error', onStreamErr);
           res.once('aborted', onResAborted);
+          res.once('timeout', onResTimeout);
         });
-        return textPromise;
+        return bodyPromise;
       };
 
-      const contentEncoding = res.headers['content-encoding'];
       const status = Number(res.statusCode || 0);
       const responseObj = {
         ok: status >= 200 && status < 300,
         status,
         headers: createHeadersAdapter(res.headers),
         async text() {
-          const buf = await readRawBuffer();
-          if (!buf.length) return '';
-          const decoded = await decompressBody(buf, contentEncoding);
-          return decoded.toString('utf8');
+          const decoded = await readDecodedBuffer();
+          return decoded.length ? decoded.toString('utf8') : '';
         },
         async json() {
           const txt = await this.text();
@@ -319,6 +419,7 @@ function workerFetch(urlStr, options = {}) {
           async cancel() {
             bodyCancelled = true;
             detachAbort();
+            destroyDecoder();
             if (!bodyConsumed && !res.destroyed) {
               res.destroy();
             }

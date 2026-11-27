@@ -82,6 +82,19 @@ function formatMinutesToHhmm(totalMinutes) {
   return `${hh}:${mm}`;
 }
 
+function setBoundedMapFifo(map, key, value, maxEntries = 200) {
+  if (map.has(key)) {
+    map.delete(key);
+  } else {
+    while (map.size >= maxEntries) {
+      const oldestKey = map.keys().next().value;
+      if (oldestKey === undefined) break;
+      map.delete(oldestKey);
+    }
+  }
+  map.set(key, value);
+}
+
 const SERVER_RESTRICTION_HINT_REGEX = /mainten|b[aả]o\s*tr|ban|c[aấ]m|gi[oớ]i\s*h[aạ]n|\bip\b|[\u0300-\u036f]/i;
 
 function classifyServerText(message) {
@@ -826,22 +839,18 @@ class MinecraftSession extends EventEmitter {
         if (s.mode === 'fixed') {
           const times = Array.isArray(s.times) && s.times.length ? s.times : (s.time ? [s.time] : []);
           if (times.includes(hhmm) && this.autoChatLastFixedKey.get(schedId) !== dateMinKey) {
-            if (!this.autoChatLastFixedKey.has(schedId) && this.autoChatLastFixedKey.size >= 200) {
-              const oldestKey = this.autoChatLastFixedKey.keys().next().value;
-              this.autoChatLastFixedKey.delete(oldestKey);
-            }
-            this.autoChatLastFixedKey.set(schedId, dateMinKey);
+            setBoundedMapFifo(this.autoChatLastFixedKey, schedId, dateMinKey, 200);
             this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
           }
         } else {
           const baseIntervalMs = Math.max(10, Math.min(604800, Number(s.intervalSeconds) || 3600)) * 1000;
           if (!this.autoChatLastIntervalAt.has(schedId) || !this.autoChatNextIntervalAt.has(schedId)) {
             const anchorAt = this.autoChatLastIntervalAt.get(schedId) || this.connectedAt || now;
-            this.autoChatLastIntervalAt.set(schedId, anchorAt);
-            this.autoChatNextIntervalAt.set(schedId, anchorAt + applyCommandJitterMs(baseIntervalMs, 5000, 5000));
+            setBoundedMapFifo(this.autoChatLastIntervalAt, schedId, anchorAt, 200);
+            setBoundedMapFifo(this.autoChatNextIntervalAt, schedId, anchorAt + applyCommandJitterMs(baseIntervalMs, 5000, 5000), 200);
           } else if (now >= this.autoChatNextIntervalAt.get(schedId)) {
-            this.autoChatLastIntervalAt.set(schedId, now);
-            this.autoChatNextIntervalAt.set(schedId, now + applyCommandJitterMs(baseIntervalMs, 5000, 5000));
+            setBoundedMapFifo(this.autoChatLastIntervalAt, schedId, now, 200);
+            setBoundedMapFifo(this.autoChatNextIntervalAt, schedId, now + applyCommandJitterMs(baseIntervalMs, 5000, 5000), 200);
             this.dispatchScheduledMessages(bot, generation, msgs, s.messageDelaySeconds);
           }
         }
@@ -897,10 +906,7 @@ class MinecraftSession extends EventEmitter {
       const effectiveMin = Math.max(0, Math.min(1439, baseMin + offsetMin));
       const effectiveHhmm = formatMinutesToHhmm(effectiveMin);
       cached = { effectiveHhmm, offsetMin };
-      if (this.botScheduleDailyJitter.size > 200) {
-        this.botScheduleDailyJitter.clear();
-      }
-      this.botScheduleDailyJitter.set(cacheKey, cached);
+      setBoundedMapFifo(this.botScheduleDailyJitter, cacheKey, cached, 200);
       this.logger?.info?.('bot_schedule_daily_jitter_assigned', {
         scheduleKey,
         baseTime: baseHhmm,
@@ -984,8 +990,7 @@ class MinecraftSession extends EventEmitter {
               if (effectiveHhmm !== hhmm) continue;
               const dayExecutionKey = `${dateStr}:${item.time}:${key}`;
               if (this.botScheduleLastFixedKey.get(key) !== dayExecutionKey) {
-                if (this.botScheduleLastFixedKey.size > 200) this.botScheduleLastFixedKey.clear();
-                this.botScheduleLastFixedKey.set(key, dayExecutionKey);
+                setBoundedMapFifo(this.botScheduleLastFixedKey, key, dayExecutionKey, 200);
                 this.executeScheduledBotAction(item.action, item.command);
               }
             }
@@ -1000,8 +1005,7 @@ class MinecraftSession extends EventEmitter {
           if (effectiveHhmm !== hhmm) continue;
           const dayExecutionKey = `${dateStr}:${s.time}:${key}`;
           if (this.botScheduleLastFixedKey.get(key) !== dayExecutionKey) {
-            if (this.botScheduleLastFixedKey.size > 200) this.botScheduleLastFixedKey.clear();
-            this.botScheduleLastFixedKey.set(key, dayExecutionKey);
+            setBoundedMapFifo(this.botScheduleLastFixedKey, key, dayExecutionKey, 200);
             this.executeScheduledBotAction(s.action, s.command || s.message);
           }
         }
@@ -1067,6 +1071,9 @@ class MinecraftSession extends EventEmitter {
         this.auth.markAuthenticated('kingmc_world');
         setPhysicsEnabled(bot, this.ecoMode === false, this.logger, 'kingmc_world');
         setAfkWorldChunkLock(bot, this.ecoMode !== false);
+        if (bot._kingmcAfkWorldLocked) {
+          this.pruneAfkPlayersIfNeeded(bot);
+        }
         if (this.state !== 'online') {
           const recoveredFromAfkDrop = this.wasAfkBeforeDisconnect;
           const attemptsTaken = Math.max(1, this.lastReconnectAttemptCount || 1);
@@ -2206,10 +2213,37 @@ class MinecraftSession extends EventEmitter {
 
   updateResourceMetrics(metrics = {}) {
     this.resourceMetrics = {
-      cpuPercent: Number.isFinite(metrics.cpuPercent) ? Math.max(0, Math.min(100, metrics.cpuPercent)) : 0,
-      rssMb: Number.isFinite(metrics.rssMb) ? Math.max(0, metrics.rssMb) : 0,
-      heapUsedMb: Number.isFinite(metrics.heapUsedMb) ? Math.max(0, metrics.heapUsedMb) : 0
+      cpuPercent: Number.isFinite(metrics.cpuPercent) ? Math.max(0, Math.min(100, Math.round(metrics.cpuPercent * 10) / 10)) : 0,
+      rssMb: Number.isFinite(metrics.rssMb) ? Math.max(0, Math.round(metrics.rssMb * 10) / 10) : 0,
+      heapUsedMb: Number.isFinite(metrics.heapUsedMb) ? Math.max(0, Math.round(metrics.heapUsedMb * 10) / 10) : 0
     };
+    if (this.bot?._kingmcAfkWorldLocked) {
+      this.pruneAfkPlayersIfNeeded(this.bot);
+    }
+  }
+
+  pruneAfkPlayersIfNeeded(bot = this.bot, maxPlayers = 8) {
+    if (!bot || !bot._kingmcAfkWorldLocked || !bot.players || typeof bot.players !== 'object') return 0;
+    const playerNames = Object.keys(bot.players);
+    if (playerNames.length <= maxPlayers) return 0;
+    const selfName = bot.username;
+    const selfPlayer = (selfName && bot.players[selfName]) ? bot.players[selfName] : bot.player;
+    const selfUuid = selfPlayer?.uuid || bot._client?.uuid || null;
+    let removed = 0;
+    for (let i = 0; i < playerNames.length; i++) {
+      const name = playerNames[i];
+      if (selfName && name === selfName) continue;
+      const playerObj = bot.players[name];
+      if (playerObj?.uuid && bot.uuidToUsername && (!selfUuid || playerObj.uuid !== selfUuid)) {
+        delete bot.uuidToUsername[playerObj.uuid];
+      }
+      delete bot.players[name];
+      removed += 1;
+    }
+    if (selfName && selfPlayer && !bot.players[selfName]) {
+      bot.players[selfName] = selfPlayer;
+    }
+    return removed;
   }
 
   sampleNetworkMetrics(now = Date.now()) {
@@ -2316,16 +2350,14 @@ class MinecraftSession extends EventEmitter {
     const sig = `${source}:${clean.toLowerCase()}`;
     const prevAt = this.recentChatSignatures.get(sig);
     if (prevAt && now - prevAt < 2500) return;
-    if (this.recentChatSignatures.size > 150) {
-      for (const [k, ts] of this.recentChatSignatures) {
-        if (now - ts >= 2500) this.recentChatSignatures.delete(k);
-      }
-      while (this.recentChatSignatures.size > 150) {
-        const first = this.recentChatSignatures.keys().next().value;
-        this.recentChatSignatures.delete(first);
-      }
+    while (this.recentChatSignatures.size > 0) {
+      const oldestKey = this.recentChatSignatures.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldestTs = this.recentChatSignatures.get(oldestKey);
+      if (now - oldestTs < 2500 && this.recentChatSignatures.size < 150) break;
+      this.recentChatSignatures.delete(oldestKey);
     }
-    this.recentChatSignatures.set(sig, now);
+    setBoundedMapFifo(this.recentChatSignatures, sig, now, 150);
 
     this.emit('event', { type: 'chat', message: clean, source });
   }

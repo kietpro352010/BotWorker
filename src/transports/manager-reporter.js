@@ -5,6 +5,16 @@ const { computeBotStateDigest } = require('../domain/worker-state');
 const { ManagerUrlPool, shouldFailoverResponse } = require('./manager-urls');
 const { resolveWorkerFetch } = require('./http-client');
 
+const COALESCEABLE_TYPES = new Set([
+  'connection_error',
+  'connecting',
+  'window_open',
+  'window_close',
+  'window_click'
+]);
+const EVENT_COALESCE_WINDOW_MS = 15000;
+const MAX_EVENT_REPEAT_COUNT = 1000;
+
 class ManagerReporter {
   constructor({ baseUrl, managerUrls = null, cacheFilePath = undefined, urlPool = null, workerId, secret = '', fetchImpl = undefined, logger, onSettingsChanged = null }) {
     this.cacheFilePath = cacheFilePath;
@@ -71,6 +81,7 @@ class ManagerReporter {
       'x-manager-bot-id': String(this.workerId),
       ...(urlsSig ? { 'x-manager-urls-sig': urlsSig } : {})
     };
+    const bodyJson = JSON.stringify(payload);
 
     for (let i = 0; i < candidates.length; i += 1) {
       const candidate = candidates[i];
@@ -83,7 +94,7 @@ class ManagerReporter {
         const response = await this.fetch(`${candidate}${path}`, {
           method: 'POST',
           headers,
-          body: JSON.stringify(payload),
+          body: bodyJson,
           signal: combinedSignal
         });
         const body = await response.json().catch(async () => {
@@ -351,6 +362,38 @@ class ManagerReporter {
       ? cleaned
       : { message: String(cleaned ?? '') };
     sanitized.occurredAt = sanitized.occurredAt || new Date().toISOString();
+    const incomingRepeat = sanitized.repeatCount !== undefined
+      ? Math.max(1, Math.min(MAX_EVENT_REPEAT_COUNT, Math.floor(Number(sanitized.repeatCount) || 1)))
+      : 1;
+    if (sanitized.repeatCount !== undefined) {
+      sanitized.repeatCount = incomingRepeat;
+    }
+
+    const evType = typeof sanitized.type === 'string' ? sanitized.type.trim() : '';
+    const evMsg = typeof sanitized.message === 'string' ? sanitized.message : '';
+    if (COALESCEABLE_TYPES.has(evType) && this.eventQueue.length > 0) {
+      const tailItem = this.eventQueue[this.eventQueue.length - 1];
+      const last = tailItem?.event;
+      if (last && last.type === evType && String(last.message || '') === evMsg) {
+        const prevMs = Date.parse(last.occurredAt || '');
+        const currMs = Date.parse(sanitized.occurredAt || '');
+        if (
+          Number.isFinite(prevMs) &&
+          Number.isFinite(currMs) &&
+          currMs >= prevMs - 1000 &&
+          (currMs - prevMs) <= EVENT_COALESCE_WINDOW_MS
+        ) {
+          last.firstOccurredAt = last.firstOccurredAt || last.occurredAt || sanitized.occurredAt;
+          last.occurredAt = sanitized.occurredAt;
+          last.repeatCount = Math.min(MAX_EVENT_REPEAT_COUNT, (Number(last.repeatCount) || 1) + incomingRepeat);
+          tailItem.coalescedDirty = true;
+          if (!this.stopping) {
+            this.scheduleFlush(0);
+          }
+          return;
+        }
+      }
+    }
 
     if (this.eventQueue.length >= 100) {
       this.eventQueue.shift(); // Bound queue to prevent memory leak
@@ -359,11 +402,12 @@ class ManagerReporter {
     this.eventQueue.push({
       event: sanitized,
       attempts: 0,
-      nextRetryAt: 0
+      nextRetryAt: 0,
+      coalescedDirty: false
     });
 
     if (!this.stopping) {
-      const isLowPriorityChat = sanitized.type === 'chat' || sanitized.type === 'message';
+      const isLowPriorityChat = evType === 'chat' || evType === 'message';
       this.scheduleFlush(isLowPriorityChat ? 250 : 0);
     }
   }
@@ -376,6 +420,10 @@ class ManagerReporter {
       void this.flushEventQueue();
     }, delayMs);
     this.eventFlushTimer.unref?.();
+  }
+
+  async flushEvents() {
+    return this.flushEventQueue();
   }
 
   async flushEventQueue() {
@@ -391,41 +439,82 @@ class ManagerReporter {
     return this.flushPromise;
   }
 
+  _mergeQueues(olderItems = [], newerItems = []) {
+    const merged = [];
+    const append = (item) => {
+      if (!item || !item.event) return;
+      const ev = item.event;
+      const evType = typeof ev.type === 'string' ? ev.type.trim() : '';
+      const evMsg = typeof ev.message === 'string' ? ev.message : '';
+      if (COALESCEABLE_TYPES.has(evType) && merged.length > 0) {
+        const tail = merged[merged.length - 1];
+        const prev = tail?.event;
+        if (prev && prev.type === evType && String(prev.message || '') === evMsg) {
+          const prevMs = Date.parse(prev.occurredAt || '');
+          const currMs = Date.parse(ev.occurredAt || '');
+          if (
+            Number.isFinite(prevMs) &&
+            Number.isFinite(currMs) &&
+            currMs >= prevMs - 1000 &&
+            (currMs - prevMs) <= EVENT_COALESCE_WINDOW_MS
+          ) {
+            prev.firstOccurredAt = prev.firstOccurredAt || prev.occurredAt || ev.firstOccurredAt || ev.occurredAt;
+            prev.occurredAt = ev.occurredAt || prev.occurredAt;
+            const addCount = Math.max(1, Math.min(MAX_EVENT_REPEAT_COUNT, Math.floor(Number(ev.repeatCount) || 1)));
+            prev.repeatCount = Math.min(MAX_EVENT_REPEAT_COUNT, (Number(prev.repeatCount) || 1) + addCount);
+            tail.coalescedDirty = true;
+            return;
+          }
+        }
+      }
+      merged.push(item);
+    };
+    for (let i = 0; i < olderItems.length; i++) append(olderItems[i]);
+    for (let i = 0; i < newerItems.length; i++) append(newerItems[i]);
+    return merged.length > 100 ? merged.slice(-100) : merged;
+  }
+
   async _flushEventQueue() {
     const batch = this.eventQueue;
     this.eventQueue = [];
     const now = Date.now();
-    const remaining = [];
+    const notReady = [];
     const ready = [];
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/events`;
 
     for (let i = 0; i < batch.length; i++) {
       const item = batch[i];
       if (this.stopping) {
-        remaining.push(...batch.slice(i));
-        break;
+        this.eventQueue = this._mergeQueues([...notReady, ...ready, ...batch.slice(i)], this.eventQueue);
+        return;
       }
       if (now < item.nextRetryAt) {
-        remaining.push(item);
+        notReady.push(item);
       } else {
         ready.push(item);
       }
+    }
+
+    if (!ready.length) {
+      this.eventQueue = this._mergeQueues(notReady, this.eventQueue);
+      return;
     }
 
     // Fast path: coalesce multiple ready events into one HTTP POST when >= 2 events are ready
     if (ready.length >= 2 && !this.stopping && this._batchEventsUnsupported !== true) {
       try {
         await this.post(path, { events: ready.map((item) => item.event) });
-        this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+        for (let r = 0; r < ready.length; r++) ready[r].coalescedDirty = false;
+        this.eventQueue = this._mergeQueues(notReady, this.eventQueue);
         return;
       } catch (batchErr) {
         // If server/mock rejects batch envelope with 400/422, mark unsupported and fall through to per-item delivery
         if (batchErr?.status === 400 || batchErr?.status === 422) {
           this._batchEventsUnsupported = true;
         } else {
-          // Transient failure: apply standard retry/permanent-4xx handling to ready items
+          // Transient failure: apply standard retry/permanent-4xx handling preserving chronological order
           if (this.stopping) {
-            this.eventQueue = [...ready, ...remaining, ...this.eventQueue].slice(-100);
+            this.eventQueue = this._mergeQueues(batch, this.eventQueue);
             return;
           }
           if (batchErr.status && batchErr.status >= 400 && batchErr.status < 500 && batchErr.status !== 429) {
@@ -434,12 +523,14 @@ class ManagerReporter {
               status: batchErr.status,
               error: batchErr.message
             });
-            this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+            this.eventQueue = this._mergeQueues(notReady, this.eventQueue);
             return;
           }
+          const exhausted = new Set();
           for (const item of ready) {
             item.attempts += 1;
             if (item.attempts >= 10) {
+              exhausted.add(item);
               this.logger?.warn?.('manager_event_delivery_exhausted', {
                 workerId: this.workerId,
                 attempts: item.attempts,
@@ -449,35 +540,37 @@ class ManagerReporter {
             }
             const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 5)));
             item.nextRetryAt = Date.now() + backoffMs;
-            remaining.push(item);
           }
           this.logger?.warn?.('manager_event_delivery_retry', {
             workerId: this.workerId,
             batchSize: ready.length,
             error: batchErr.message
           });
-          this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+          const surviving = exhausted.size ? batch.filter((it) => !exhausted.has(it)) : batch;
+          this.eventQueue = this._mergeQueues(surviving, this.eventQueue);
           return;
         }
       }
     }
 
+    const settledItems = new Set();
     for (let i = 0; i < ready.length; i++) {
       const item = ready[i];
       if (this.stopping) {
-        remaining.push(...ready.slice(i));
         break;
       }
 
       try {
         await this.post(path, item.event);
+        item.coalescedDirty = false;
+        settledItems.add(item);
       } catch (err) {
         if (this.stopping) {
-          remaining.push(...ready.slice(i));
           break;
         }
         // Discard permanent 4xx (except 429) errors without retrying forever
         if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
+          settledItems.add(item);
           this.logger?.warn?.('manager_event_delivery_rejected_permanent', {
             workerId: this.workerId,
             status: err.status,
@@ -487,6 +580,7 @@ class ManagerReporter {
         }
         item.attempts += 1;
         if (item.attempts >= 10) {
+          settledItems.add(item);
           this.logger?.warn?.('manager_event_delivery_exhausted', {
             workerId: this.workerId,
             attempts: item.attempts,
@@ -496,7 +590,6 @@ class ManagerReporter {
         }
         const backoffMs = Math.min(60000, 1000 * Math.pow(2, Math.min(item.attempts, 5)));
         item.nextRetryAt = Date.now() + backoffMs;
-        remaining.push(item);
         this.logger?.warn?.('manager_event_delivery_retry', {
           workerId: this.workerId,
           attempts: item.attempts,
@@ -506,7 +599,8 @@ class ManagerReporter {
       }
     }
 
-    this.eventQueue = [...remaining, ...this.eventQueue].slice(-100);
+    const unsentInOrder = settledItems.size ? batch.filter((it) => !settledItems.has(it)) : batch;
+    this.eventQueue = this._mergeQueues(unsentInOrder, this.eventQueue);
   }
 
   async sendEvent(event) {
@@ -521,24 +615,33 @@ class ManagerReporter {
   }
 
   async drain({ finalStatus = null, timeoutMs = 2000 } = {}) {
-    const hasEvents = this.eventQueue.length > 0;
-    if (!hasEvents && !finalStatus) {
+    const hadEvents = this.eventQueue.length > 0 || Boolean(this.flushPromise);
+    if (!hadEvents && !finalStatus) {
       return { flushedEvents: false, sentFinalStatus: false };
     }
     if (this.eventFlushTimer) {
       clearTimeout(this.eventFlushTimer);
       this.eventFlushTimer = null;
     }
-    for (const item of this.eventQueue) {
-      if (item && typeof item === 'object') item.nextRetryAt = 0;
-    }
     const drainController = new AbortController();
     const timer = setTimeout(() => drainController.abort(), Math.max(100, timeoutMs));
     timer.unref?.();
     try {
+      const drainEventsTask = async () => {
+        if (!hadEvents || this.stopping) return;
+        if (this.flushPromise) {
+          await this.flushPromise.catch(() => {});
+        }
+        if (!this.stopping && !drainController.signal.aborted && this.eventQueue.length > 0) {
+          for (const item of this.eventQueue) {
+            if (item && typeof item === 'object') item.nextRetryAt = 0;
+          }
+          await this.flushEventQueue();
+        }
+      };
       const tasks = [];
-      if (hasEvents && !this.stopping) {
-        tasks.push(this.flushEventQueue());
+      if (hadEvents && !this.stopping) {
+        tasks.push(drainEventsTask());
       }
       if (finalStatus && !this.stopping) {
         tasks.push(this.sendHeartbeat(finalStatus, { signal: drainController.signal }));
@@ -549,7 +652,7 @@ class ManagerReporter {
           drainController.signal.addEventListener('abort', resolve, { once: true });
         })
       ]);
-      return { flushedEvents: hasEvents && this.eventQueue.length === 0, sentFinalStatus: Boolean(finalStatus) };
+      return { flushedEvents: hadEvents && this.eventQueue.length === 0 && !this.flushPromise, sentFinalStatus: Boolean(finalStatus) };
     } catch (_) {
       return { flushedEvents: false, sentFinalStatus: false };
     } finally {
@@ -568,4 +671,6 @@ class ManagerReporter {
   }
 }
 
+ManagerReporter.COALESCEABLE_TYPES = COALESCEABLE_TYPES;
+ManagerReporter.EVENT_COALESCE_WINDOW_MS = EVENT_COALESCE_WINDOW_MS;
 module.exports = ManagerReporter;

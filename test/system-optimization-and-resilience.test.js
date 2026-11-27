@@ -1540,6 +1540,350 @@ async function testHumanizedEventsAndNetworkTelemetry() {
   console.log('✅ 16. Humanized Vietnamese lifecycle/GUI events & netDownKb/netUpKb verified.');
 }
 
+async function testWave6SourceCoalescingDigestBucketAndStreamingZlibGuard() {
+  console.log('17. Testing Wave-6 Source-Side 15s Event Coalescing (1..1000), 50ms Ping / <1MB RAM Digest Filter & Streaming Zlib Zip-Bomb Guard...');
+  const http = require('node:http');
+  const zlib = require('node:zlib');
+  const { computeBotStateDigest } = require('../src/domain/worker-state');
+  const { workerFetch, closeWorkerHttpAgents } = require('../src/transports/http-client');
+
+  // 17a. ManagerReporter.enqueueEvent 15s window coalescing + repeatCount clamp (1..1000) + firstOccurredAt preservation
+  const flushedBatches = [];
+  const reporter = new ManagerReporter({
+    baseUrl: 'https://mgr.example.com',
+    workerId: 'bot-17',
+    secret: 's'.repeat(32),
+    fetchImpl: async (_url, init) => {
+      flushedBatches.push(JSON.parse(init.body));
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
+    logger: createSilentLogger()
+  });
+  // Pause auto-timer so queue coalescing is tested deterministically before flushEvents()
+  reporter.scheduleFlush = () => {};
+
+  const t0 = Date.parse('2026-11-27T16:00:00.000Z');
+  const t0Iso = new Date(t0).toISOString();
+  const t5sIso = new Date(t0 + 5000).toISOString();
+  const t14sIso = new Date(t0 + 14000).toISOString();
+  const t31sIso = new Date(t0 + 31000).toISOString(); // > 15s after t14s -> new queue entry
+
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ECONNRESET lobby', occurredAt: t0Iso });
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ECONNRESET lobby', occurredAt: t5sIso });
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ECONNRESET lobby', occurredAt: t14sIso, repeatCount: 9999 }); // Clamped to 1000
+
+  assert.strictEqual(reporter.eventQueue.length, 1, 'Identical coalesceable events within <=15s must merge in-place');
+  assert.strictEqual(reporter.eventQueue[0].event.firstOccurredAt, t0Iso, 'Must preserve original firstOccurredAt');
+  assert.strictEqual(reporter.eventQueue[0].event.occurredAt, t14sIso, 'Must advance occurredAt to latest event');
+  assert.strictEqual(reporter.eventQueue[0].event.repeatCount, 1000, 'repeatCount must clamp safely within 1..1000');
+  assert.strictEqual(reporter.eventQueue[0].coalescedDirty, true);
+
+  // Event > 15s outside window must start a fresh entry instead of merging
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ECONNRESET lobby', occurredAt: t31sIso });
+  assert.strictEqual(reporter.eventQueue.length, 2, 'Event arriving >15s later must create a separate queue item');
+
+  // Non-coalesceable type ('chat') never merges even at identical timestamp
+  reporter.enqueueEvent({ type: 'chat', message: 'Xin chao', occurredAt: t31sIso });
+  reporter.enqueueEvent({ type: 'chat', message: 'Xin chao', occurredAt: t31sIso });
+  assert.strictEqual(reporter.eventQueue.length, 4, 'Non-coalesceable chat events must remain distinct');
+
+  await reporter.flushEvents();
+  assert.strictEqual(reporter.eventQueue.length, 0);
+  assert.strictEqual(flushedBatches.length, 1);
+  assert.strictEqual(flushedBatches[0].events[0].repeatCount, 1000);
+  assert.strictEqual(flushedBatches[0].events[0].firstOccurredAt, t0Iso);
+  reporter.stop();
+
+  // 17b. computeBotStateDigest buckets ping into 50ms bands & ignores <1MB RAM/heap/CPU jitter
+  const baseSnap = {
+    state: 'afk',
+    health: 20,
+    food: 20,
+    totemCount: 4,
+    locationState: 'afk',
+    dimension: 'minecraft:overworld',
+    pingMs: 32, // Math.round(32/50)*50 === 50
+    username: 'BotEco17',
+    rssMb: 142.1,
+    heapUsedMb: 68.2,
+    cpuPercent: 2.1,
+    inventory: { revision: 3 }
+  };
+  const jitterSnap = {
+    ...baseSnap,
+    pingMs: 68, // Math.round(68/50)*50 === 50 (same 50ms bucket!)
+    rssMb: 142.9, // +0.8 MB jitter
+    heapUsedMb: 68.9, // +0.7 MB jitter
+    cpuPercent: 4.8
+  };
+  const shiftedPingSnap = {
+    ...baseSnap,
+    pingMs: 112 // Math.round(112/50)*50 === 100 (different bucket!)
+  };
+  assert.strictEqual(
+    computeBotStateDigest(baseSnap),
+    computeBotStateDigest(jitterSnap),
+    'Same 50ms ping bucket and <1MB RAM/heap jitter must NOT churn state digest'
+  );
+  assert.notStrictEqual(
+    computeBotStateDigest(baseSnap),
+    computeBotStateDigest(shiftedPingSnap),
+    'Crossing into a different 50ms ping bucket must update state digest'
+  );
+
+  // 17c. workerFetch streaming gzip/deflate decompression, TCP_NODELAY, maxBytes zip-bomb defense & decoder.destroy()
+  let gunzipDestroyedCount = 0;
+  const origGunzipDestroy = zlib.Gunzip.prototype.destroy;
+  zlib.Gunzip.prototype.destroy = function trackedGunzipDestroy(...dArgs) {
+    gunzipDestroyedCount += 1;
+    return origGunzipDestroy.apply(this, dArgs);
+  };
+
+  let serverNoDelayObserved = false;
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/gzip-ok') {
+      const body = zlib.gzipSync(Buffer.from(JSON.stringify({ ok: true, mode: 'gzip-stream', count: 42 })));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' });
+      res.end(body);
+      return;
+    }
+    if (req.url === '/deflate-ok') {
+      const body = zlib.deflateSync(Buffer.from(JSON.stringify({ ok: true, mode: 'deflate-stream' })));
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Encoding': 'deflate' });
+      res.end(body);
+      return;
+    }
+    if (req.url === '/zip-bomb') {
+      // ~160B wire payload that expands to 128KB plain zeros -> exceeds maxBytes: 4096!
+      const bomb = zlib.gzipSync(Buffer.alloc(128 * 1024, 'A'));
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Encoding': 'gzip' });
+      res.end(bomb);
+      return;
+    }
+    if (req.url === '/slow-gzip') {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Encoding': 'gzip' });
+      const fullGzip = zlib.gzipSync(Buffer.from('streaming-chunk-before-abort'.repeat(20)));
+      res.write(fullGzip.subarray(0, 12));
+      // Leave stream open until client aborts
+      req.on('close', () => { try { res.destroy(); } catch (_) {} });
+    }
+  });
+  srv.on('connection', (sock) => {
+    // Track client connection establishment
+    if (sock) serverNoDelayObserved = true;
+  });
+
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = srv.address().port;
+
+    const gzipRes = await workerFetch(`http://127.0.0.1:${port}/gzip-ok`);
+    assert.strictEqual(gzipRes.ok, true);
+    const gzipJson = await gzipRes.json();
+    assert.strictEqual(gzipJson.mode, 'gzip-stream');
+    assert.strictEqual(gzipJson.count, 42);
+    assert.strictEqual(serverNoDelayObserved, true);
+
+    const deflateRes = await workerFetch(`http://127.0.0.1:${port}/deflate-ok`);
+    const deflateJson = await deflateRes.json();
+    assert.strictEqual(deflateJson.mode, 'deflate-stream');
+
+    const destroyedBeforeBomb = gunzipDestroyedCount;
+    const bombRes = await workerFetch(`http://127.0.0.1:${port}/zip-bomb`, { maxBytes: 4096 });
+    await assert.rejects(
+      () => bombRes.text(),
+      (err) => err && err.code === 'ERR_RESPONSE_TOO_LARGE',
+      'Decoded gzip expansion past maxBytes must reject with ERR_RESPONSE_TOO_LARGE'
+    );
+    assert.ok(gunzipDestroyedCount > destroyedBeforeBomb, 'Gunzip decoder.destroy() must run on maxBytes overflow');
+
+    const destroyedBeforeAbort = gunzipDestroyedCount;
+    const ac = new AbortController();
+    const slowRes = await workerFetch(`http://127.0.0.1:${port}/slow-gzip`, { signal: ac.signal });
+    const textPromise = slowRes.text();
+    setTimeout(() => ac.abort(), 30);
+    await assert.rejects(() => textPromise, (err) => err && (err.name === 'AbortError' || /abort/i.test(err.message)));
+    assert.ok(gunzipDestroyedCount > destroyedBeforeAbort, 'Gunzip decoder.destroy() must run when response stream aborts');
+  } finally {
+    zlib.Gunzip.prototype.destroy = origGunzipDestroy;
+    closeWorkerHttpAgents();
+    srv.closeAllConnections?.();
+    await new Promise((resolve) => srv.close(resolve));
+  }
+
+  console.log('✅ 17. Wave-6 15s event coalescing, 50ms ping/<1MB RAM digest filter & streaming zlib maxBytes guard verified.');
+}
+
+async function testWave7CommandIdempotencyQueueMergeAndAfkPrune() {
+  console.log('18. Testing Wave-7 poller command idempotency, single-pass JSON failover, in-flight event queue merge & AFK player pruning...');
+
+  // 18a. WispbytePoller idempotency (skip duplicate runtime.execute for same commandId within 10m TTL, dedup pendingResults, FIFO cap 128)
+  let runtimeCalls = 0;
+  let pollTurn = 0;
+  const deliveredResults = [];
+  let poller = null;
+
+  poller = new WispbytePoller({
+    config: { workerId: '18', pollWaitMs: 1000, managerUrl: 'https://mgr.example.com', secret: 's'.repeat(32) },
+    runtime: {
+      status: () => ({ state: 'afk', online: true }),
+      execute: async (action, payload) => {
+        runtimeCalls += 1;
+        return { ok: true, action, echoed: payload?.message || '' };
+      }
+    },
+    reporter: {
+      prepareStatusPayload: (s) => ({ payload: s, digestUnchanged: false, positionMoved: false }),
+      recordStatusSent: () => {},
+      noteSettingsRevision: () => {},
+      lastSettingsRevision: 1
+    },
+    logger: createSilentLogger(),
+    fetchImpl: async (url, init) => {
+      const parsed = JSON.parse(init.body);
+      if (url.endsWith('/result')) {
+        deliveredResults.push(parsed);
+        if (deliveredResults.length >= 2) {
+          poller.stopping = true;
+          poller.stopController.abort();
+        }
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      pollTurn += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          command: { commandId: 'cmd-idem-wave7', action: 'chat', payload: { message: 'ping' } },
+          settingsRevision: 1
+        })
+      };
+    }
+  });
+
+  await poller.start();
+  assert.strictEqual(runtimeCalls, 1, 'Duplicate commandId must NOT re-execute runtime action');
+  assert.strictEqual(deliveredResults.length, 2, 'Cached result must be re-delivered cleanly on retry');
+  assert.strictEqual(deliveredResults[0].completedAt, deliveredResults[1].completedAt);
+  assert.strictEqual(pollTurn >= 2, true);
+
+  // Deduplicate pendingResults by commandId in-place + FIFO cap 128 in executedCommands
+  poller.enqueueResult({ commandId: 'dup-1', ok: true, rev: 1 });
+  poller.enqueueResult({ commandId: 'dup-1', ok: true, rev: 2 });
+  assert.strictEqual(poller.pendingResults.length, 1);
+  assert.strictEqual(poller.pendingResults[0].payload.rev, 2);
+
+  poller.executedCommands.clear();
+  for (let i = 0; i < 130; i += 1) {
+    poller._rememberExecutedCommand(`fifo-${i}`, { commandId: `fifo-${i}`, ok: true }, 1000000 + i);
+  }
+  assert.strictEqual(poller.executedCommands.size, 128);
+  assert.strictEqual(poller._getCachedCommandResult('fifo-0', 1000200), null);
+  assert.ok(poller._getCachedCommandResult('fifo-129', 1000200));
+
+  // 18b. Single-pass JSON.stringify across multi-URL failover + _mergeQueues / drain() coalescing preservation
+  const origStringify = JSON.stringify;
+  let trackedStringifyCalls = 0;
+  let flushResolve = null;
+  let flushGate = new Promise((r) => { flushResolve = r; });
+  let failPost = true;
+  let postAttempts = 0;
+  const drainedPayloads = [];
+
+  const reporter = new ManagerReporter({
+    baseUrl: 'https://mgr-1.example.com',
+    managerUrls: ['https://mgr-1.example.com', 'https://mgr-2.example.com', 'https://mgr-3.example.com'],
+    workerId: '18',
+    secret: 's'.repeat(32),
+    fetchImpl: async () => {
+      postAttempts += 1;
+      if (failPost) {
+        if (flushGate) await flushGate;
+        return { ok: false, status: 503, json: async () => ({ ok: false, error: 'unavailable' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ ok: true }) };
+    },
+    logger: createSilentLogger()
+  });
+  reporter.scheduleFlush = () => {};
+
+  const singleObj = { wave7FailoverMarker: true, n: 1 };
+  JSON.stringify = function countedStringify(val, ...rest) {
+    if (val === singleObj) trackedStringifyCalls += 1;
+    return origStringify.call(this, val, ...rest);
+  };
+  try {
+    flushGate = null;
+    await assert.rejects(() => reporter.post('/api/v1/workers/18/heartbeat', singleObj), /unavailable/);
+    assert.strictEqual(trackedStringifyCalls, 1, 'JSON.stringify must run only once across 3 failover URLs');
+    assert.strictEqual(postAttempts, 3);
+  } finally {
+    JSON.stringify = origStringify;
+  }
+
+  // Test in-flight _mergeQueues + drain() preserving repeatCount across 503 retry
+  reporter.stopping = false;
+  reporter.stopController = new AbortController();
+  reporter.fetch = async (_url, init) => {
+    if (failPost) {
+      await flushGate;
+      return { ok: false, status: 503, json: async () => ({ ok: false, error: 'temporary_503' }) };
+    }
+    drainedPayloads.push(JSON.parse(init.body));
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  flushGate = new Promise((r) => { flushResolve = r; });
+  const t0 = Date.parse('2026-11-27T17:00:00.000Z');
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ETIMEDOUT', occurredAt: new Date(t0).toISOString() });
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ETIMEDOUT', occurredAt: new Date(t0 + 2000).toISOString() });
+  const inFlight = reporter.flushEventQueue();
+  await new Promise((r) => setTimeout(r, 15));
+  reporter.enqueueEvent({ type: 'connection_error', message: 'ETIMEDOUT', occurredAt: new Date(t0 + 5000).toISOString() });
+  flushResolve();
+  await inFlight;
+  assert.strictEqual(reporter.eventQueue.length, 1);
+  assert.strictEqual(reporter.eventQueue[0].event.repeatCount, 3, 'In-flight coalesced repeatCount must merge cleanly with failed batch');
+  assert.strictEqual(reporter.eventQueue[0].event.firstOccurredAt, new Date(t0).toISOString());
+
+  failPost = false;
+  const drainRes = await reporter.drain({ timeoutMs: 2000 });
+  assert.strictEqual(drainRes.flushedEvents, true);
+  assert.strictEqual(drainedPayloads.length, 1);
+  assert.strictEqual(drainedPayloads[0].repeatCount, 3);
+  reporter.stop();
+
+  // 18c. MinecraftSession.pruneAfkPlayersIfNeeded keeps SelfBot & removes >8 stranger entries
+  const session = new MinecraftSession({
+    workerId: '18',
+    mc: { host: 'kingmc.vn', port: 25565, username: 'SelfBot', password: 'pw' }
+  }, createSilentLogger());
+  const fakePlayers = {
+    SelfBot: { username: 'SelfBot', uuid: 'uuid-self-0000' }
+  };
+  const fakeUuidMap = { 'uuid-self-0000': 'SelfBot' };
+  for (let i = 1; i <= 12; i += 1) {
+    const uname = `Stranger_${i}`;
+    const uid = `uuid-stranger-${i}`;
+    fakePlayers[uname] = { username: uname, uuid: uid };
+    fakeUuidMap[uid] = uname;
+  }
+  const fakeBot = {
+    username: 'SelfBot',
+    player: fakePlayers.SelfBot,
+    players: fakePlayers,
+    uuidToUsername: fakeUuidMap,
+    _kingmcAfkWorldLocked: true,
+    _client: { uuid: 'uuid-self-0000' }
+  };
+  const prunedCount = session.pruneAfkPlayersIfNeeded(fakeBot, 8);
+  assert.strictEqual(prunedCount, 12);
+  assert.deepStrictEqual(Object.keys(fakeBot.players), ['SelfBot']);
+  assert.strictEqual(fakeBot.uuidToUsername['uuid-self-0000'], 'SelfBot');
+
+  console.log('✅ 18. Wave-7 poller idempotency, single-pass JSON failover, in-flight event merge & AFK pruning verified.');
+}
+
 async function main() {
   console.log('--- [WORKER SYSTEM OPTIMIZATION & RESILIENCE TESTS] ---');
   await testManagerReporterDigestAndRollback();
@@ -1558,6 +1902,8 @@ async function main() {
   await testWave5bDeepAuditFixesAndDecompressorStreamBypass();
   await testWave5cKbotFeaturePreservationAudit();
   await testHumanizedEventsAndNetworkTelemetry();
+  await testWave6SourceCoalescingDigestBucketAndStreamingZlibGuard();
+  await testWave7CommandIdempotencyQueueMergeAndAfkPrune();
   console.log('\n🎉 ALL WORKER OPTIMIZATION & RESILIENCE TESTS PASSED 100%!');
 }
 

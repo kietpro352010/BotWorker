@@ -39,10 +39,12 @@ function computeBotStateDigest(status = {}) {
   const stateStr = String(status.state || status.status || 'unknown');
   const health = Math.round(Number(status.health) || 0);
   const food = Math.round(Number(status.food) || 0);
-  const totems = Number(status.totemCount || 0);
+  const totems = Math.round(Number(status.totemCount) || 0);
   const loc = String(status.locationState || status.locationKind || 'unknown');
   const dim = String(status.dimension || '');
-  const pingBucket = Math.round((Number(status.pingMs) || 0) / 25) * 25;
+  // Bucket ping into 50ms bands and exclude transient <1MB RAM/heap/CPU jitter so steady AFK polls never churn digest
+  const rawPing = Number(status.pingMs);
+  const pingBucket = Number.isFinite(rawPing) && rawPing > 0 ? Math.round(rawPing / 50) * 50 : 0;
   const err = String(status.lastError || status.lastKickReason || '');
   const restriction = String(status.restriction || '');
   const username = String(status.username || '');
@@ -90,7 +92,15 @@ class CircularLogBuffer {
 
   getSince(lastAckedLogSeq = 0) {
     if (this.size === 0 || lastAckedLogSeq >= this.logSeq) return [];
-    return this.getAll().filter((entry) => entry && entry.seq > lastAckedLogSeq);
+    const result = [];
+    const start = this.size < this.capacity ? 0 : this.head;
+    for (let i = 0; i < this.size; i++) {
+      const entry = this.buffer[(start + i) % this.capacity];
+      if (entry && entry.seq > lastAckedLogSeq) {
+        result.push(entry);
+      }
+    }
+    return result;
   }
 
   latestSeq() {
