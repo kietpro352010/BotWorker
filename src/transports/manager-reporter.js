@@ -3,14 +3,15 @@
 const { redactAuditValue } = require('../game/server-auth');
 const { computeBotStateDigest } = require('../domain/worker-state');
 const { ManagerUrlPool, shouldFailoverResponse } = require('./manager-urls');
+const { resolveWorkerFetch } = require('./http-client');
 
 class ManagerReporter {
-  constructor({ baseUrl, managerUrls = null, cacheFilePath = undefined, workerId, secret = '', fetchImpl = global.fetch, logger, onSettingsChanged = null }) {
+  constructor({ baseUrl, managerUrls = null, cacheFilePath = undefined, urlPool = null, workerId, secret = '', fetchImpl = undefined, logger, onSettingsChanged = null }) {
     this.cacheFilePath = cacheFilePath;
-    this.urlPool = new ManagerUrlPool({ baseUrl, managerUrls, cacheFilePath });
+    this.urlPool = urlPool || new ManagerUrlPool({ baseUrl, managerUrls, cacheFilePath });
     this.workerId = workerId;
     this.secret = String(secret || '').trim();
-    this.fetch = fetchImpl;
+    this.fetch = resolveWorkerFetch(fetchImpl);
     this.logger = logger;
     this.onSettingsChanged = typeof onSettingsChanged === 'function' ? onSettingsChanged : null;
     this.lastSettingsRevision = null;
@@ -36,7 +37,7 @@ class ManagerReporter {
 
   set baseUrl(nextUrl) {
     if (nextUrl) {
-      this.urlPool = new ManagerUrlPool({ baseUrl: nextUrl, managerUrls: this.urlPool?.urls, cacheFilePath: this.cacheFilePath });
+      this.urlPool.setPrimary(nextUrl);
     }
   }
 
@@ -63,10 +64,12 @@ class ManagerReporter {
     if (!candidates.length || !this.fetch || this.stopping) return;
     const startedAt = Date.now();
     let lastError = null;
+    const urlsSig = typeof this.urlPool?.urlsSignature === 'function' ? this.urlPool.urlsSignature() : '';
     const headers = {
       'content-type': 'application/json',
       ...(this.secret ? { 'x-worker-secret': this.secret } : {}),
-      'x-manager-bot-id': String(this.workerId)
+      'x-manager-bot-id': String(this.workerId),
+      ...(urlsSig ? { 'x-manager-urls-sig': urlsSig } : {})
     };
 
     for (let i = 0; i < candidates.length; i += 1) {
@@ -90,10 +93,13 @@ class ManagerReporter {
         if (!response.ok || (body && typeof body.ok === 'boolean' && !body.ok)) {
           const err = new Error(body?.error || `manager_http_${response.status}`);
           err.status = response.status;
-          if (hasMore && shouldFailoverResponse(response, body)) {
-            lastError = err;
-            this.logger?.warn?.('manager_failover_retry', { workerId: this.workerId, failedUrl: candidate, status: response.status, error: err.message });
-            continue;
+          if (shouldFailoverResponse(response, body)) {
+            this.urlPool.markFailed?.(candidate);
+            if (hasMore) {
+              lastError = err;
+              this.logger?.warn?.('manager_failover_retry', { workerId: this.workerId, failedUrl: candidate, status: response.status, error: err.message });
+              continue;
+            }
           }
           throw err;
         }
@@ -103,10 +109,13 @@ class ManagerReporter {
         return body;
       } catch (err) {
         if (this.stopping || signal?.aborted || this.stopController.signal.aborted) throw err;
-        if (hasMore && (!err?.status || shouldFailoverResponse({ status: err.status }, null))) {
-          lastError = err;
-          this.logger?.warn?.('manager_failover_retry', { workerId: this.workerId, failedUrl: candidate, error: err?.message || String(err) });
-          continue;
+        if (!err?.status || shouldFailoverResponse({ status: err.status }, null)) {
+          this.urlPool.markFailed?.(candidate);
+          if (hasMore) {
+            lastError = err;
+            this.logger?.warn?.('manager_failover_retry', { workerId: this.workerId, failedUrl: candidate, error: err?.message || String(err) });
+            continue;
+          }
         }
         throw err;
       }
@@ -149,6 +158,9 @@ class ManagerReporter {
       || ['stopped', 'disconnected', 'error', 'maintenance', 'ip_limited', 'banned'].includes(stateStr);
     const positionMoved = Boolean(!disconnected && raw.position && this.hasPositionMovedSignificantly(raw.position));
 
+    const optNum = (key, val) => (val !== null && val !== undefined && Number.isFinite(Number(val)) ? { [key]: val } : {});
+    const netDownKb = Number(raw.bandwidthRxBps) > 0 ? Math.round((Number(raw.bandwidthRxBps) / 1024) * 10) / 10 : 0;
+    const netUpKb = Number(raw.bandwidthTxBps) > 0 ? Math.round((Number(raw.bandwidthTxBps) / 1024) * 10) / 10 : 0;
     const payload = digestUnchanged
       ? {
           workerId: raw.workerId,
@@ -157,22 +169,26 @@ class ManagerReporter {
           connected: Boolean(raw.connected),
           online: Boolean(raw.online ?? raw.connected),
           ...(raw.manuallyStopped !== undefined ? { manuallyStopped: Boolean(raw.manuallyStopped) } : {}),
-          managerLatencyMs: this.managerLatencyMs,
+          ...optNum('managerLatencyMs', this.managerLatencyMs),
           stateDigest: digest,
           digestUnchanged: true,
           isLightweight: true,
-          uptimeSeconds: raw.uptimeSeconds,
-          pingMs: raw.pingMs,
-          tps: raw.tps,
-          cpuPercent: raw.cpuPercent,
-          rssMb: raw.rssMb,
-          heapUsedMb: raw.heapUsedMb,
+          ...optNum('uptimeSeconds', raw.uptimeSeconds),
+          ...optNum('pingMs', raw.pingMs),
+          ...optNum('tps', raw.tps),
+          ...optNum('cpuPercent', raw.cpuPercent),
+          ...optNum('rssMb', raw.rssMb),
+          ...optNum('heapUsedMb', raw.heapUsedMb),
+          ...(netDownKb > 0 ? { netDownKb } : {}),
+          ...(netUpKb > 0 ? { netUpKb } : {}),
           ...(raw.lastStateAt !== undefined ? { lastStateAt: raw.lastStateAt } : {}),
           ...(positionMoved ? { position: raw.position } : { positionUnchanged: true })
         }
       : {
           ...raw,
-          managerLatencyMs: this.managerLatencyMs,
+          netDownKb,
+          netUpKb,
+          ...optNum('managerLatencyMs', this.managerLatencyMs),
           stateDigest: digest,
           digestUnchanged: false,
           ...(raw.position && !positionMoved ? { positionUnchanged: true } : {})
@@ -252,9 +268,11 @@ class ManagerReporter {
     const path = `/api/v1/workers/${encodeURIComponent(this.workerId)}/bootstrap`;
     const startedAt = Date.now();
     const candidates = this.urlPool.getUrlsOrdered();
+    const urlsSig = typeof this.urlPool?.urlsSignature === 'function' ? this.urlPool.urlsSignature() : '';
     const headers = {
       ...(this.secret ? { 'x-worker-secret': this.secret } : {}),
-      'x-manager-bot-id': String(this.workerId)
+      'x-manager-bot-id': String(this.workerId),
+      ...(urlsSig ? { 'x-manager-urls-sig': urlsSig } : {})
     };
     let lastError = null;
     for (let i = 0; i < candidates.length; i += 1) {
@@ -269,14 +287,20 @@ class ManagerReporter {
           headers,
           signal: combinedSignal
         });
-        const body = await response.json().catch(() => ({}));
+        const body = await response.json().catch(async () => {
+          await response.body?.cancel?.().catch(() => {});
+          return {};
+        });
         if (!response.ok || !body.ok) {
           const err = new Error(body?.error || `manager_http_${response.status}`);
           err.status = response.status;
-          if (hasMore && shouldFailoverResponse(response, body)) {
-            lastError = err;
-            this.logger?.warn?.('manager_bootstrap_failover_retry', { workerId: this.workerId, failedUrl: candidate, status: response.status, error: err.message });
-            continue;
+          if (shouldFailoverResponse(response, body)) {
+            this.urlPool.markFailed?.(candidate);
+            if (hasMore) {
+              lastError = err;
+              this.logger?.warn?.('manager_bootstrap_failover_retry', { workerId: this.workerId, failedUrl: candidate, status: response.status, error: err.message });
+              continue;
+            }
           }
           throw err;
         }
@@ -289,10 +313,13 @@ class ManagerReporter {
         return body;
       } catch (err) {
         if (this.stopping || signal?.aborted || this.stopController.signal.aborted) throw err;
-        if (hasMore && (!err?.status || shouldFailoverResponse({ status: err.status }, null))) {
-          lastError = err;
-          this.logger?.warn?.('manager_bootstrap_failover_retry', { workerId: this.workerId, failedUrl: candidate, error: err?.message || String(err) });
-          continue;
+        if (!err?.status || shouldFailoverResponse({ status: err.status }, null)) {
+          this.urlPool.markFailed?.(candidate);
+          if (hasMore) {
+            lastError = err;
+            this.logger?.warn?.('manager_bootstrap_failover_retry', { workerId: this.workerId, failedUrl: candidate, error: err?.message || String(err) });
+            continue;
+          }
         }
         throw err;
       }

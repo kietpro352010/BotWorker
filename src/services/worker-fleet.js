@@ -5,6 +5,8 @@ const { MinecraftSession } = require('../game/minecraft-session');
 const WorkerRuntime = require('./worker-runtime');
 const ManagerReporter = require('../transports/manager-reporter');
 const WispbytePoller = require('../transports/wispbyte-poller');
+const { ManagerUrlPool } = require('../transports/manager-urls');
+const { resolveWorkerFetch } = require('../transports/http-client');
 const WispbyteKeepAlive = require('./wispbyte-keepalive');
 
 const FleetState = Object.freeze({
@@ -61,14 +63,37 @@ class WorkerFleet {
     } catch (_) {
       this.loopDelayMonitor = null;
     }
-    this.wispbyteKeepAlive = new WispbyteKeepAlive(config.wispbyte, logger, { fetchImpl });
+    const effectiveFetch = resolveWorkerFetch(fetchImpl);
+    this.wispbyteKeepAlive = new WispbyteKeepAlive(config.wispbyte, logger, { fetchImpl: effectiveFetch });
+
+    const basePoolUrls = [];
+    if (config.managerUrl) basePoolUrls.push(config.managerUrl);
+    if (Array.isArray(config.managerUrls)) basePoolUrls.push(...config.managerUrls);
+    for (const botConfig of config.bots) {
+      if (botConfig.managerUrl) basePoolUrls.push(botConfig.managerUrl);
+      if (Array.isArray(botConfig.managerUrls)) basePoolUrls.push(...botConfig.managerUrls);
+    }
+    this.sharedUrlPool = new ManagerUrlPool({
+      baseUrl: config.managerUrl || config.bots?.[0]?.managerUrl || '',
+      managerUrls: basePoolUrls,
+      cacheFilePath: config.managerUrlCacheFile !== undefined
+        ? config.managerUrlCacheFile
+        : config.bots?.[0]?.managerUrlCacheFile
+    });
 
     for (const botConfig of config.bots) {
       const botLogger = scopeLogger(logger, botConfig.workerId);
       const session = new MinecraftSession(botConfig, botLogger);
+      const sharePool = !botConfig.managerUrl || !config.managerUrl || botConfig.managerUrl === config.managerUrl;
       const reporter = new ManagerReporter({
-        baseUrl: botConfig.managerUrl, managerUrls: botConfig.managerUrls, cacheFilePath: botConfig.managerUrlCacheFile,
-        workerId: botConfig.workerId, secret: botConfig.secret, logger: botLogger, fetchImpl
+        baseUrl: botConfig.managerUrl,
+        managerUrls: botConfig.managerUrls,
+        cacheFilePath: botConfig.managerUrlCacheFile,
+        ...(sharePool ? { urlPool: this.sharedUrlPool } : {}),
+        workerId: botConfig.workerId,
+        secret: botConfig.secret,
+        logger: botLogger,
+        fetchImpl: effectiveFetch
       });
       let instanceRef = null;
       const refreshManagerConfig = async ({ signal, applyManualStop = true } = {}) => {
@@ -107,7 +132,7 @@ class WorkerFleet {
       });
       const runtime = new WorkerRuntime(session, botConfig, botLogger, { refreshManagerConfig });
       const poller = botConfig.transport === 'wispbyte-poll'
-        ? new WispbytePoller({ config: botConfig, runtime, reporter, logger: botLogger, fetchImpl }) : null;
+        ? new WispbytePoller({ config: botConfig, runtime, reporter, logger: botLogger, fetchImpl: effectiveFetch }) : null;
       const instance = { config: botConfig, session, runtime, reporter, poller, managerManuallyStopped: false, refreshManagerConfig };
       instanceRef = instance;
       this.instances.set(botConfig.workerId, instance);
@@ -237,8 +262,19 @@ class WorkerFleet {
       return;
     }
 
+    let pollerSlotIndex = 0;
     for (const instance of this.instances.values()) {
-      if (instance.poller) void instance.poller.start();
+      if (instance.poller) {
+        if (pollerSlotIndex === 0) {
+          void instance.poller.start();
+        } else {
+          const staggerTimer = setTimeout(() => {
+            if (!this.stopping) void instance.poller.start();
+          }, pollerSlotIndex * 350);
+          staggerTimer.unref?.();
+        }
+        pollerSlotIndex += 1;
+      }
     }
 
     this.heartbeatTimer = setInterval(() => {

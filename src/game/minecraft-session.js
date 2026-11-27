@@ -93,6 +93,17 @@ function classifyServerText(message) {
   return null;
 }
 
+function humanizeStopReasonVi(reason) {
+  const code = String(reason || '').trim().toLowerCase();
+  if (code === 'manager_stop') return 'Đã dừng bot theo lệnh điều khiển.';
+  if (code === 'manager_restart') return 'Tạm dừng bot để khởi động lại...';
+  if (code === 'scheduled_stop') return 'Đã tự động dừng bot theo lịch hẹn giờ.';
+  if (code === 'manager_offline_stop') return 'Đã đồng bộ trạng thái dừng từ bảng điều khiển.';
+  if (code === 'process_shutdown' || code === 'fleet_stop') return 'Bot tạm dừng do tiến trình Worker khởi động lại.';
+  if (code === 'command_timeout' || code === 'command_aborted') return 'Lệnh điều khiển đã hủy do hết thời gian chờ.';
+  return code ? `Bot đã dừng hoạt động (${code}).` : 'Bot đã dừng hoạt động.';
+}
+
 class MinecraftSession extends EventEmitter {
   constructor(config, logger) {
     super();
@@ -226,7 +237,7 @@ class MinecraftSession extends EventEmitter {
       this.manualStop = true;
       this.lastError = 'Minecraft account credentials are not configured in Web Dashboard or Discord.';
       this.setState('error', 'credentials_missing');
-      this.emit('event', { type: 'credentials_missing', message: 'Set this worker account on the Web Dashboard or Discord before starting.' });
+      this.emit('event', { type: 'credentials_missing', message: 'Chưa cài đặt tài khoản Minecraft trên Web hoặc Discord trước khi bật bot.' });
       const worker = this.getStatus();
       return { ok: false, error: 'credentials_missing', code: 'CREDENTIALS_MISSING', status: 422, detail: this.lastError, worker };
     }
@@ -236,7 +247,7 @@ class MinecraftSession extends EventEmitter {
       this.maintenanceWindow = true;
       this.clearTimers();
       this.setState('maintenance', 'fixed_maintenance_window');
-      this.emit('event', { type: 'maintenance_window', message: 'Reconnect is paused until 05:30 Vietnam time (UTC+7).'});
+      this.emit('event', { type: 'maintenance_window', message: 'Đang trong khung giờ bảo trì định kỳ (04:30 – 05:30 VN), bot sẽ tự kết nối lúc 05:30.' });
       return this.getStatus();
     }
     if (!this.manualStop && this.bot && !['stopped', 'error', 'ip_limited', 'banned'].includes(this.state)) return this.getStatus();
@@ -471,7 +482,12 @@ class MinecraftSession extends EventEmitter {
         this._windowEventsBound = (win && typeof win.on === 'function') ? win : null;
         const title = extractChatMessage(win?.title);
         this.logger.info('window_opened', { title, type: win?.type });
-        this.emit('event', { type: 'window_open', title, windowType: win?.type });
+        this.emit('event', {
+          type: 'window_open',
+          title,
+          windowType: win?.type,
+          message: title ? `Mở cửa sổ menu trong game: ${title}` : 'Mở cửa sổ menu trong game.'
+        });
         if (win && typeof win.on === 'function' && !win._kbotUpdateSlotBound) {
           win._kbotUpdateSlotBound = true;
           win.on('updateSlot', () => {
@@ -492,7 +508,7 @@ class MinecraftSession extends EventEmitter {
         }
         this.windowRevision = (this.windowRevision || 0) + 1;
         this.logger.info('window_closed', { type: win?.type });
-        this.emit('event', { type: 'window_close' });
+        this.emit('event', { type: 'window_close', message: 'Đã đóng cửa sổ menu trong game.' });
       });
       bot.once('spawn', () => this.onSpawn(bot, generation, host));
       return this.getStatus();
@@ -577,7 +593,11 @@ class MinecraftSession extends EventEmitter {
       const pos = bot.entity?.position;
       const coords = pos ? `X: ${Math.round(pos.x)}, Y: ${Math.round(pos.y)}, Z: ${Math.round(pos.z)}` : 'Không rõ';
       this.logger.warn('bot_died', { coords });
-      this.emit('event', { type: 'bot_death', reason: `Bot bị chết tại tọa độ ${coords}` });
+      this.emit('event', {
+        type: 'bot_death',
+        reason: `Bot bị chết tại tọa độ ${coords}`,
+        message: `Bot bị hạ gục tại tọa độ ${coords}. Hệ thống sẽ tự hồi sinh nếu cần.`
+      });
       setPhysicsEnabled(bot, true, this.logger, 'death');
     });
 
@@ -733,7 +753,7 @@ class MinecraftSession extends EventEmitter {
         if (this.bot !== bot || generation !== this.generation || this.manualStop || this.state !== 'online') return;
         try {
           bot.chat(cmd);
-          this.emit('event', { type: 'chat', message: `[${bot.username || this.username}] ${cmd}` });
+          this._recordChatMessage(`→ ${cmd}`, 'spawn_command');
         } catch (_) {}
       }, delayMs);
       timer.unref?.();
@@ -752,7 +772,7 @@ class MinecraftSession extends EventEmitter {
         if (this.bot !== bot || generation !== this.generation || this.manualStop || this.state !== 'online') return;
         try {
           bot.chat(msg);
-          this.emit('event', { type: 'chat', message: `[${bot.username || this.username}] ${msg}` });
+          this._recordChatMessage(`→ ${msg}`, 'auto_chat');
         } catch (_) {}
       };
       if (idx === 0 || stepMs === 0) {
@@ -1132,7 +1152,7 @@ class MinecraftSession extends EventEmitter {
       if (this.state === 'maintenance') return;
       this.lastKickReason = 'Server maintenance';
       this.setState('maintenance', 'maintenance_message');
-      this.emit('event', { type: 'maintenance', message: 'Server maintenance notice received.' });
+      this.emit('event', { type: 'maintenance', message: 'Máy chủ thông báo bảo trì, tạm ngắt kết nối và chờ vào lại.' });
       try { bot.quit('server_maintenance'); } catch (_) { try { bot.end('server_maintenance'); } catch (_) {} }
     } else if (classification === 'ip_limited' || classification === 'banned') {
       this.pauseForRestriction(classification, safeText);
@@ -1421,7 +1441,7 @@ class MinecraftSession extends EventEmitter {
     this.bot = null;
     this.cleanupSessionResources(bot);
     this.setState('stopped', reason);
-    if (emitEvent) this.emit('event', { type: 'stopped', reason });
+    if (emitEvent) this.emit('event', { type: 'stopped', reason, message: humanizeStopReasonVi(reason) });
     return this.getStatus();
   }
 
@@ -2127,13 +2147,16 @@ class MinecraftSession extends EventEmitter {
     if (mouseButton !== 0 && mouseButton !== 1) throw new Error('Invalid mouseButton (expected 0 or 1).');
     if (!Number.isInteger(mode) || mode < 0 || mode > 6) throw new Error('Invalid click mode (expected 0-6).');
     if (typeof bot.clickWindow === 'function') {
+      const clickedItem = window.slots?.[slot];
+      const itemHint = cleanText(clickedItem?.displayName || clickedItem?.name || '');
       await bot.clickWindow(slot, mouseButton, mode);
       this._bumpInventoryRevision();
       this._cachedWinSnap = null;
       this.windowRevision = (this.windowRevision || 0) + 1;
+      const clickKind = mouseButton === 1 ? ' (chuột phải)' : '';
       this.emit('event', {
         type: 'window_click',
-        message: `Tương tác menu GUI: Click ô #${slot} (nút: ${mouseButton}, mode: ${mode})`
+        message: `Đã chọn ô #${slot}${itemHint ? ` (${itemHint})` : ''}${clickKind} trên menu GUI.`
       });
       return { ok: true, clickedSlot: slot, inventory: this.getInventorySnapshot(bot), currentWindow: this.getWindowSnapshot(bot) };
     }
@@ -2153,7 +2176,7 @@ class MinecraftSession extends EventEmitter {
       this.windowRevision = (this.windowRevision || 0) + 1;
       this.emit('event', {
         type: 'window_close',
-        message: 'Đã đóng giao diện menu GUI.'
+        message: 'Đã đóng cửa sổ menu trong game.'
       });
       return { ok: true, closed: true, currentWindow: null };
     }
@@ -2280,7 +2303,7 @@ class MinecraftSession extends EventEmitter {
     this.connectedAt = null;
     this.connectedAtIso = null;
     this.setState('maintenance', 'fixed_maintenance_window');
-    this.emit('event', { type: 'maintenance_window', message: 'Scheduled stop 04:30–05:30 Vietnam time (UTC+7).' });
+    this.emit('event', { type: 'maintenance_window', message: 'Tạm nghỉ khung giờ bảo trì định kỳ (04:30 – 05:30 VN), sẽ tự vào lại lúc 05:30.' });
   }
 
   _recordChatMessage(text, source = 'chat') {

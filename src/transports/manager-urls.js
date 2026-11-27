@@ -5,8 +5,12 @@ const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 
+const { computeUrlsSignature } = require('./http-client');
+
 const DEFAULT_MANAGER_URL = 'https://kbotmanager.onrender.com';
 const MAX_MANAGER_URLS = 8;
+const DEFAULT_FAIL_COOLDOWN_MS = 20000;
+const MAX_FAIL_COOLDOWN_MS = 120000;
 
 function isPrivateOrInternalHost(hostname) {
   const bare = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
@@ -132,6 +136,22 @@ function shouldFailoverResponse(response, body) {
   return false;
 }
 
+function isConfirmedWorkerAuthError(status, body) {
+  const code = Number(status || 0);
+  const errCode = String(body?.error || '').trim();
+  if (code === 401) {
+    return !errCode || errCode === 'unauthorized';
+  }
+  if (code === 404) {
+    return Boolean(
+      body &&
+      body.ok === false &&
+      ['worker_not_found', 'worker_not_found_or_disabled', 'not_found'].includes(errCode)
+    );
+  }
+  return false;
+}
+
 class ManagerUrlPool {
   constructor({ baseUrl = '', managerUrls = null, cacheFilePath = undefined, defaultFallback = false } = {}) {
     this.cacheFilePath = cacheFilePath !== undefined ? cacheFilePath : getCacheFilePath();
@@ -143,6 +163,12 @@ class ManagerUrlPool {
     }
     this.urls = mergeManagerUrls(initial);
     this.activeIndex = 0;
+    this.failedState = new Map();
+    this._urlsSig = computeUrlsSignature(this.urls);
+  }
+
+  urlsSignature() {
+    return this._urlsSig;
   }
 
   currentUrl() {
@@ -151,15 +177,69 @@ class ManagerUrlPool {
     return this.urls[this.activeIndex] || this.urls[0] || '';
   }
 
-  getUrlsOrdered() {
+  getUrlsOrdered(now = Date.now()) {
     if (!this.urls.length) return [];
     const idx = Math.max(0, Math.min(this.activeIndex, this.urls.length - 1));
-    return [this.urls[idx], ...this.urls.slice(0, idx), ...this.urls.slice(idx + 1)];
+    const rotated = [this.urls[idx], ...this.urls.slice(0, idx), ...this.urls.slice(idx + 1)];
+    if (this.failedState.size === 0) return rotated;
+    const healthy = [];
+    const cooledDown = [];
+    for (const url of rotated) {
+      const st = this.failedState.get(url);
+      if (st && st.cooldownUntil > now) {
+        cooledDown.push({ url, until: st.cooldownUntil });
+      } else {
+        healthy.push(url);
+      }
+    }
+    cooledDown.sort((a, b) => a.until - b.until);
+    return [...healthy, ...cooledDown.map((entry) => entry.url)];
   }
 
   markHealthy(url) {
+    this.failedState.delete(url);
     const idx = this.urls.indexOf(url);
     if (idx >= 0) this.activeIndex = idx;
+  }
+
+  markFailed(url, baseCooldownMs = DEFAULT_FAIL_COOLDOWN_MS, now = Date.now()) {
+    const idx = this.urls.indexOf(url);
+    if (idx < 0) return false;
+    const prev = this.failedState.get(url);
+    const count = (prev ? prev.count : 0) + 1;
+    const cooldownMs = Math.min(MAX_FAIL_COOLDOWN_MS, Math.max(1000, Number(baseCooldownMs) || DEFAULT_FAIL_COOLDOWN_MS) * (2 ** Math.min(count - 1, 3)));
+    const cooldownUntil = now + cooldownMs;
+    this.failedState.set(url, { count, cooldownUntil });
+
+    if (this.activeIndex === idx && this.urls.length > 1) {
+      let nextIdx = (idx + 1) % this.urls.length;
+      for (let offset = 1; offset < this.urls.length; offset += 1) {
+        const candidateIdx = (idx + offset) % this.urls.length;
+        const st = this.failedState.get(this.urls[candidateIdx]);
+        if (!st || st.cooldownUntil <= now) {
+          nextIdx = candidateIdx;
+          break;
+        }
+      }
+      this.activeIndex = nextIdx;
+    }
+    return true;
+  }
+
+  setPrimary(rawUrl) {
+    const hasLocal = this.urls.some((u) => /^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(u));
+    const norm = normalizeManagerUrl(rawUrl, { strictHttps: false, allowLoopbackHttp: hasLocal || /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/i.test(String(rawUrl || '')) });
+    if (!norm) return false;
+    if (!this.urls.includes(norm)) {
+      this.learn(norm);
+    }
+    this.failedState.delete(norm);
+    const idx = this.urls.indexOf(norm);
+    if (idx >= 0) {
+      this.activeIndex = idx;
+      return true;
+    }
+    return false;
   }
 
   learn(rawUrls) {
@@ -170,6 +250,7 @@ class ManagerUrlPool {
     const merged = mergeManagerUrls(this.urls, rawUrls, { strictHttps: true, allowLoopbackHttp: hasLocalInitial });
     if (!merged.length) return false;
     this.urls = merged;
+    this._urlsSig = computeUrlsSignature(this.urls);
     if (current) {
       const idx = this.urls.indexOf(current);
       this.activeIndex = idx >= 0 ? idx : 0;
@@ -194,11 +275,14 @@ class ManagerUrlPool {
 module.exports = {
   DEFAULT_MANAGER_URL,
   MAX_MANAGER_URLS,
+  DEFAULT_FAIL_COOLDOWN_MS,
+  MAX_FAIL_COOLDOWN_MS,
   isPrivateOrInternalHost,
   normalizeManagerUrl,
   mergeManagerUrls,
   loadCachedManagerUrls,
   persistCachedManagerUrls,
   shouldFailoverResponse,
+  isConfirmedWorkerAuthError,
   ManagerUrlPool
 };

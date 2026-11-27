@@ -28,6 +28,7 @@ const { listenHttpServer } = require('./config/host-runtime');
 const logger = require('./utils/logger');
 const WorkerFleet = require('./services/worker-fleet');
 const { createApp } = require('./http/app');
+const { closeWorkerHttpAgents } = require('./transports/http-client');
 
 async function main() {
   const config = loadConfig();
@@ -130,6 +131,7 @@ async function main() {
       } finally {
         if (graceCloseTimer) clearTimeout(graceCloseTimer);
       }
+      closeWorkerHttpAgents();
     }
     clearTimeout(forceExitTimer);
     process.exitCode = currentExitCode;

@@ -1467,6 +1467,79 @@ async function testWave5cKbotFeaturePreservationAudit() {
   console.log('✅ 15. Wave-5c KBot Feature-Preservation Safeguards verified 100%.');
 }
 
+async function testHumanizedEventsAndNetworkTelemetry() {
+  console.log('16. Testing humanized Vietnamese lifecycle/GUI events & netDownKb/netUpKb telemetry...');
+  const session = new MinecraftSession({
+    workerId: 'bot-log-clarity',
+    transport: 'wispbyte-poll',
+    mc: { host: 'kingmc.vn', username: '' }
+  }, createSilentLogger());
+
+  const emitted = [];
+  session.on('event', (e) => emitted.push(e));
+
+  // credentials_missing emits non-empty Vietnamese guidance
+  await session.start();
+  const credEv = emitted.find((e) => e.type === 'credentials_missing');
+  assert.ok(credEv && credEv.message && credEv.message.includes('Chưa cài đặt tài khoản Minecraft'));
+
+  // window_click, window_close & stop emit clean Vietnamese messages instead of raw codes
+  const fakeWin = new EventEmitter();
+  fakeWin.id = 7;
+  fakeWin.type = 'minecraft:chest';
+  fakeWin.title = { text: 'Menu Server' };
+  fakeWin.slots = [{ name: 'diamond_sword', count: 1, displayName: 'KingSMP' }];
+  const fakeBot = new EventEmitter();
+  fakeBot.player = {};
+  fakeBot.username = 'LogBot';
+  fakeBot._client = { socket: new EventEmitter() };
+  fakeBot.currentWindow = fakeWin;
+  fakeBot.chat = () => {};
+  fakeBot.clickWindow = async () => {};
+  fakeBot.closeWindow = () => { fakeBot.currentWindow = null; };
+  session.bot = fakeBot;
+  session.username = 'LogBot';
+  session.manualStop = false;
+  session.state = 'online';
+
+  await session.clickWindow({ slot: 0, mouseButton: 0, mode: 0 });
+  const clickEv = emitted.find((e) => e.type === 'window_click');
+  assert.ok(clickEv && clickEv.message.includes('KingSMP') && !clickEv.message.includes('mode: 0'));
+
+  await session.closeWindow();
+  const closeEv = emitted.find((e) => e.type === 'window_close');
+  assert.ok(closeEv && closeEv.message && closeEv.message.includes('đóng cửa sổ menu'));
+
+  session.dispatchScheduledMessages(fakeBot, session.generation, ['/home afk'], 0);
+  const chatEv = emitted.find((e) => e.type === 'chat');
+  assert.ok(chatEv && chatEv.source === 'auto_chat' && chatEv.message.startsWith('→ /home afk'));
+
+  await session.stop('manager_stop');
+  const stopEv = emitted.find((e) => e.type === 'stopped');
+  assert.strictEqual(stopEv.reason, 'manager_stop');
+  assert.ok(stopEv.message && stopEv.message.includes('Đã dừng bot'));
+
+  // prepareStatusPayload includes rounded netDownKb/netUpKb when non-zero
+  const reporter = new ManagerReporter({
+    baseUrl: 'https://manager.example.com',
+    workerId: 'bot-log-clarity',
+    secret: 's'.repeat(32),
+    logger: createSilentLogger()
+  });
+  const firstMeta = reporter.prepareStatusPayload({
+    workerId: 'bot-log-clarity',
+    transport: 'wispbyte-poll',
+    state: 'online',
+    connected: true,
+    bandwidthRxBps: 5120,
+    bandwidthTxBps: 1536
+  });
+  assert.strictEqual(firstMeta.payload.netDownKb, 5);
+  assert.strictEqual(firstMeta.payload.netUpKb, 1.5);
+  reporter.stop();
+  console.log('✅ 16. Humanized Vietnamese lifecycle/GUI events & netDownKb/netUpKb verified.');
+}
+
 async function main() {
   console.log('--- [WORKER SYSTEM OPTIMIZATION & RESILIENCE TESTS] ---');
   await testManagerReporterDigestAndRollback();
@@ -1484,6 +1557,7 @@ async function main() {
   await testWave5ExtremeCpuBinaryPacketFilterAndEcoPhysics();
   await testWave5bDeepAuditFixesAndDecompressorStreamBypass();
   await testWave5cKbotFeaturePreservationAudit();
+  await testHumanizedEventsAndNetworkTelemetry();
   console.log('\n🎉 ALL WORKER OPTIMIZATION & RESILIENCE TESTS PASSED 100%!');
 }
 

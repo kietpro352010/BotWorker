@@ -1,8 +1,11 @@
 'use strict';
 
+const { resolveWorkerFetch } = require('../transports/http-client');
+
 const DEFAULT_PANEL_URL = 'https://wispbyte.com/client';
 const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+const KEEPALIVE_MAX_HTML_BYTES = 16 * 1024;
 
 function isAllowedPanelUrl(urlStr) {
   try {
@@ -17,13 +20,13 @@ function isAllowedPanelUrl(urlStr) {
 }
 
 class WispbyteKeepAlive {
-  constructor(config = {}, logger = console, { fetchImpl = global.fetch } = {}) {
+  constructor(config = {}, logger = console, { fetchImpl = undefined } = {}) {
     this.cookie = String(config.cookie || '').trim();
     this.panelUrl = String(config.panelUrl || DEFAULT_PANEL_URL).trim();
     this.userAgent = String(config.userAgent || DEFAULT_USER_AGENT).trim();
     this.intervalMs = Math.max(60000, Math.min(604800000, Number(config.intervalMs) || TWENTY_FOUR_HOURS_MS));
     this.logger = logger;
-    this.fetch = fetchImpl;
+    this.fetch = resolveWorkerFetch(fetchImpl);
     this.enabled = Boolean(this.cookie);
     this.timer = null;
     this.initialTimer = null;
@@ -69,17 +72,19 @@ class WispbyteKeepAlive {
             'Cache-Control': 'no-cache'
           },
           redirect: 'manual',
-          signal: controller.signal
+          signal: controller.signal,
+          maxBytes: KEEPALIVE_MAX_HTML_BYTES,
+          truncateOnMaxBytes: true
         });
       } finally {
         clearTimeout(timeoutTimer);
       }
 
       const location = res.headers.get('location') || '';
-      const html = await res.text().catch(() => '');
       this.lastPingAt = new Date().toISOString();
 
       if ([301, 302, 303, 307, 308].includes(res.status)) {
+        await res.body?.cancel?.().catch(() => {});
         const lowerLoc = location.toLowerCase();
         if (lowerLoc.includes('login') || lowerLoc.includes('auth') || lowerLoc.includes('discord')) {
           this.lastStatus = 'expired';
@@ -95,6 +100,7 @@ class WispbyteKeepAlive {
       }
 
       if (res.status === 200) {
+        const html = (await res.text().catch(() => '')).slice(0, KEEPALIVE_MAX_HTML_BYTES);
         const lower = html.toLowerCase();
         if ((lower.includes('login with discord') || lower.includes('sign in to your account'))
             && !lower.includes('logout') && !lower.includes('servers')) {
@@ -109,6 +115,8 @@ class WispbyteKeepAlive {
         this.logger.info?.('wispbyte_keepalive_success', { renewCount: this.renewCount });
         return { success: true, status: this.lastStatus, message: this.lastMessage };
       }
+
+      await res.body?.cancel?.().catch(() => {});
 
       if (res.status === 401 || res.status === 403) {
         this.lastStatus = 'error';

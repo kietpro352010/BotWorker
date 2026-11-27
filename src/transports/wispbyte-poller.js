@@ -1,6 +1,7 @@
 'use strict';
 
-const { ManagerUrlPool, shouldFailoverResponse } = require('./manager-urls');
+const { ManagerUrlPool, shouldFailoverResponse, isConfirmedWorkerAuthError } = require('./manager-urls');
+const { resolveWorkerFetch } = require('./http-client');
 
 function cancellableSleep(ms, signal) {
   return new Promise((resolve) => {
@@ -19,12 +20,12 @@ function cancellableSleep(ms, signal) {
 }
 
 class WispbytePoller {
-  constructor({ config, runtime, reporter, logger, fetchImpl = global.fetch, authFailureThreshold = 5, authBackoffScheduleMs = [15000, 30000, 60000, 120000, 300000] }) {
+  constructor({ config, runtime, reporter, logger, fetchImpl = undefined, authFailureThreshold = 5, authBackoffScheduleMs = [15000, 30000, 60000, 120000, 300000] }) {
     this.config = config;
     this.runtime = runtime;
     this.reporter = reporter;
     this.logger = logger;
-    this.fetch = fetchImpl;
+    this.fetch = resolveWorkerFetch(fetchImpl);
     this.stopping = false;
     this.loopPromise = null;
     this.failures = 0;
@@ -138,19 +139,19 @@ class WispbytePoller {
         continue;
       }
       try {
-        await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, item.payload);
+        await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, item.payload, { timeoutMs: 12000, connectTimeoutMs: 6000 });
       } catch (err) {
         if (this.stopping) {
           remaining.push(...batch.slice(i));
           break;
         }
-        if ([401, 404].includes(err.status)) {
+        if (err.isWorkerAuthError === true || (err.status === 401 && err.isWorkerAuthError !== false)) {
           const authDelayMs = await this._handleAuthFailure(err.status);
           this._lastFlushAuthDelayMs = authDelayMs;
           remaining.push(...batch.slice(i));
           break;
         }
-        if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429) {
+        if (err.status && err.status >= 400 && err.status < 500 && err.status !== 429 && err.status !== 404) {
           this.logger?.warn?.('wispbyte_result_rejected_permanent', {
             commandId: item.payload?.commandId,
             status: err.status,
@@ -181,17 +182,19 @@ class WispbytePoller {
     this.pendingResults = [...remaining, ...this.pendingResults].slice(-this.maxPendingResults);
   }
 
-  async request(path, payload, { timeoutMs = 35000 } = {}) {
+  async request(path, payload, { timeoutMs = 35000, connectTimeoutMs = 8000 } = {}) {
     const configPrimary = this.config?.managerUrl || this.config?.managerBaseUrl || '';
     if (configPrimary && !this.urlPool.urls.includes(configPrimary)) {
       this.urlPool.learn(configPrimary);
     }
     const candidates = this.urlPool.getUrlsOrdered();
     const secret = String(this.config?.secret || '').trim();
+    const urlsSig = typeof this.urlPool?.urlsSignature === 'function' ? this.urlPool.urlsSignature() : '';
     const headers = {
       'content-type': 'application/json',
       ...(secret ? { 'x-worker-secret': secret } : {}),
-      'x-manager-bot-id': String(this.config.workerId)
+      'x-manager-bot-id': String(this.config.workerId),
+      ...(urlsSig ? { 'x-manager-urls-sig': urlsSig } : {})
     };
     let lastError = null;
     for (let i = 0; i < candidates.length; i += 1) {
@@ -208,7 +211,9 @@ class WispbytePoller {
         const response = await this.fetch(url, {
           method: 'POST',
           headers,
-          body: JSON.stringify(payload), signal: combinedSignal
+          body: JSON.stringify(payload),
+          signal: combinedSignal,
+          connectTimeoutMs
         });
         const body = await response.json().catch(async () => {
           await response.body?.cancel?.().catch(() => {});
@@ -217,10 +222,14 @@ class WispbytePoller {
         if (!response.ok || !body.ok) {
           const error = new Error(body.error || `manager_http_${response.status}`);
           error.status = response.status;
-          if (hasMore && shouldFailoverResponse(response, body)) {
-            lastError = error;
-            this.logger?.warn?.('wispbyte_manager_failover', { failedUrl: baseUrl, status: response.status, error: error.message });
-            continue;
+          error.isWorkerAuthError = isConfirmedWorkerAuthError(response.status, body);
+          if (shouldFailoverResponse(response, body)) {
+            this.urlPool.markFailed?.(baseUrl);
+            if (hasMore) {
+              lastError = error;
+              this.logger?.warn?.('wispbyte_manager_failover', { failedUrl: baseUrl, status: response.status, error: error.message });
+              continue;
+            }
           }
           throw error;
         }
@@ -229,10 +238,13 @@ class WispbytePoller {
         return body;
       } catch (err) {
         if (this.stopping || this.stopController.signal.aborted) throw err;
-        if (hasMore && (!err?.status || shouldFailoverResponse({ status: err.status }, null))) {
-          lastError = err;
-          this.logger?.warn?.('wispbyte_manager_failover', { failedUrl: baseUrl, error: err?.message || String(err) });
-          continue;
+        if (!err?.status || shouldFailoverResponse({ status: err.status }, null)) {
+          this.urlPool.markFailed?.(baseUrl);
+          if (hasMore) {
+            lastError = err;
+            this.logger?.warn?.('wispbyte_manager_failover', { failedUrl: baseUrl, error: err?.message || String(err) });
+            continue;
+          }
         }
         throw err;
       } finally {
@@ -324,9 +336,9 @@ class WispbytePoller {
           };
           let authDelayMs = 0;
           try {
-            await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, resultPayload);
+            await this.request(`/api/v1/workers/${encodeURIComponent(this.config.workerId)}/result`, resultPayload, { timeoutMs: 12000, connectTimeoutMs: 6000 });
           } catch (err) {
-            if ([401, 404].includes(err.status)) {
+            if (err.isWorkerAuthError === true || (err.status === 401 && err.isWorkerAuthError !== false)) {
               authDelayMs = await this._handleAuthFailure(err.status);
             }
             this.logger?.warn?.('wispbyte_result_send_failed_queueing', {
@@ -348,7 +360,7 @@ class WispbytePoller {
         }
       } catch (error) {
         if (this.stopping) break;
-        if ([401, 404].includes(error.status)) {
+        if (error.isWorkerAuthError === true || (error.status === 401 && error.isWorkerAuthError !== false)) {
           const authDelayMs = await this._handleAuthFailure(error.status);
           await cancellableSleep(authDelayMs, this.stopController.signal);
           continue;
